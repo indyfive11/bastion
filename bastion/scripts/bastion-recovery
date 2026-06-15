@@ -45,6 +45,13 @@ do_start() {
   [ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
   mkdir -p "$RUN"; chmod 700 "$RUN"
 
+  # CLEANUP TRAP: from here on we create a privileged surface (OTP user + NOPASSWD-ALL sudoers +
+  # recovery sshd). If do_start is interrupted before the self-destruct is armed — SIGTERM from
+  # the unit's TimeoutStartSec, an admin Ctrl-C, or an OOM kill — that surface would otherwise
+  # persist with NO timer to ever remove it. Tear it all down on any such signal. Cleared only
+  # after arm_destruct succeeds (the self-destruct timer then owns teardown).
+  trap 'log "interrupted during start — tearing down partial recovery surface"; do_stop quiet; exit 1' INT TERM
+
   # Build the adaptive bind set from the FREE subset of: main port(s), 22, dedicated.
   local bind="" p
   for p in $(detect_ssh_ports); do port_free "$p" && bind="$bind $p"; done   # (a) operator's known port if main sshd is down
@@ -100,6 +107,7 @@ NFT
   "$sshd" -f "$cfg" || { log "FATAL: recovery sshd failed to start"; do_stop quiet; exit 1; }
 
   arm_destruct
+  trap - INT TERM   # recovery surface is up and the self-destruct is armed — hand off teardown to it
 
   # Announce — the console is the source of truth.
   local ips; ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')

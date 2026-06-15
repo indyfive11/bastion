@@ -166,3 +166,15 @@ def test_cli_status_on_fresh_root_returns_zero(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "l0" in out
     assert "no layers installed yet" in out
+
+
+def test_recovery_traps_signals_during_start():
+    # do_start creates a privileged OTP user + NOPASSWD sudoers BEFORE the self-destruct is armed.
+    # An interrupt (TimeoutStartSec, Ctrl-C, OOM) must tear that surface down, not leave a
+    # never-expiring backdoor. The trap is set in do_start and cleared only after arm_destruct.
+    body = (SCRIPTS / "bastion-recovery").read_text()
+    assert "do_stop quiet; exit 1' INT TERM" in body
+    # cleared on success (after the self-destruct is armed) so the timer owns teardown thereafter
+    set_trap = body.index("do_stop quiet; exit 1' INT TERM")
+    clear_trap = body.index("trap - INT TERM")
+    assert clear_trap > set_trap

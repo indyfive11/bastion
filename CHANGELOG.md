@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.4] - 2026-06-15
+
+A second dogfooding/audit pass over the safety mechanisms and the layer
+lifecycle, found while hardening the v1.0.3 endpoint work.
+
+### Fixed
+
+- **`bastion layer uninstall l0` could strip the firewall out from under the
+  running stack.** Each layer declares `prerequisites`, but they were never enforced.
+  Uninstalling L0 while L1–L6 were installed deleted the base nft table (taking the
+  feed/crowdsec/AI sets with it) and removed `bastion-recovery` + the kill switch while
+  those services kept running. `bastion layer install`/`uninstall` now enforce the
+  dependency graph (install requires prerequisites present; uninstall refuses while a
+  dependent layer is installed). `--force` overrides for a deliberate out-of-order teardown.
+- **The AI signal collector was blind on endpoint nodes.** `edge-ai-collect`
+  hardcoded the `inet edge` table (like the kill switch did before v1.0.3), so on an
+  endpoint (`inet bastion`) it could never read the current `ai_*` set members and the
+  analyzer lost its "already acted" feedback. It now reads `NFT_TABLE`, and its unit
+  sources `machine.env`.
+- **The AI kill switch could report success while doing nothing.** `edge-ctl panic`
+  and `ai-disable` always exited 0 even when every `nft flush` failed (e.g. the managed
+  table was gone). They now exit non-zero and print an honest "incomplete" headline when
+  a flush fails; a clean node is unaffected.
+- **`bastion-recovery` could leave a privileged backdoor user if interrupted.**
+  `do_start` creates an ephemeral OTP user with NOPASSWD sudo before arming the
+  self-destruct timer; an interruption in that window (start timeout, Ctrl-C, OOM) left
+  the user and sudoers drop-in with nothing to remove them. A cleanup trap now tears the
+  partial recovery surface down on signal, and is cleared only once the self-destruct is armed.
+
+### Changed
+
+- **Clarified Expert AI depth.** `ai.depth` controls how much config the AI is *shown*,
+  not what it can apply: base/access changes (e.g. SSH port) are always routed to the
+  human-review queue and never auto-applied at any depth. `expert_canary_seconds` /
+  `expert_confidence_floor` are documented as reserved/inert placeholders for a future
+  auto-apply path that does not exist yet.
+
 ## [1.0.3] - 2026-06-15
 
 Endpoint-mode dogfooding pass: a live install on an ordinary laptop surfaced a

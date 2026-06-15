@@ -6,6 +6,9 @@ Wants=crowdsec.service
 
 [Service]
 Type=oneshot
+# Supplies NFT_TABLE/MODE so the collector reads the right managed table (inet edge vs
+# inet bastion). `-` => optional: a not-yet-generated env file is not a startup failure.
+EnvironmentFile=-/etc/bastion/machine.env
 ExecStart=/usr/local/sbin/edge-ai-collect
 # Privileged read-only collector (reads cscli + journal). Holds ZERO firewall-write power.
 ProtectSystem=strict

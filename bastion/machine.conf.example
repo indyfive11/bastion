@@ -64,11 +64,15 @@ model = claude-opus-4-8
 max_intents = 32
 # systemd OnUnitActiveSec for edge-ai.timer
 timer_interval = 4h
-# regular | advanced | expert
+# regular | advanced | expert — controls how much config the AI is SHOWN, not what it can apply.
+# In every depth, base/access changes (e.g. SSH port) are proposed to the human-review queue
+# (proposals.jsonl) and NEVER auto-applied — see edge-ai-analyze / edge-reconciler. Only the
+# ai_* sets are ever applied automatically.
 depth = regular
-# auto-rollback window for Expert Mode access-rule changes
+# RESERVED (inert): knobs for a future expert-mode AUTO-APPLY path that does not exist yet. Since
+# base changes are always human-reviewed today, nothing reads these — they are placeholders so the
+# config shape is stable if/when auto-apply (gated by a canary + confidence floor) is implemented.
 expert_canary_seconds = 300
-# minimum confidence for Expert Mode auto-apply
 expert_confidence_floor = 0.92
 
 [recovery]

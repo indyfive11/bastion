@@ -126,19 +126,39 @@ def cmd_status():
         print(f"  (audit unavailable: {e})")
     return 0
 
+def _flush_failures(res):
+    """Sets whose flush returned an nft error. A kill switch MUST NOT report success while it
+    silently did nothing (e.g. the managed table/sets are gone, or NFT_TABLE resolved wrong), so
+    these propagate to a non-zero exit. `nft flush set` succeeds on an existing-but-empty set, so
+    a clean node never trips this."""
+    return [s for s, r in res.items() if isinstance(r, str) and r.startswith("ERR:")]
+
 def cmd_panic():
     res = flush_ai_sets()
-    clear_spool()
-    audit({"event": "edge-ctl", "action": "panic", "flush": res})
-    print("PANIC: flushed ai_* sets + cleared spool")
+    spool_ok = clear_spool()
+    failed = _flush_failures(res)
+    audit({"event": "edge-ctl", "action": "panic", "flush": res, "ok": not failed})
+    if failed or not spool_ok:
+        print(f"PANIC INCOMPLETE: {len(res) - len(failed)}/{len(res)} ai_* sets flushed"
+              + ("" if spool_ok else "; spool NOT cleared"))
+    else:
+        print("PANIC: flushed ai_* sets + cleared spool")
     for s, r in res.items():
         print(f"  {s}: {r}")
-    return 0
+    return 1 if (failed or not spool_ok) else 0
 
 def cmd_ai_disable():
     systemctl("disable", "--now", TIMER)
-    res = flush_ai_sets(); clear_spool()
-    audit({"event": "edge-ctl", "action": "ai-disable", "flush": res})
+    res = flush_ai_sets(); spool_ok = clear_spool()
+    failed = _flush_failures(res)
+    audit({"event": "edge-ctl", "action": "ai-disable", "flush": res, "ok": not failed})
+    if failed or not spool_ok:
+        print(f"AI DISABLED ({TIMER} stopped) but FLUSH INCOMPLETE: "
+              f"{len(res) - len(failed)}/{len(res)} ai_* sets flushed"
+              + ("" if spool_ok else "; spool NOT cleared"))
+        for s, r in res.items():
+            print(f"  {s}: {r}")
+        return 1
     print(f"AI DISABLED: {TIMER} stopped+disabled; ai_* flushed; spool cleared")
     return 0
 

@@ -20,7 +20,30 @@ ALLOWLIST   = "/etc/edge-reconciler/policy.allowlist"
 OUT         = "/var/lib/edge-ai/signals.json"
 WINDOW_HOURS = 24
 AI_SETS     = ["ai_block", "ai_ratelimit", "ai_tarpit"]
-TABLE_FAM, TABLE_NAME = "inet", "edge"
+
+
+def _nft_table():
+    """The managed nft table: `inet edge` (edge) or `inet bastion` (endpoint). Read NFT_TABLE
+    from the environment (the unit sets EnvironmentFile=/etc/bastion/machine.env), else parse
+    that file directly so a manual run still works. Hardcoding `inet edge` would make every
+    `nft list set` below fail on an endpoint (`inet bastion`), so `already_acted` would always be
+    empty and the analyzer would lose its record of what it has already acted on. Falls back to
+    inet edge for older configs."""
+    val = os.environ.get("NFT_TABLE", "")
+    if not val:
+        try:
+            with open("/etc/bastion/machine.env") as f:
+                for line in f:
+                    if line.strip().startswith("NFT_TABLE="):
+                        val = line.split("=", 1)[1].strip().strip("'\"")
+                        break
+        except OSError:
+            pass
+    parts = val.split()
+    return (parts[0], parts[1]) if len(parts) == 2 else ("inet", "edge")
+
+
+TABLE_FAM, TABLE_NAME = _nft_table()
 
 def log(m): sys.stderr.write(f"edge-ai-collect: {m}\n")
 

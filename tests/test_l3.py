@@ -66,3 +66,27 @@ def test_l3_pipeline_requires_is_internal_only():
     # No hard dep on anything outside the L3 subsystem.
     for external in ("Requires=crowdsec", "Requires=nftables", "BindsTo="):
         assert external not in svc
+
+
+def test_collector_reads_nft_table_env():
+    # The collector must not hardcode the managed table — on an endpoint it is `inet bastion`,
+    # so a hardcoded `inet edge` makes every `nft list set` fail and `already_acted` go empty.
+    body = (SCRIPTS / "edge-ai-collect").read_text()
+    assert 'os.environ.get("NFT_TABLE"' in body
+    assert 'TABLE_FAM, TABLE_NAME = "inet", "edge"' not in body
+
+
+def test_collector_unit_supplies_machine_env():
+    # NFT_TABLE only reaches the collector if its unit sources machine.env (`-` => optional).
+    unit = (TEMPLATES / "systemd/edge-ai-collect.service").read_text()
+    assert "EnvironmentFile=-/etc/bastion/machine.env" in unit
+
+
+def test_killswitch_panic_fails_loud_on_flush_error():
+    # `edge-ctl panic`/`ai-disable` must NOT report success when a flush errors (silent kill
+    # switch). The error sets are collected and a non-zero exit is returned.
+    body = (SCRIPTS / "edge-ctl").read_text()
+    assert "_flush_failures" in body
+    # both kill-switch paths return 1 on failure
+    assert body.count("return 1 if (failed or not spool_ok) else 0") >= 1
+    assert "PANIC INCOMPLETE" in body

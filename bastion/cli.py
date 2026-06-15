@@ -234,6 +234,11 @@ def cmd_layer(args: argparse.Namespace) -> int:
         if os.geteuid() != 0 and ctx.system.root == Path("/"):
             print(f"layer {args.action} requires root (or use --root for a staged tree)", file=sys.stderr)
             return 1
+        if not getattr(args, "force", False):
+            blocked = _prerequisite_block(ctx, layer, args.action)
+            if blocked:
+                print(f"{args.name}: ABORT — {blocked} (use --force to override)", file=sys.stderr)
+                return 1
         if args.action == "install":
             _install_layer_packages(ctx, layer)
         try:
@@ -243,6 +248,35 @@ def cmd_layer(args: argparse.Namespace) -> int:
             return 1
         return 0
     return 2
+
+
+def _prerequisite_block(ctx: Context, layer, action: str) -> str | None:
+    """Enforce the layer dependency graph declared in each Layer.prerequisites. Returns a reason
+    string if the action must be blocked, else None.
+
+    - install: every prerequisite layer must already be installed (e.g. L3 needs L0+L1). Installing
+      a layer whose base table / feeds are absent leaves it half-wired.
+    - uninstall: no STILL-INSTALLED layer may depend on this one. Without this, `uninstall l0`
+      deletes the base nft table (taking L1/L2/L3's sets with it) AND removes bastion-recovery +
+      the kill switch while the dependent services keep running — Commandment 'recovery always in
+      L0' / 'kill switch always present'. Tear down in reverse order (l6..l0) and this passes."""
+    try:
+        if action == "install":
+            missing = [p for p in layer.prerequisites
+                       if not (layermod.get(p) and layermod.get(p).status(ctx).installed)]
+            if missing:
+                return (f"requires {', '.join(missing)} installed first "
+                        f"(prerequisites: {', '.join(layer.prerequisites)})")
+        else:  # uninstall — reverse-dependency check
+            dependents = [other.name for other in layermod.all_layers()
+                          if layer.name in getattr(other, "prerequisites", ())
+                          and other.status(ctx).installed]
+            if dependents:
+                return (f"still required by installed layer(s) {', '.join(dependents)} — "
+                        f"uninstall them first (reverse order)")
+    except Exception as exc:  # a status probe failing must not wedge the command
+        print(f"warning: prerequisite check incomplete ({exc})", file=sys.stderr)
+    return None
 
 
 def cmd_firewall(args: argparse.Namespace) -> int:
@@ -381,6 +415,9 @@ def build_parser() -> argparse.ArgumentParser:
     lay.add_argument("--root", help="operate under this base dir instead of / (staged install/testing)")
     lay.add_argument("--templates", help="path to templates/ dir")
     lay.add_argument("--scripts", help="path to scripts/ dir")
+    lay.add_argument("--force", action="store_true",
+                     help="bypass the prerequisite/dependency check (e.g. force-uninstall l0 "
+                          "while dependent layers remain)")
     lay.set_defaults(func=cmd_layer)
 
     fw = sub.add_parser("firewall", help="manage the live nftables ruleset")
