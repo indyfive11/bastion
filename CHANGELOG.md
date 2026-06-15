@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.6] - 2026-06-15
+
+### Documentation
+
+- **README: dedicated router / firewall-box use case.** Added an edge-mode appliance section
+  with grounded minimum/recommended hardware specs (CPU, RAM, NICs, storage, uplink), modeled on
+  OPNsense's published baselines and adjusted down because bastion's threat-intel layer (CrowdSec)
+  is log-based rather than inline deep-packet inspection. Notes correct a common misconception:
+  WireGuard uses ChaCha20-Poly1305 and does **not** require AES-NI.
+
 ## [1.0.5] - 2026-06-15
 
 ### Fixed

@@ -4,8 +4,10 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
 A modular, layered Linux firewall framework with an operator CLI, an optional AI-driven
-analysis layer, and an intelligent setup wizard. It targets both **edge** routing machines
-and ordinary **endpoint** computers, and installs from scratch on a fresh system.
+analysis layer, and an intelligent setup wizard. Use it to turn a spare mini-PC or SBC into a
+defense-in-depth **router/firewall box** (a scriptable alternative to consumer-router firmware),
+or to harden a single **endpoint** workstation or server. It installs from scratch on a fresh
+system.
 
 > **What it is NOT:** a general-purpose firewall GUI, a replacement for nftables, a cloud
 > service, or a configuration-management system. It is a focused defense-in-depth tool built
@@ -42,6 +44,51 @@ and ordinary **endpoint** computers, and installs from scratch on a fresh system
   optionally, L5 VPN routing. **You must give the LAN interface an IP yourself** (see pain points).
 - **endpoint** — defense-in-depth on a single host (workstation/server). No LAN routing, no DHCP;
   L4 is skipped.
+
+## Use case: a dedicated router / firewall box
+
+In **edge** mode, bastion turns a small spare machine into a router/firewall appliance. It sits
+between your modem/ISP uplink (WAN) and your LAN and provides stateful firewalling, threat-feed +
+CrowdSec blocking, LAN DNS/DHCP with an ad/tracker/malware sinkhole, and optional WireGuard /
+ZeroTier remote access — a scriptable, defense-in-depth alternative to a consumer router's
+firmware, built on plain nftables.
+
+Use the **`full-edge`** profile (or **`basic-edge`** to skip DNS/DHCP and the AI layer). Edge mode
+requires **at least two network interfaces** — one WAN, one LAN (or a single NIC split into VLANs
+on a managed switch).
+
+### Suggested hardware
+
+bastion's data path is plain in-kernel nftables, and its threat-intel layer (CrowdSec) is
+**log-based, not inline deep-packet inspection** — so it needs noticeably less CPU and RAM than a
+firewall running an inline IDS like Suricata. The figures below track the published OPNsense
+baselines, adjusted down for that lighter footprint.
+
+| | Minimum (~1 Gbps line) | Recommended (1–2.5 Gbps, VPN, headroom) |
+|---|---|---|
+| **CPU** | dual-core x86-64 ≥ 1.5 GHz, or ARM64 (AES-NI **not** required) | quad-core x86-64 ~3 GHz (e.g. Intel N100 / N150) |
+| **RAM** | 2 GB | 4 GB (8 GB with a large DNS sinkhole, heavy VPN, or many CrowdSec collections) |
+| **NICs** | 2× 1GbE, Intel chipset preferred | 2–4× Intel 2.5GbE (e.g. i226-V) |
+| **Storage** | 8 GB | 32 GB+ SSD (CrowdSec DB + journald + feed lists) |
+| **Uplink** | 1 GbE | 2.5GbE+ if your WAN exceeds 1 Gbps |
+
+Notes:
+
+- **Routing is cheap; the userspace services set the floor.** NATed forwarding at 1 Gbps uses well
+  under 10% of one modern core, so an N100-class quad-core sits near line rate even at 2.5 Gbps with
+  filtering. RAM is driven by CrowdSec (~100–300 MB), unbound's cache, and the DNS sinkhole list —
+  not by the firewall itself. The reference build is validated on a 2-core / 2 GB VM.
+- **WireGuard does not need AES-NI.** It uses ChaCha20-Poly1305, which is fast on any CPU (vector
+  instructions match or beat AES-NI); ~1 Gbps of tunnel traffic uses 1–2 cores. AES-NI still helps
+  ZeroTier (AES) and TLS, so it's nice to have, not a requirement.
+- **Two NICs is the hard requirement** for edge mode — one WAN, one LAN (or a single NIC split into
+  VLANs on a managed switch). A single-NIC box can still run **endpoint** mode but cannot route a LAN.
+- **ARM64 works** (an SBC with two NICs, or one NIC + a USB-3 gigabit adapter) — bastion is portable
+  Python + nftables — but on Arch ARM you build CrowdSec from the AUR yourself (as on any Arch
+  system; see the pain points).
+- **Keep an out-of-band console** (serial / IPMI / a keyboard + monitor) for first setup and for the
+  `bastion-recovery` lifeline. A misconfigured firewall on a headless router is otherwise hard to
+  recover.
 
 ## Requirements
 
