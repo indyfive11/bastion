@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# bastion-recovery — emergency, console-initiated SSH recovery (L0, always installed,
+# disabled by default). Machine-agnostic and SELF-CONFIGURING: it detects the real sshd
+# port(s) at START time (never assumes 22), binds an adaptive union of FREE ports, opens an
+# independent nft override table for exactly those ports, stands up a second sshd instance
+# with a one-time password on an EPHEMERAL recovery user, and ANNOUNCES on the console exactly
+# how to connect. Active only while running; leaves the main firewall + main sshd untouched.
+#
+# Subcommands:  start (default) | stop | extend | status
+# Honors machine.env (optional): RECOVERY_DEDICATED_PORT, RECOVERY_WINDOW_SECONDS,
+# RECOVERY_TRY_PORT_22. Live detection wins when those are stale.
+set -u
+
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+DEDICATED_PORT="${RECOVERY_DEDICATED_PORT:-}"
+WINDOW_SECONDS="${RECOVERY_WINDOW_SECONDS:-1800}"
+TRY_PORT_22="${RECOVERY_TRY_PORT_22:-yes}"
+
+RUN=/run/bastion-recovery
+RECOVERY_USER=bastion-rescue
+DESTRUCT_UNIT=bastion-recovery-destruct
+log(){ logger -t bastion-recovery "$*" 2>/dev/null; printf 'bastion-recovery: %s\n' "$*" >&2; }
+
+# ---- detection helpers ----------------------------------------------------
+detect_ssh_ports() {
+  local ports
+  ports=$(sshd -T 2>/dev/null | awk '/^port /{print $2}')
+  [ -z "$ports" ] && ports=$(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2}' /etc/ssh/sshd_config 2>/dev/null)
+  [ -z "$ports" ] && ports=$(ss -tlnH 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}' | sort -un)
+  [ -z "$ports" ] && ports=22
+  printf '%s\n' $ports | sort -un
+}
+port_free() { ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+pick_free_port() { local p; for p in 2222 2022 22222 64022 50022; do port_free "$p" && { echo "$p"; return; }; done; echo 0; }
+
+arm_destruct() {
+  systemctl stop "${DESTRUCT_UNIT}.timer" 2>/dev/null || true
+  systemd-run --quiet --unit="$DESTRUCT_UNIT" --on-active="${WINDOW_SECONDS}s" \
+    /usr/bin/systemctl stop bastion-recovery 2>/dev/null \
+    || log "WARN: could not arm self-destruct timer (manual stop required)"
+}
+
+# ---- start ----------------------------------------------------------------
+do_start() {
+  [ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
+  mkdir -p "$RUN"; chmod 700 "$RUN"
+
+  # Build the adaptive bind set from the FREE subset of: main port(s), 22, dedicated.
+  local bind="" p
+  for p in $(detect_ssh_ports); do port_free "$p" && bind="$bind $p"; done   # (a) operator's known port if main sshd is down
+  [ "$TRY_PORT_22" = yes ] && port_free 22 && bind="$bind 22"                 # (b) universal fallback
+  if [ -n "$DEDICATED_PORT" ]; then                                          # (c) dedicated
+    port_free "$DEDICATED_PORT" && bind="$bind $DEDICATED_PORT"
+  else
+    local dp; dp=$(pick_free_port); [ "$dp" != 0 ] && bind="$bind $dp"
+  fi
+  bind=$(printf '%s\n' $bind | sort -un | tr '\n' ' ')
+  [ -n "${bind// /}" ] || { log "FATAL: no free port available to bind recovery sshd"; exit 1; }
+  printf '%s' "$bind" > "$RUN/ports"
+
+  # Ephemeral recovery user with a one-time password + transient NOPASSWD sudo (for setup).
+  local otp; otp=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+  if ! id "$RECOVERY_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -c "bastion recovery (ephemeral)" "$RECOVERY_USER" 2>/dev/null \
+      || { log "FATAL: could not create recovery user"; exit 1; }
+  fi
+  printf '%s:%s\n' "$RECOVERY_USER" "$otp" | chpasswd
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$RECOVERY_USER" > /etc/sudoers.d/bastion-recovery
+  chmod 440 /etc/sudoers.d/bastion-recovery
+
+  # Ephemeral sshd config — reuse the system host keys (no host-key-changed warning).
+  local cfg="$RUN/sshd_config" k
+  {
+    echo "# bastion-recovery ephemeral sshd — generated at start, removed on stop"
+    for p in $bind; do echo "Port $p"; done
+    echo "PasswordAuthentication yes"
+    echo "KbdInteractiveAuthentication yes"
+    echo "UsePAM yes"
+    echo "PermitRootLogin no"
+    echo "AllowUsers $RECOVERY_USER"
+    echo "PidFile $RUN/sshd.pid"
+    for k in /etc/ssh/ssh_host_*_key; do [ -f "$k" ] && echo "HostKey $k"; done
+  } > "$cfg"
+
+  # nft override: independent table, accepts ONLY the bound ports + ICMP. Does not touch main.
+  local portset; portset=$(printf '%s' "$bind" | tr ' ' ',' | sed 's/^,//; s/,$//')
+  nft -f - <<NFT 2>/dev/null || log "WARN: nft override load failed (main ruleset may already permit these)"
+table inet bastion_recovery {
+  chain input {
+    type filter hook input priority -50; policy accept;
+    tcp dport { $portset } accept
+    ip protocol icmp accept
+    ip6 nexthdr ipv6-icmp accept
+  }
+}
+NFT
+
+  # Start the recovery sshd instance.
+  local sshd; sshd=$(command -v sshd)
+  "$sshd" -f "$cfg" || { log "FATAL: recovery sshd failed to start"; do_stop quiet; exit 1; }
+
+  arm_destruct
+
+  # Announce — the console is the source of truth.
+  local ips; ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')
+  log "================ RECOVERY ACTIVE ================"
+  log "  bound port(s) : $bind"
+  log "  reachable IP(s): ${ips:-<none detected — check console/IPMI link>}"
+  log "  login user     : $RECOVERY_USER (sudo enabled)"
+  log "  one-time pass  : $otp"
+  log "  connect, e.g.  : ssh -p ${bind%% *} ${RECOVERY_USER}@${ips%% *}"
+  log "  auto-stop in   : ${WINDOW_SECONDS}s  (extend: bastion recovery extend | stop: systemctl stop bastion-recovery)"
+  log "================================================"
+}
+
+# ---- stop -----------------------------------------------------------------
+do_stop() {
+  systemctl stop "${DESTRUCT_UNIT}.timer" 2>/dev/null || true
+  [ -f "$RUN/sshd.pid" ] && kill "$(cat "$RUN/sshd.pid")" 2>/dev/null || true
+  pkill -f "sshd -f $RUN/sshd_config" 2>/dev/null || true
+  nft delete table inet bastion_recovery 2>/dev/null || true
+  rm -f /etc/sudoers.d/bastion-recovery
+  if id "$RECOVERY_USER" >/dev/null 2>&1; then userdel -r "$RECOVERY_USER" 2>/dev/null || userdel "$RECOVERY_USER" 2>/dev/null || true; fi
+  rm -rf "$RUN"
+  [ "${1:-}" = quiet ] || log "recovery stopped: override table removed, recovery sshd down, OTP user revoked. Main firewall unaffected."
+}
+
+# ---- extend / status ------------------------------------------------------
+do_extend() {
+  [ -d "$RUN" ] || { log "recovery is not active"; exit 1; }
+  arm_destruct
+  log "recovery window extended by ${WINDOW_SECONDS}s"
+}
+do_status() {
+  if [ -d "$RUN" ] && [ -f "$RUN/ports" ]; then
+    echo "bastion-recovery: ACTIVE on port(s) $(cat "$RUN/ports")"
+  else
+    echo "bastion-recovery: inactive"
+  fi
+}
+
+case "${1:-start}" in
+  start)  do_start ;;
+  stop)   do_stop ;;
+  extend) do_extend ;;
+  status) do_status ;;
+  *) echo "usage: bastion-recovery {start|stop|extend|status}" >&2; exit 2 ;;
+esac

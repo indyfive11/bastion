@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bastionfw"
+version = "1.0.0"
+description = "Modular, layered Linux firewall framework with an operator CLI, optional AI analysis layer, and an intelligent setup wizard."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "indyfive11", email = "203553604+indyfive11@users.noreply.github.com" }]
+keywords = ["firewall", "nftables", "security", "edge", "crowdsec"]
+dependencies = [
+    "textual>=0.60",
+]
+
+[project.optional-dependencies]
+web = ["fastapi", "uvicorn"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+bastion = "bastion.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/indyfive11/bastion"
+
+[tool.setuptools.packages.find]
+include = ["bastion*"]
+
+[tool.setuptools.package-data]
+# Operational scripts + config templates ship inside the wheel so an installed
+# `bastion setup` can find them (resolved package-relative in cli.find_*_dir).
+bastion = ["scripts/*", "templates/*", "templates/systemd/*", "machine.conf.example"]

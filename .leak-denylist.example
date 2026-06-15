@@ -1,0 +1,16 @@
+# .leak-denylist — LOCAL, GITIGNORED. Copy to `.leak-denylist` and fill in YOUR values.
+#
+# `make leak-check` greps the whole tree for these strings (case-insensitive, fixed-string)
+# and FAILS if any appears in a committed file. Put your installation-specific identifiers
+# here so they can never leak into the public repo. This .example is committed; the real
+# .leak-denylist is gitignored and never published — so the denylist never leaks the very
+# strings it guards.
+#
+# One literal string (or IP prefix) per line. List YOUR real values in .leak-denylist, e.g.:
+#   my-edge-hostname
+#   my-laptop-hostname
+#   me@example.com
+#   203.0.113            # your VPS / relay public IP prefix
+#   198.51.100           # your DNS upstream public IP prefix
+#   <private ntfy topic or other capability tokens>
+#   <hardware/disk UUIDs that identify your machine>

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# lan-verify — verify REAL LAN clients are being forwarded+masqueraded through the relay
+# AND getting replies. Reads conntrack (the FORWARD path the node's own egress test can't
+# see). Run while a LAN client is generating traffic. Closes the "LAN-client blind spot".
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+LAN_NET=${LAN_NET:-}                   # LAN CIDR, e.g. 10.0.1.0/24
+RELAY_DST=${RELAY_DST:-}               # relay masquerade addr (this node's relay-side IP)
+
+# Conntrack source: the procfs file when present, else `conntrack -L` (conntrack-tools). Modern
+# kernels ship with CONFIG_NF_CONNTRACK_PROCFS off, so /proc/net/nf_conntrack is ABSENT even though
+# nf_conntrack is loaded and used by the nft `ct`/masquerade ruleset; the conntrack binary reads the
+# same table over netlink. Both need root. The two output formats share the src=/dst=/UNREPLIED/
+# ASSURED fields the greps below match, so the parsing is identical either way.
+ct_proc=/proc/net/nf_conntrack
+if [ -r "$ct_proc" ]; then
+  CT=$(cat "$ct_proc" 2>/dev/null); src_desc="$ct_proc"
+elif command -v conntrack >/dev/null 2>&1; then
+  CT=$(conntrack -L 2>/dev/null) || { echo "conntrack -L failed (need root)"; exit 2; }
+  src_desc="conntrack -L"
+else
+  echo "no conntrack source: $ct_proc absent (kernel without CONFIG_NF_CONNTRACK_PROCFS) and the"
+  echo "conntrack binary is not installed — install conntrack-tools (e.g. pacman -S conntrack-tools)."
+  exit 2
+fi
+[ -n "$LAN_NET" ] && [ -n "$RELAY_DST" ] || { echo "set LAN_NET and RELAY_DST (machine.env)"; exit 2; }
+
+# Dotted source prefix from the LAN CIDR (e.g. 10.0.1.0/24 -> "10.0.1.") and a regex-safe form.
+LAN_SRC=$(printf '%s' "$LAN_NET" | sed -E 's#\.[0-9]+/[0-9]+$#.#')
+LAN_RE=$(printf '%s' "$LAN_SRC" | sed 's/\./\\./g')
+DST_RE=$(printf '%s' "$RELAY_DST" | sed 's/\./\\./g')
+
+total=$(grep -c "src=${LAN_RE}.*dst=${DST_RE}" <<<"$CT")
+replied=$(grep "src=${LAN_RE}.*dst=${DST_RE}" <<<"$CT" | grep -vc 'UNREPLIED')
+assured=$(grep "src=${LAN_RE}.*dst=${DST_RE}" <<<"$CT" | grep -c 'ASSURED')
+echo "== LAN-client relay flows (${LAN_SRC}x -> relay, masqueraded to ${RELAY_DST}; via ${src_desc}) =="
+echo "  total flows : $total"
+echo "  with replies: $replied   (ASSURED: $assured)"
+echo "  distinct LAN clients using the relay:"
+grep -oE "src=${LAN_RE}[0-9]+" <<<"$CT" | sort -u | sed 's/^/    /' | head
+echo "  sample replied flows (proof of working return path):"
+grep "src=${LAN_RE}.*dst=${DST_RE}" <<<"$CT" | grep -v UNREPLIED | grep -E 'ASSURED|ESTABLISHED' | head -3 | sed -E 's/^/    /'
+echo
+if [ "$replied" -gt 0 ]; then echo "RESULT: PASS — LAN clients are forwarding AND receiving replies through the relay."; exit 0
+else echo "RESULT: NO REPLIED FLOWS — generate traffic on a LAN client (load a web page) and re-run."; exit 1; fi

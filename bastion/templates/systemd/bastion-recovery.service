@@ -1,0 +1,18 @@
+[Unit]
+Description=bastion emergency SSH recovery (console-initiated; disabled by default)
+Documentation=file:/usr/local/sbin/bastion-recovery
+# No hard deps: this is the last-resort recovery surface and must be able to start even when
+# the rest of the stack is broken. Soft ordering only.
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bastion-recovery start
+ExecStop=/usr/local/sbin/bastion-recovery stop
+# Needs root and stays un-sandboxed: it writes nft, a sudoers drop-in, an ephemeral user,
+# and a second sshd. Confinement breakage on the recovery path is worse than the gain.
+TimeoutStartSec=30
+
+# Intentionally NO [Install]/WantedBy: always installed, NEVER auto-enabled. Start only from
+# the local console:  sudo systemctl start bastion-recovery

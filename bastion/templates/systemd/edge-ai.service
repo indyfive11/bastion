@@ -1,0 +1,34 @@
+[Unit]
+Description=edge-ai analyzer (UNPRIVILEGED; pluggable AI backend -> intents.json spool)
+Documentation=file:/usr/local/sbin/edge-ai-analyze
+# Internal pipeline ordering (allowed by §3 #3): collect (root sanitizer) MUST produce fresh
+# signals.json before analyze consumes it. collect+analyze are ONE cycle split only for privilege
+# separation — both internal to L3, timer-triggered (not boot), AI layer non-core (cycle failure
+# => firewall keeps enforcing existing sets). If collect fails, this cycle is skipped and the next
+# timer tick retries both. This is an internal-pipeline hard dep, not an external/boot one.
+Requires=edge-ai-collect.service
+After=edge-ai-collect.service
+
+[Service]
+Type=oneshot
+User=edge-ai
+Group=edge-ai
+# API key (claude backend) injected by systemd; '-' = optional so mock/offline still runs.
+EnvironmentFile=-/etc/edge-ai/claude.env
+ExecStart=/usr/local/sbin/edge-ai-analyze
+WorkingDirectory=/var/lib/edge-ai
+# zero-privilege analyzer: needs network (API call) + read signals + write intents only
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/edge-ai
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

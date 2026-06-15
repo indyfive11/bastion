@@ -1,0 +1,27 @@
+# bastion never-block allowlist — Tier-0 invariant.
+# The reconciler HARD-REJECTS any candidate (from ANY source: CrowdSec, feeds, AI) that
+# OVERLAPS an entry here, plus per-source CIDR-width floors. One CIDR/IP per line.
+#
+# Blast-radius note: managed sets match SOURCE addr on input/forward (INBOUND) only, and
+# `ct established,related accept` precedes the block drops — so an entry here cannot strand
+# OUTBOUND traffic. What this list guards is an inbound PEER / TUNNEL / MGMT source (e.g. a
+# WireGuard handshake) from being blocked.
+#
+# This shipped template contains ONLY the universal RFC1918 + loopback + CGNAT floors.
+# Installation-specific entries (your relay endpoint, chosen DNS upstreams, AI API range)
+# are appended by the installer/wizard from machine.conf — they are NEVER committed here,
+# because committing a real public IP is a leak (see Makefile leak-check).
+
+# --- loopback ---
+127.0.0.0/8
+# --- all RFC1918 (covers LAN, ZeroTier, WireGuard, and local gateway space) ---
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+# --- CGNAT (possible ISP gateway space once this node is the WAN edge) ---
+100.64.0.0/10
+
+# --- installation-specific entries are added below by the installer, e.g.: ---
+#   <relay/tunnel far-end public IP>/32        (anti-stranding for your upstream relay)
+#   <chosen DNS upstream IP>/32                (so the resolver path is never blocked)
+#   <AI API provider range>/NN                 (anti-stranding so the analyzer can always reach its API)

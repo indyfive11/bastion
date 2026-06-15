@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# edge-ai-analyze — the UNPRIVILEGED analyzer (runs as user edge-ai; no sudo, no nft).
+#
+# Reads the sanitized /var/lib/edge-ai/signals.json, invokes the configured pluggable
+# BACKEND_CMD (signals on stdin -> intent-envelope JSON on stdout), validates the result
+# against intent.schema.json, stamps each intent with an ABSOLUTE `expires` epoch, and
+# atomically writes /var/lib/edge-ai/intents.json. The reconciler (root) re-validates and
+# applies. This process can NEVER touch the firewall.
+#
+# Self-heal: absolute expiry means a DEAD analyzer's blocks count down and drop out even
+# though intents.json persists (the reconciler applies timeout = expires - now). On ANY
+# error we leave the previous intents.json UNTOUCHED so its entries keep expiring normally.
+#
+import json, os, subprocess, sys, time
+
+BACKENDCONF = "/etc/edge-ai/backend.conf"
+SCHEMA      = "/etc/edge-ai/intent.schema.json"
+SIGNALS     = "/var/lib/edge-ai/signals.json"
+INTENTS     = "/var/lib/edge-ai/intents.json"
+PROPOSALS   = "/var/lib/edge-ai/proposals.jsonl"   # human-review queue (propose_base_change)
+APPLY_ACTIONS = {"block_src", "ratelimit_src", "tarpit_src"}
+
+def log(m): sys.stderr.write(f"edge-ai-analyze: {m}\n")
+def die(m, code=1):
+    log(m); log("leaving previous intents.json untouched (self-heal via TTL)"); sys.exit(code)
+
+def load_conf():
+    cfg = {"BACKEND_CMD": "/usr/local/sbin/edge-ai-backend-mock", "MODEL": "claude-opus-4-8",
+           "MAX_INTENTS": 32, "MAX_TTL": 86400, "MIN_TTL": 60, "BACKEND_TIMEOUT": 60}
+    try:
+        with open(BACKENDCONF) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line: continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        log(f"WARNING: {BACKENDCONF} missing, using defaults")
+    for k in ("MAX_INTENTS", "MAX_TTL", "MIN_TTL", "BACKEND_TIMEOUT"):
+        try: cfg[k] = int(cfg[k])
+        except (ValueError, TypeError): pass
+    return cfg
+
+def main():
+    cfg = load_conf()
+    try:
+        with open(SIGNALS) as f:
+            signals_raw = f.read()
+        json.loads(signals_raw)   # sanity parse
+    except Exception as e:
+        die(f"cannot read/parse {SIGNALS}: {e}")
+
+    # ---- invoke the pluggable backend (the provider-agnostic process contract) ----
+    cmd = cfg["BACKEND_CMD"].split()
+    env = dict(os.environ)
+    env["EDGE_AI_MODEL"] = str(cfg["MODEL"])
+    try:
+        p = subprocess.run(cmd, input=signals_raw, capture_output=True, text=True,
+                           timeout=cfg["BACKEND_TIMEOUT"], env=env)
+    except subprocess.TimeoutExpired:
+        die(f"backend {cmd[0]} timed out after {cfg['BACKEND_TIMEOUT']}s")
+    except Exception as e:
+        die(f"backend {cmd[0]} exec failed: {e}")
+    if p.returncode != 0:
+        die(f"backend {cmd[0]} rc={p.returncode}: {p.stderr.strip()[:300]}")
+    try:
+        env_doc = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        die(f"backend output not JSON: {e}; head={p.stdout[:200]!r}")
+
+    # ---- validate envelope shape (jsonschema if available, else manual) ----
+    try:
+        import jsonschema
+        with open(SCHEMA) as f:
+            schema = json.load(f)
+        jsonschema.validate(env_doc, schema)
+    except ImportError:
+        if not (isinstance(env_doc, dict) and env_doc.get("version") == 1
+                and isinstance(env_doc.get("intents"), list)):
+            die("envelope failed manual validation (no jsonschema lib)")
+    except Exception as e:
+        die(f"envelope failed schema validation: {e}")
+
+    now = int(time.time())
+    backend_id = str(env_doc.get("backend", cmd[0]))[:200]
+    applied, proposals = [], []
+    for it in env_doc.get("intents", []):
+        action = it.get("action")
+        if action == "propose_base_change":
+            proposals.append({"ts": now, "backend": backend_id,
+                              "description": str(it.get("description", ""))[:600],
+                              "reason": str(it.get("reason", ""))[:280]})
+            continue
+        if action not in APPLY_ACTIONS:
+            log(f"drop unknown action {action!r}"); continue
+        cidr = str(it.get("cidr", "")).strip()
+        if not cidr:
+            log(f"drop {action}: missing cidr"); continue
+        ttl = it.get("ttl", cfg["MIN_TTL"])
+        try: ttl = int(ttl)
+        except (ValueError, TypeError): ttl = cfg["MIN_TTL"]
+        ttl = max(cfg["MIN_TTL"], min(cfg["MAX_TTL"], ttl))   # clamp
+        applied.append({
+            "action": action, "cidr": cidr, "ttl": ttl, "expires": now + ttl,
+            "reason": str(it.get("reason", ""))[:280],
+            "confidence": it.get("confidence"),
+        })
+        if len(applied) >= cfg["MAX_INTENTS"]:
+            log(f"hit MAX_INTENTS={cfg['MAX_INTENTS']}, truncating"); break
+
+    out = {"version": 1, "generated_epoch": now, "backend": backend_id, "intents": applied}
+    os.makedirs(os.path.dirname(INTENTS), exist_ok=True)
+    tmp = INTENTS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+    os.replace(tmp, INTENTS)
+
+    if proposals:
+        with open(PROPOSALS, "a") as f:
+            for pr in proposals:
+                f.write(json.dumps(pr, separators=(",", ":")) + "\n")
+
+    log(f"backend={backend_id} -> {len(applied)} apply-intents, {len(proposals)} proposals")
+    print(json.dumps({"backend": backend_id, "apply_intents": len(applied),
+                      "proposals": len(proposals)}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

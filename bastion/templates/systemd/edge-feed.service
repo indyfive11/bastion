@@ -1,0 +1,16 @@
+[Unit]
+Description=edge threat-feed fetcher (source for edge-reconciler; zero firewall privilege)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=edge-feed
+ExecStart=/usr/local/sbin/edge-feed-fetch
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+SystemCallFilter=@system-service

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# flowcheck — verify every testable network flow on a bastion node. Run identically
+# at each checkpoint. Egress may traverse a relay interface, so the egress canary
+# doubles as the relay test. Machine-specific values come from the bastion env file.
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+RELAY_IF=${RELAY_IF:-}                 # upstream relay/tunnel interface (optional)
+WG_SERVER_IF=${WG_SERVER_IF:-}         # WireGuard server interface (optional)
+LAN_IP=${LAN_IP:-}                     # this node's LAN IP (for the local DNS listen check)
+DNS_UPSTREAM=${DNS_UPSTREAM:-}         # local stub resolver, host#port (e.g. 127.0.0.1#5335)
+EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
+
+pass=0; fail=0
+ck(){ if eval "$2" >/dev/null 2>&1; then echo "  PASS  $1"; pass=$((pass+1)); else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
+
+# DNS query helper — prints A records, rc 0 on an answer. Uses whichever resolver tool is present:
+# dig (bind-tools), drill (ldns — shipped as an unbound dependency on Arch, so reliably there where
+# the local stub is), or kdig (knot). bastion installs none of these itself, so don't assume dig.
+DNS_TOOL=$(command -v dig || command -v drill || command -v kdig || true)
+dns_q(){ # dns_q <server> <port> <name>
+  case "${DNS_TOOL##*/}" in
+    dig)  dig +short +time=3 -p "$2" @"$1" "$3" ;;
+    drill) drill -Q @"$1" -p "$2" "$3" ;;
+    kdig) kdig +short +time=3 -p "$2" @"$1" "$3" ;;
+    *)    return 127 ;;
+  esac
+}
+
+# resolv_leak — does the host's OWN /etc/resolv.conf bypass the hardened local DNS chain? Catches the
+# class of leak where WAN DHCP overwrites resolv.conf with the ISP's public resolver, so this node's
+# lookups skip dnsmasq->unbound->VPS entirely. "Local" = loopback (127.0.0.0/8, ::1 — covers the :5335
+# stub AND systemd-resolved's 127.0.0.53) or this node's own LAN_IP (its dnsmasq). Any other (public)
+# nameserver is a leak. Only meaningful when a local chain is expected (loopback stub — the caller
+# gates on that). CAVEAT: if resolv.conf IS the systemd-resolved stub (127.0.0.53) this passes even if
+# resolved itself forwards to the ISP — a deeper `resolvectl` probe is a deferred polish-phase item.
+# Echoes the leaking server(s); rc 0 = leak found, rc 1 = clean. RESOLV_CONF overridable for tests.
+resolv_leak(){
+  local f="${RESOLV_CONF:-/etc/resolv.conf}" ns leak=""
+  [ -r "$f" ] || return 1
+  for ns in $(awk '/^[[:space:]]*nameserver/{print $2}' "$f"); do
+    case "$ns" in
+      127.*|::1|"$LAN_IP") ;;          # local chain — fine
+      *) leak="$leak $ns" ;;
+    esac
+  done
+  [ -n "$leak" ] && { echo "$leak"; return 0; }
+  return 1
+}
+
+echo "== firewall state =="
+echo "  ufw=$(systemctl is-active ufw)  nftables=$(systemctl is-active nftables)"
+
+echo "== flows =="
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$EGRESS_PROBE" 2>/dev/null)
+[ "$code" = "404" -o "$code" = "200" ] && { echo "  PASS  egress->$EGRESS_PROBE (HTTP $code)"; pass=$((pass+1)); } || { echo "  FAIL  egress->$EGRESS_PROBE (HTTP ${code:-none})"; fail=$((fail+1)); }
+ck "egress->Cloudflare (independent path check)" 'curl -s -o /dev/null --max-time 8 https://www.cloudflare.com'
+ck "DNS resolves (getent)" 'getent hosts github.com'
+# Local stub resolver: dnsmasq forwards to a loopback stub (unbound on 127.0.0.1#5335 in the
+# reference edge profile). Probe the CONFIGURED host#port — querying 127.0.0.1:53 finds nothing
+# (dnsmasq listens on LAN_IP:53, unbound on :5335). Only when the upstream is a loopback stub;
+# an external dns_upstream has no local stub to test.
+stub_host=${DNS_UPSTREAM%%#*}
+stub_port=${DNS_UPSTREAM##*#}; [ "$stub_port" = "$DNS_UPSTREAM" ] && stub_port=53
+case "$stub_host" in
+  127.*|::1)
+    [ -n "$DNS_TOOL" ] && \
+      ck "DNS via local stub (${DNS_TOOL##*/} -p ${stub_port} @${stub_host})" \
+         'dns_q '"$stub_host"' '"$stub_port"' cloudflare.com | grep -E "^[0-9]+\."'
+    # host's own resolver must not bypass the local chain (ISP-DNS leak guard)
+    if leak=$(resolv_leak); then
+      echo "  FAIL  host resolver leak — /etc/resolv.conf points at$leak (bypasses local chain)"; fail=$((fail+1))
+    else
+      echo "  PASS  host resolver uses local chain (no ISP-DNS leak)"; pass=$((pass+1))
+    fi
+    ;;
+esac
+[ -n "$RELAY_IF" ] && ck "relay handshake fresh (<180s)" 'a=$(sudo -n wg show '"$RELAY_IF"' latest-handshakes 2>/dev/null | awk "{print \$2}"); n=$(date +%s 2>/dev/null || echo 0); [ -n "$a" ] && [ "$a" -gt 0 ] && [ $((n-a)) -lt 180 ]'
+[ -n "$WG_SERVER_IF" ] && ck "WireGuard server iface present" 'sudo -n wg show '"$WG_SERVER_IF"
+[ -n "$LAN_IP" ] && ck "local DNS listening ${LAN_IP}:53" 'ss -uln | grep -q "'"$LAN_IP"':53"'
+
+echo "== summary: $pass pass / $fail fail =="
+[ "$fail" -eq 0 ]

@@ -1,0 +1,47 @@
+#!/usr/sbin/nft -f
+# bastion endpoint firewall — defense-in-depth for a node that is NOT the gateway.
+# Input chain only: no forward chain, no NAT, no DHCP/DNS service rules. Another device
+# already provides routing and addressing; this template never touches the default route.
+#
+# Interface (resolved from machine.conf at generate time): {{ interfaces.lan }}=primary NIC
+
+flush ruleset
+
+table inet bastion {
+
+    set blk_feed { type ipv4_addr; flags interval, timeout; }
+    set cs_block { type ipv4_addr; flags interval, timeout; }
+    set ai_block { type ipv4_addr; flags interval, timeout; }
+    set ai_ratelimit { type ipv4_addr; flags interval, timeout; }
+    set ai_tarpit { type ipv4_addr; flags interval, timeout; }
+
+    set trusted_hosts {
+        type ipv4_addr
+        {{ network.trusted_hosts_elements }}
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        ip saddr @cs_block drop
+        ip saddr @blk_feed drop
+        ip saddr @ai_block drop
+        ip saddr @ai_ratelimit ct state new limit rate over 10/second burst 20 packets drop
+        ip saddr @ai_tarpit ct state new limit rate over 2/minute burst 5 packets drop
+
+        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+        ip protocol icmp icmp type echo-request limit rate 10/second accept
+        ip6 nexthdr ipv6-icmp accept
+
+        # Management access from the local subnet + explicitly trusted hosts only.
+        ip saddr {{ network.lan_cidr }} tcp dport {{ ports.ssh }} accept
+        ip saddr @trusted_hosts accept
+    }
+
+    # No forward chain and no NAT table: an endpoint never routes for other hosts.
+    chain output { type filter hook output priority filter; policy accept; }
+}

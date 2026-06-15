@@ -1,0 +1,20 @@
+[Unit]
+Description=edge-ai signal collector (root, READ-ONLY, sanitizes -> external-safe signals.json)
+Documentation=file:/usr/local/sbin/edge-ai-collect
+After=crowdsec.service
+Wants=crowdsec.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/edge-ai-collect
+# Privileged read-only collector (reads cscli + journal). Holds ZERO firewall-write power.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/edge-ai
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

@@ -1,0 +1,94 @@
+# bastion machine.conf — ANNOTATED EXAMPLE. Copy to /etc/bastion/machine.conf (system
+# install) or ~/.config/bastion/machine.conf (user install) and edit. All values here are
+# generic placeholders (RFC1918 / documentation values) — NEVER commit a real machine.conf.
+#
+# `bastion generate` resolves the templates/ files against this file ({{ section.key }}
+# notation) and also renders the shell-sourced /etc/bastion/machine.env that the operational
+# scripts (edge-watchdog, lan-verify, net-confirm, net-rollback, edge-dnsblock-update) read.
+#
+# Comments are on their own lines (a value may itself contain '#', e.g. dns_upstream).
+
+[machine]
+# mode: edge | endpoint
+mode = edge
+# profile: full-edge | basic-edge | full-endpoint | minimal-endpoint | custom
+profile = full-edge
+# active layers (derived from profile unless custom)
+layers = l0,l1,l2,l3,l4,l5,l6
+# distro: arch | debian | ubuntu | fedora | auto
+distro = arch
+secrets_file = /etc/bastion/secrets.conf
+
+[interfaces]
+# LAN interface — detected by wizard, confirm or override
+lan = eth0
+# WAN interface (edge mode only)
+wan = eth1
+# ZeroTier interface — auto-detected, or unused
+zt_iface = zt0
+# upstream relay/tunnel interface (L5, optional)
+wg_vps_iface = wg_vps
+# WireGuard server interface (L5, optional)
+wg_server_iface = wg0
+
+[network]
+# LAN subnet (edge mode)
+lan_cidr = 10.0.1.0/24
+# this node's LAN IP
+lan_ip = 10.0.1.1
+# upstream default gateway (router) — ISP-up probe + default-route restore
+gateway = 10.0.1.254
+# ZeroTier subnet (edge full profile); set equal to lan_cidr if unused
+zt_cidr = 10.147.17.0/24
+# WireGuard server subnet (L5)
+wg_server_cidr = 10.8.0.0/24
+# always-accept management IPs (comma-separated, user-entered)
+trusted_hosts = 10.0.1.50, 10.0.1.55
+# DNS upstream — see docs/options/dns-options.md (local stub shown)
+dns_upstream = 127.0.0.1#5335
+# L4 DHCP pool start
+dhcp_range_start = 10.0.1.100
+# L4 DHCP pool end
+dhcp_range_end = 10.0.1.249
+# L4 DHCP lease time
+dhcp_lease = 12h
+
+[ports]
+# SSH listen port — detected from running sshd, confirm or change
+ssh = 22
+
+[ai]
+# claude backend; mock = edge-ai-backend-mock
+backend_cmd = /usr/local/sbin/edge-ai-backend-claude
+model = claude-opus-4-8
+max_intents = 32
+# systemd OnUnitActiveSec for edge-ai.timer
+timer_interval = 4h
+# regular | advanced | expert
+depth = regular
+# auto-rollback window for Expert Mode access-rule changes
+expert_canary_seconds = 300
+# minimum confidence for Expert Mode auto-apply
+expert_confidence_floor = 0.92
+
+[recovery]
+# bastion-recovery (L0, always installed, disabled by default). All optional — at start the
+# service detects live sshd port(s) and binds an adaptive union of free ports; these are
+# defaults/overrides only (live detection wins when machine.conf is stale).
+# extra recovery sshd port; blank = auto-pick a free high port
+dedicated_port =
+# self-destruct window (seconds) before auto-stop unless `bastion recovery extend`
+window_seconds = 1800
+# also bind 22 when it is free (universal fallback)
+try_port_22 = yes
+
+[monitoring]
+# L6 watchdog/verify/alert + L4 DNS-sinkhole knobs, rendered into machine.env.
+# egress canary URL (net-confirm, flowcheck)
+egress_probe = https://api.anthropic.com
+# relay far-end / masquerade-side IP (edge-watchdog, lan-verify); blank if no relay
+relay_dst = 10.0.0.3
+# NetworkManager connection to re-up on rollback; blank if not using NM
+nm_conn =
+# space-separated host-list URLs; blank = built-in default (StevenBlack)
+dnsblock_sources =

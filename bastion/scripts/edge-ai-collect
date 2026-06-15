@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# edge-ai-collect — the PRIVILEGED, READ-ONLY signal collector for the AI analyzer.
+#
+# Runs as root (it reads cscli + the journal), but holds ZERO firewall-write capability:
+# it only WRITES a data file. The sole nft writer remains edge-reconciler.
+#
+# CRITICAL — this is the DATA-EGRESS SANITIZATION BOUNDARY. The analyzer hands signals.json
+# to a (possibly remote) AI backend, which is an EXTERNAL channel. Per the fleet HARD RULE
+# (no architectural detail on external/unencrypted channels) this collector emits ONLY:
+#   * PUBLIC source IPs (is_global AND not in our allowlist)   -- never RFC1918/CGNAT/loopback
+#   * event type + counts + coarse timestamps
+#   * what we have ALREADY done (current ai_* set members)
+# It STRIPS hostnames, internal/LAN IPs, our own infra IPs (VPS/Anthropic/allowlist), mount
+# and trust detail. Because the AI only ever sees this curated file, it is also our
+# prompt-injection containment surface.
+#
+import ipaddress, json, os, re, subprocess, sys, time
+
+ALLOWLIST   = "/etc/edge-reconciler/policy.allowlist"
+OUT         = "/var/lib/edge-ai/signals.json"
+WINDOW_HOURS = 24
+AI_SETS     = ["ai_block", "ai_ratelimit", "ai_tarpit"]
+TABLE_FAM, TABLE_NAME = "inet", "edge"
+
+def log(m): sys.stderr.write(f"edge-ai-collect: {m}\n")
+
+def load_allowlist():
+    nets = []
+    try:
+        with open(ALLOWLIST) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    try: nets.append(ipaddress.ip_network(line, strict=False))
+                    except ValueError: pass
+    except FileNotFoundError:
+        log(f"WARNING: {ALLOWLIST} missing")
+    return nets
+
+def is_emittable(ipstr, allow):
+    # external-safe gate: only PUBLIC IPs that are not ours.
+    try:
+        ip = ipaddress.ip_address(ipstr)
+    except ValueError:
+        return False
+    if ip.version != 4:          # IPv4 only for now (matches the data plane)
+        return False
+    if not ip.is_global:         # strips RFC1918, loopback, CGNAT 100.64/10, link-local, etc.
+        return False
+    for a in allow:
+        if a.version == 4 and ip in a:   # strips VPS / Anthropic / any allowlisted infra
+            return False
+    return True
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            log(f"{cmd[0]} rc={p.returncode}: {p.stderr.strip()[:160]}")
+            return None
+        return p.stdout
+    except Exception as e:
+        log(f"{cmd[0]} failed: {e}")
+        return None
+
+# ---- sources (each best-effort; failure => empty, never crash) ----
+def crowdsec_signals(obs, allow):
+    # active decisions = currently-banned; alerts = what was detected + scenario.
+    out = run(["cscli", "decisions", "list", "-o", "json"])
+    active = set()
+    if out and out.strip() not in ("", "null"):
+        try:
+            for alert in json.loads(out) or []:
+                for d in alert.get("decisions") or []:
+                    v = d.get("value", "")
+                    if "/" in v:  # range -> use network addr token as-is for membership note only
+                        v = v.split("/")[0]
+                    if is_emittable(v, allow):
+                        active.add(v)
+        except Exception as e:
+            log(f"cscli decisions parse: {e}")
+    out = run(["cscli", "alerts", "list", "-o", "json"])
+    if out and out.strip() not in ("", "null"):
+        try:
+            for alert in json.loads(out) or []:
+                src = (alert.get("source") or {}).get("value", "")
+                scenario = alert.get("scenario", "") or ""
+                # scenario looks like "crowdsecurity/ssh-bf"; keep only the leaf label
+                label = scenario.split("/")[-1] if scenario else "crowdsec"
+                if is_emittable(src, allow):
+                    o = obs.setdefault(src, {"ip": src, "events": {}, "scenarios": set()})
+                    o["events"]["crowdsec_alert"] = o["events"].get("crowdsec_alert", 0) + 1
+                    if label: o["scenarios"].add(label)
+        except Exception as e:
+            log(f"cscli alerts parse: {e}")
+    for ip in active:
+        o = obs.setdefault(ip, {"ip": ip, "events": {}, "scenarios": set()})
+        o["crowdsec_active_decision"] = True
+
+IP_RE = re.compile(r'(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])')
+def journal_sshd_signals(obs, allow):
+    out = run(["journalctl", "-u", "sshd.service", "--since", f"-{WINDOW_HOURS}h",
+               "-o", "cat", "--no-pager"], timeout=25)
+    if not out:
+        return
+    for line in out.splitlines():
+        et = None
+        if "Failed password" in line or "Invalid user" in line:
+            et = "ssh_auth_fail"
+        elif "Connection closed by authenticating user" in line or "preauth" in line:
+            et = "ssh_preauth_abort"
+        if not et:
+            continue
+        for m in IP_RE.findall(line):
+            if is_emittable(m, allow):
+                o = obs.setdefault(m, {"ip": m, "events": {}, "scenarios": set()})
+                o["events"][et] = o["events"].get(et, 0) + 1
+                break
+
+def current_ai_sets():
+    acted = {}
+    for s in AI_SETS:
+        out = run(["nft", "-j", "list", "set", TABLE_FAM, TABLE_NAME, s], timeout=15)
+        members = []
+        if out:
+            try:
+                data = json.loads(out)
+                for obj in data.get("nftables", []):
+                    st = obj.get("set")
+                    if not st: continue
+                    for e in st.get("elem", []) or []:
+                        v = e
+                        if isinstance(e, dict) and "elem" in e:
+                            v = e["elem"].get("val", e["elem"])
+                        if isinstance(v, dict) and "prefix" in v:
+                            members.append(f"{v['prefix']['addr']}/{v['prefix']['len']}")
+                        elif isinstance(v, str):
+                            members.append(v)
+            except Exception as e:
+                log(f"ai set {s} parse: {e}")
+        acted[s] = members
+    return acted
+
+def main():
+    allow = load_allowlist()
+    obs = {}
+    crowdsec_signals(obs, allow)
+    journal_sshd_signals(obs, allow)
+    # finalize observations (sets -> sorted lists; total)
+    observations = []
+    for ip, o in obs.items():
+        o["scenarios"] = sorted(o.get("scenarios", []))
+        o["total_events"] = sum(o.get("events", {}).values())
+        observations.append(o)
+    observations.sort(key=lambda x: x["total_events"], reverse=True)
+    doc = {
+        "version": 1,
+        "generated_epoch": int(time.time()),
+        "window_hours": WINDOW_HOURS,
+        "note": ("External-safe: PUBLIC source IPs + event types + counts only. "
+                 "No internal/LAN/host/arch detail (fleet no-arch-leak HARD RULE)."),
+        "observations": observations,
+        "already_acted": current_ai_sets(),
+    }
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, separators=(",", ":"))
+    os.replace(tmp, OUT)
+    # make readable by the edge-ai user (root writes it; analyzer reads it)
+    try:
+        os.chmod(OUT, 0o644)
+    except OSError:
+        pass
+    log(f"wrote {len(observations)} observations -> {OUT}")
+    print(json.dumps({"observations": len(observations),
+                      "already_acted": {k: len(v) for k, v in doc["already_acted"].items()}}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

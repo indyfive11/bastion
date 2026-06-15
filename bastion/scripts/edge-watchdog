@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# edge-watchdog — standing egress/relay self-heal for a bastion edge node.
+# Permanent successor to net-monitor (which is a SHORT-window cutover tool):
+#   * persistent loop, re-arms after acting (net-monitor is single-shot)
+#   * self-refreshing known-good snapshot while stable (kills the stale-snapshot
+#     footgun that caused the 2026-06-05 edge<->UFW flap)
+#   * us-vs-ISP discrimination: upstream/ISP outages => ALERT ONLY, never roll back
+#     (a rollback can't fix an upstream outage; avoid churn)
+#   * graduated heal: cheapest first (atomic nft reload) -> full net-rollback
+#   * closes the LAN-client blind spot via conntrack (node self-egress can be green
+#     while LAN clients are cut)
+#   * firewall-aware: reuses /var/lib/net-safe snapshot + net-{snapshot,rollback}
+#   * alerts: FULL detail to the local journal ONLY; any external/ntfy push is a
+#     GENERIC "see runbook" line — never arch detail on unencrypted channels (HARD RULE).
+# Runs as ROOT via edge-watchdog.service (Restart=always). nft/iptables/ip/ping/
+# conntrack all work unprivileged-of-sudo here because the service is root.
+#
+# Modes:  edge-watchdog          -> daemon loop
+#         edge-watchdog once     -> single evaluation (testing)
+# Env:    POLL, EGRESS_FAIL_TRIPS, REFRESH_AFTER, WAN_DOWN_BACKOFF, DRYRUN=1 (log, don't act)
+# Test hooks (in $RUN): simulate-egress-dead, simulate-isp-down,
+#         simulate-config-broken, simulate-lan-broken, simulate-wan-carrier-down
+# Pause:  touch /run/edge-watchdog/pause   (or /etc/edge-watchdog/disabled)
+set -u
+
+RUN=/run/edge-watchdog
+CONF=/etc/edge-watchdog
+SNAP=/var/lib/net-safe/snapshot
+mkdir -p "$RUN"
+
+POLL=${POLL:-30}
+EGRESS_FAIL_TRIPS=${EGRESS_FAIL_TRIPS:-3}     # consecutive fails before acting (~90s @30s)
+REFRESH_AFTER=${REFRESH_AFTER:-1800}          # re-snapshot known-good after this many stable sec
+WAN_DOWN_BACKOFF=${WAN_DOWN_BACKOFF:-300}     # while WAN carrier is physically down: re-log at most this often
+DRYRUN=${DRYRUN:-0}
+
+# Machine-specific values are sourced from the bastion-generated env file
+# (`bastion generate` writes /etc/bastion/machine.env from machine.conf). Fallbacks
+# below are generic placeholders so the script never carries a real topology value.
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+WAN_IF=${WAN_IF:-}                             # WAN/uplink interface (edge mode; physical-carrier probe)
+GATEWAY=${GATEWAY:-}                           # LAN default gateway IP
+RELAY_IF=${RELAY_IF:-}                         # upstream relay/tunnel interface (optional)
+LAN_NET=${LAN_NET:-}                           # LAN CIDR
+RELAY_DST=${RELAY_DST:-}                       # relay far-end probe target (optional)
+EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints (ISP-up signal)
+EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
+
+log(){ logger -t edge-watchdog "$*"; }
+# alert(): FULL detail to local journal; external push (only if configured) is GENERIC.
+alert(){
+  log "ALERT: $*"
+  local urlf="$CONF/internal-ntfy-url"
+  [ -f "$urlf" ] && curl -fsS -m 5 -d "edge-watchdog: state change — see runbook" "$(cat "$urlf")" >/dev/null 2>&1 || true
+}
+
+paused(){ [ -f "$RUN/pause" ] || [ -f "$CONF/disabled" ]; }
+
+# ---------- health probes ----------
+egress_ok(){
+  [ -f "$RUN/simulate-egress-dead" ] && return 1
+  local u
+  for u in $EXT_HTTPS; do curl -s -o /dev/null -m 6 "$u" && return 0; done
+  return 1
+}
+gateway_ok(){ ping -c1 -W1 "$GATEWAY" >/dev/null 2>&1; }
+ext_reachable(){                                  # any diverse external answers ICMP (independent of relay)
+  [ -f "$RUN/simulate-isp-down" ] && return 1
+  local ip
+  for ip in $EXT_PINGS; do ping -c1 -W1 "$ip" >/dev/null 2>&1 && return 0; done
+  return 1
+}
+# wan_carrier_down: is the physical WAN uplink carrier down? (cable unplugged, ONT/modem
+# reboot, ISP maintenance, upstream power-down). When the carrier drops, the OS removes the
+# default route — which config_ok() would otherwise misread as "OUR config broken" and try to
+# roll back, churning useless rollbacks + false "MANUAL intervention" alerts that drown out the
+# real outage. A rollback can't restore a route over a dead carrier, so this gates that branch.
+# Empty WAN_IF (endpoint mode / unset) => not applicable, treat as up.
+wan_carrier_down(){
+  [ -f "$RUN/simulate-wan-carrier-down" ] && return 0
+  [ -n "$WAN_IF" ] || return 1
+  ip -o link show "$WAN_IF" 2>/dev/null | grep -q LOWER_UP && return 1
+  return 0
+}
+# config_ok: is OUR edge config intact? firewall-agnostic (edge OR ufw, whichever governs).
+# echoes a reason on failure; returns 0 if intact.
+config_ok(){
+  [ -f "$RUN/simulate-config-broken" ] && { echo "simulated-broken"; return 1; }
+  local fw
+  if nft list table inet edge >/dev/null 2>&1; then fw=edge
+  elif systemctl is-active --quiet ufw; then fw=ufw
+  else echo "no-firewall"; return 1; fi
+  if [ "$fw" = edge ]; then
+    nft list table ip edge_nat 2>/dev/null | grep -qE "${RELAY_IF}.*masquerade" || { echo "relay-masq-missing(edge)"; return 1; }
+  else
+    iptables -t nat -C POSTROUTING -s "$LAN_NET" -o "$RELAY_IF" -j MASQUERADE 2>/dev/null || { echo "relay-masq-missing(ufw)"; return 1; }
+  fi
+  ip link show "$RELAY_IF" >/dev/null 2>&1            || { echo "relay-iface-down"; return 1; }
+  ip route show default | grep -q .                  || { echo "default-route-missing"; return 1; }
+  return 0
+}
+# lan_relay_broken: true ONLY if LAN clients are actively using the relay but getting
+# zero replies (relay forward broken). No traffic / no evidence = not broken.
+# Reads the conntrack table from /proc/net/nf_conntrack when readable, else `conntrack -L`
+# over netlink — modern kernels build CONFIG_NF_CONNTRACK_PROCFS off, so the procfs file is
+# absent and only conntrack-tools (shipped in L6) can read the table. No source at all =>
+# can't observe => not-broken (the no-evidence default), warned once. CT_PROC overridable for tests.
+lan_relay_broken(){
+  [ -f "$RUN/simulate-lan-broken" ] && return 0
+  [ -n "$RELAY_DST" ] || return 1
+  local ct_proc="${CT_PROC:-/proc/net/nf_conntrack}" ct total replied
+  if [ -r "$ct_proc" ]; then
+    ct=$(cat "$ct_proc" 2>/dev/null)
+  elif command -v conntrack >/dev/null 2>&1; then
+    ct=$(conntrack -L 2>/dev/null)
+  else
+    [ -f "$RUN/conntrack-missing-warned" ] || {
+      log "lan_relay_broken: no conntrack source ($ct_proc absent + conntrack binary missing) — LAN-client relay check disabled; install conntrack-tools"
+      : > "$RUN/conntrack-missing-warned"
+    }
+    return 1
+  fi
+  total=$(grep -c "dst=${RELAY_DST}" <<<"$ct")
+  [ "${total:-0}" -eq 0 ] && return 1
+  replied=$(grep "dst=${RELAY_DST}" <<<"$ct" | grep -vc UNREPLIED)
+  [ "${replied:-0}" -eq 0 ] && return 0
+  return 1
+}
+
+# ---------- heals (graduated) ----------
+heal_light(){   # cheapest: atomic reload of the governing firewall's config (re-adds relay rules)
+  if nft list table inet edge >/dev/null 2>&1 || [ -f "$SNAP/fw-nftables-active" ]; then
+    nft -f /etc/nftables.conf 2>/dev/null && log "heal: reloaded edge nft config" || log "heal: nft reload FAILED"
+  else
+    /usr/local/sbin/net-rollback edge-watchdog-light >/dev/null 2>&1 && log "heal: net-rollback (ufw relay ensure)"
+  fi
+}
+heal_full(){ /usr/local/sbin/net-rollback edge-watchdog >/dev/null 2>&1 && log "heal: full net-rollback executed"; }
+
+# ---------- known-good refresh ----------
+maybe_refresh(){
+  local now last
+  now=$(date +%s)
+  last=$(cat "$RUN/last-good-snapshot" 2>/dev/null || echo 0)
+  if config_ok >/dev/null && ! lan_relay_broken && [ $((now - last)) -ge "$REFRESH_AFTER" ]; then
+    if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would refresh known-good snapshot (stable ${REFRESH_AFTER}s)"; return; fi
+    systemctl start net-snapshot.service 2>/dev/null && { echo "$now" > "$RUN/last-good-snapshot"; log "known-good snapshot refreshed (stable ${REFRESH_AFTER}s)"; }
+  fi
+}
+
+# ---------- one evaluation cycle ----------
+evaluate(){
+  if paused; then log "paused — no action"; return; fi
+
+  if egress_ok; then
+    fails=0
+    if [ -f "$RUN/wan-down-alerted" ]; then
+      rm -f "$RUN/wan-down-alerted"
+      alert "WAN carrier/egress recovered (${WAN_IF:-wan} back up) — resuming normal watch"
+    fi
+    if lan_relay_broken; then
+      alert "egress OK but LAN-client relay degraded (clients sending, zero replies) — light heal"
+      [ "$DRYRUN" = 1 ] && { log "[DRYRUN] would heal_light (relay forward)"; return; }
+      heal_light; sleep 3
+      lan_relay_broken && alert "LAN relay STILL degraded after light heal — escalating to full rollback" && heal_full
+      return
+    fi
+    maybe_refresh
+    return
+  fi
+
+  # egress is failing
+  fails=$((fails+1))
+  log "egress check failed (${fails}/${EGRESS_FAIL_TRIPS})"
+  [ "$fails" -lt "$EGRESS_FAIL_TRIPS" ] && return
+
+  # sustained egress failure — physical uplink FIRST: a rollback can't restore a route over a
+  # dead carrier, and treating the OS-removed default route as "our config broken" here is the
+  # nightly-blackout rollback-churn / false-MANUAL-alert bug. Carrier down => ALERT ONCE, back off.
+  if wan_carrier_down; then
+    local now2 since
+    now2=$(date +%s); since=$(cat "$RUN/wan-down-alerted" 2>/dev/null || echo 0)
+    if [ "${since:-0}" -eq 0 ]; then
+      alert "sustained egress loss + WAN carrier DOWN (${WAN_IF:-wan}) => physical/upstream uplink outage — ALERT ONCE, no rollback"
+      echo "$now2" > "$RUN/wan-down-alerted"
+    elif [ $((now2 - since)) -ge "$WAN_DOWN_BACKOFF" ]; then
+      log "WAN carrier still down (${WAN_IF:-wan}) — backing off ${WAN_DOWN_BACKOFF}s, no rollback"
+      echo "$now2" > "$RUN/wan-down-alerted"
+    fi
+    fails=0; return
+  fi
+
+  # carrier is up — diagnose us-vs-upstream
+  local cfg rc
+  cfg=$(config_ok); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    alert "sustained egress loss + OUR config broken (${cfg}) — self-healing"
+    if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would heal_light, verify egress, then heal_full if still down"; fails=0; return; fi
+    heal_light; sleep 5
+    if egress_ok; then alert "recovered after light heal"; fails=0; return; fi
+    heal_full; sleep 5
+    if egress_ok; then alert "recovered after full rollback"; else alert "STILL DOWN after full rollback — MANUAL intervention needed"; fi
+    fails=0; return
+  fi
+
+  # our config is intact — is this upstream?
+  if gateway_ok && ! ext_reachable; then
+    alert "sustained egress loss; local gateway UP + config intact + all external down => UPSTREAM/ISP outage — ALERT ONLY, no rollback"
+    fails=0; return
+  fi
+  if ! gateway_ok; then
+    alert "sustained egress loss + gateway UNREACHABLE + config intact — full rollback (local recovery: addr/route/fw)"
+    if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would heal_full (local recovery)"; fails=0; return; fi
+    heal_full; sleep 5; egress_ok && alert "recovered after rollback"
+    fails=0; return
+  fi
+  # gateway up, some external reachable via ICMP, but our HTTPS egress down: relay far-end / VPS / DNS.
+  alert "sustained egress loss; config intact, gateway+external reachable => relay far-end/VPS/DNS suspected — ALERT ONLY, observing"
+  fails=0
+}
+
+# ---------- main ----------
+fails=0
+echo "$(date +%s)" > "$RUN/last-good-snapshot"   # seed so first auto-refresh is REFRESH_AFTER out
+if [ "${1:-}" = "once" ]; then evaluate; exit 0; fi
+log "started (poll=${POLL}s trips=${EGRESS_FAIL_TRIPS} refresh=${REFRESH_AFTER}s dryrun=${DRYRUN})"
+while true; do
+  sleep "$POLL"
+  evaluate
+done

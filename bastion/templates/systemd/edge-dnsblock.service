@@ -1,0 +1,12 @@
+[Unit]
+Description=bastion DNS sinkhole update (ads+trackers+malware -> unbound local-zone)
+After=network-online.target unbound.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/edge-dnsblock-update
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/unbound

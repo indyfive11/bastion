@@ -1,0 +1,19 @@
+[Unit]
+Description=edge-reconciler — sole validated writer to managed nft block sets
+Documentation=man:nft(8)
+After=nftables.service crowdsec.service network.target
+Wants=crowdsec.service
+
+[Service]
+Type=oneshot
+# Optional (-): supplies NFT_TABLE (edge vs endpoint base table) + topology vars. Generic
+# fallbacks in the script keep edge behaviour if machine.env is absent.
+EnvironmentFile=-/etc/bastion/machine.env
+ExecStart=/usr/local/sbin/edge-reconciler
+# Root is required (nft set writes + cscli LAPI). Light sandbox; NOT strict because
+# this is part of the recovery/safety surface and must never fail on confinement.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/edge-reconciler /var/lib/edge-reconciler

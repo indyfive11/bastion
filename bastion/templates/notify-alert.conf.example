@@ -1,0 +1,22 @@
+# bastion notify-alert config — ANNOTATED EXAMPLE. Copy to /etc/bastion/notify-alert.conf
+# (chmod 600, root-only) and fill in. NEVER commit a real notify-alert.conf — the topic,
+# email, and internal URL are installation-specific and the email/topic are sensitive.
+#
+# TIERED ALERTING (HARD RULE: no arch detail on unencrypted channels).
+#   EXTERNAL sinks (public ntfy + ALERT_EMAIL) carry ONLY the fixed "service degraded,
+#   see runbook" template. Full detail (host, device, unit, status) goes ONLY to the local
+#   journal and the INTERNAL_NTFY channel, which must live on an operator-controlled network.
+
+# --- EXTERNAL: public ntfy push (degraded-only template) ---------------
+# Keep the topic private — treat it like a capability URL.
+NTFY_SERVER="https://ntfy.sh"
+NTFY_TOPIC=""                 # e.g. a long random topic name; empty disables ntfy
+
+# --- EXTERNAL: email (degraded-only template) --------------------------
+ALERT_EMAIL=""                # destination address; empty disables email
+
+# --- INTERNAL: full-detail push over an operator-controlled network ----
+# A self-hosted ntfy reachable ONLY over ZeroTier/WireGuard, behind auth. Leave EMPTY until
+# that endpoint exists — full detail is still captured in the local journal meanwhile.
+INTERNAL_NTFY_URL=""
+INTERNAL_NTFY_AUTH=""

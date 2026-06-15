@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# net-rollback — idempotent, GENTLE restore of known-good network.
+# Lifeline = LAN addr + FIREWALL + upstream relay + default route + DNS.
+# Safe to run when state already matches (pure no-op). Resilient: never aborts on error.
+STATE=/var/lib/net-safe; SNAP="$STATE/snapshot"
+REASON="${1:-manual}"
+
+# Machine-specific values sourced from the bastion-generated env file
+# (`bastion generate` writes /etc/bastion/machine.env from machine.conf). Generic
+# fallbacks keep real topology out of the repo; the live node always has machine.env.
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+LAN_IF=${LAN_IF:-eth0}                 # LAN interface
+RELAY_IF=${RELAY_IF:-}                 # upstream relay/tunnel interface (optional)
+LAN_NET=${LAN_NET:-}                   # LAN CIDR
+LAN_IP_CIDR=${LAN_IP_CIDR:-}           # this node's LAN addr in CIDR form, e.g. <ip>/<prefix>
+GATEWAY=${GATEWAY:-}                   # LAN default gateway IP
+NM_CONN=${NM_CONN:-}                   # NetworkManager connection name to re-up after profile restore
+log(){ logger -t net-safe "net-rollback[$REASON]: $*"; }
+[ -d "$SNAP" ] || { log "NO SNAPSHOT at $SNAP — cannot roll back"; exit 1; }
+changed=0
+log "starting restore"
+
+# 1) LAN address present? (re-add only if missing — never bounce a working link)
+if [ -n "$LAN_IP_CIDR" ] && ! ip -4 addr show dev "$LAN_IF" 2>/dev/null | grep -q "$LAN_IP_CIDR"; then
+  ip addr add "$LAN_IP_CIDR" dev "$LAN_IF" 2>/dev/null && { log "re-added LAN addr $LAN_IP_CIDR"; changed=1; }
+fi
+ip link set "$LAN_IF" up 2>/dev/null || true
+
+# 2) FIREWALL manager — restore the one that was known-good at snapshot.
+# Done early: a broken ruleset is the likeliest thing killing traffic, so fix it
+# before route/DNS. UFW is allow-out by default, so egress returns the moment it's up.
+# Detection keys on the ACTUAL loaded ruleset ('table inet edge'), not service state
+# (nftables.service is oneshot RemainAfterExit=no — its active state is unreliable).
+edge_loaded(){ nft list table inet edge >/dev/null 2>&1; }
+
+# The upstream relay (LAN -> relay interface) may live in iptables/UFW config.
+# After restoring UFW, ALSO ensure it live — belt-and-suspenders so LAN clients never
+# lose internet on a rollback even if the config rules somehow didn't apply. Only valid
+# in the UFW (iptables) world, and only when a relay interface + LAN CIDR are configured.
+ensure_relay_ufw(){
+  [ -n "$RELAY_IF" ] && [ -n "$LAN_NET" ] || return 0
+  iptables -t nat -C POSTROUTING -s "$LAN_NET" -o "$RELAY_IF" -j MASQUERADE 2>/dev/null \
+    || { iptables -t nat -A POSTROUTING -s "$LAN_NET" -o "$RELAY_IF" -j MASQUERADE 2>/dev/null \
+         && { log "ensured relay MASQUERADE"; changed=1; }; }
+  iptables -C ufw-user-forward -i "$LAN_IF" -o "$RELAY_IF" -j ACCEPT 2>/dev/null \
+    || { iptables -I ufw-user-forward 1 -i "$LAN_IF" -o "$RELAY_IF" -j ACCEPT 2>/dev/null \
+         && { log "ensured relay FWD LAN->relay"; changed=1; }; }
+  iptables -C ufw-user-forward -i "$RELAY_IF" -o "$LAN_IF" -j ACCEPT 2>/dev/null \
+    || { iptables -I ufw-user-forward 2 -i "$RELAY_IF" -o "$LAN_IF" -j ACCEPT 2>/dev/null \
+         && { log "ensured relay FWD relay->LAN"; changed=1; }; }
+}
+
+if [ -f "$SNAP/fw-ufw-active" ]; then
+  # Known-good was UFW. If our edge table is loaded (cutover) or ufw is down,
+  # hard-restore UFW: stop+flush nftables/edge, then re-apply UFW rules.
+  if edge_loaded || ! systemctl is-active --quiet ufw; then
+    systemctl stop nftables 2>/dev/null || true
+    nft flush ruleset 2>/dev/null || true          # clear edge table (+ any remnant)
+    systemctl restart ufw 2>/dev/null || ufw --force enable 2>/dev/null || true
+    log "firewall RESTORED to known-good: UFW up, edge flushed"
+    changed=1
+  fi
+  # ALWAYS ensure the LAN relay after a UFW baseline (idempotent; self-heals).
+  ensure_relay_ufw
+elif [ -f "$SNAP/fw-nftables-active" ]; then
+  # Known-good was nftables/edge. If the edge table is missing, reload it.
+  # The edge config carries the relay rules itself, so no separate ensure needed.
+  if ! edge_loaded; then
+    systemctl stop ufw 2>/dev/null || true
+    nft -f /etc/nftables.conf 2>/dev/null || systemctl start nftables 2>/dev/null || true
+    log "firewall RESTORED to known-good: edge (nftables) reloaded"
+    changed=1
+  fi
+fi
+
+# 3) Default route (idempotent replace; only acts if different)
+DEF="$(cat "$SNAP/default-route.txt" 2>/dev/null)"
+if [ -z "$DEF" ] && [ -n "$GATEWAY" ]; then DEF="default via $GATEWAY dev $LAN_IF proto static metric 100"; fi
+if [ -n "$DEF" ] && ! ip route show default | grep -qF "$DEF"; then
+  ip route replace $DEF 2>/dev/null && { log "restored default route: $DEF"; changed=1; }
+fi
+
+# 4) DNS resolver
+if [ -f "$SNAP/resolv.conf" ] && ! cmp -s "$SNAP/resolv.conf" /etc/resolv.conf; then
+  cp -P "$SNAP/resolv.conf" /etc/resolv.conf 2>/dev/null && { log "restored /etc/resolv.conf"; changed=1; }
+fi
+
+# 5) NM profiles — only reload+reup if they actually changed (heavier, may blip link)
+if [ -d "$SNAP/nm-system-connections" ] && \
+   ! diff -rq "$SNAP/nm-system-connections" /etc/NetworkManager/system-connections >/dev/null 2>&1; then
+  cp -a "$SNAP/nm-system-connections/." /etc/NetworkManager/system-connections/ 2>/dev/null || true
+  chmod 600 /etc/NetworkManager/system-connections/*.nmconnection 2>/dev/null || true
+  nmcli connection reload 2>/dev/null || true
+  [ -n "$NM_CONN" ] && nmcli con up "$NM_CONN" 2>/dev/null || true
+  log "restored NM profiles${NM_CONN:+ + re-upped '$NM_CONN'}"; changed=1
+fi
+
+# 6) Stop dnsmasq if it was NOT active when we snapshotted (i.e. we added it)
+if [ -f "$SNAP/dnsmasq-was-inactive" ] && systemctl is-active --quiet dnsmasq; then
+  systemctl stop dnsmasq 2>/dev/null && { log "stopped dnsmasq (was inactive at snapshot)"; changed=1; }
+fi
+
+if [ "$changed" -eq 0 ]; then log "restore complete — state already matched known-good (no-op)"
+else log "restore complete — applied changes"; fi
+exit 0

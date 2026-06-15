@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# edge-ai-backend-mock — a DETERMINISTIC, OFFLINE backend implementing the provider-agnostic
+# contract (signals JSON on stdin -> intent-envelope JSON on stdout). Proves the pipeline is
+# vendor-agnostic and drives the full end-to-end test with no API key / no network.
+#
+# Policy (deterministic): rank observations by total_events; top -> block_src, 2nd ->
+# ratelimit_src, 3rd -> tarpit_src (so one run exercises all three ai_* sets). /32 each.
+#
+import json, sys
+
+def main():
+    try:
+        sig = json.load(sys.stdin)
+    except Exception as e:
+        sys.stderr.write(f"mock: bad signals: {e}\n"); return 1
+    obs = sorted(sig.get("observations", []),
+                 key=lambda o: o.get("total_events", 0), reverse=True)
+    plan = [("block_src", 3600), ("ratelimit_src", 1800), ("tarpit_src", 1800)]
+    intents = []
+    for (action, ttl), o in zip(plan, obs):
+        ip = o.get("ip")
+        if not ip:
+            continue
+        ev = o.get("events", {})
+        intents.append({
+            "action": action,
+            "cidr": f"{ip}/32",
+            "ttl": ttl,
+            "reason": f"mock: {o.get('total_events',0)} events {dict(ev)} scenarios={o.get('scenarios',[])}",
+            "confidence": 0.5,
+        })
+    print(json.dumps({"version": 1, "backend": "mock:deterministic-v1", "intents": intents}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,7 @@
+[Unit]
+Description=Failure notification for %i
+# Intentionally NO OnFailure= here — prevents a notification loop.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/notify-failure %i

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# net-snapshot — capture current known-good network state for net-rollback.
+# Runs as root (via net-snapshot.service). Writes to /var/lib/net-safe/snapshot.
+STATE=/var/lib/net-safe; SNAP="$STATE/snapshot"
+log(){ logger -t net-safe "net-snapshot: $*"; }
+mkdir -p "$SNAP/nm-system-connections" /run/net-safe
+
+# Authoritative static config (IP / gateway / DNS live in the NM profiles)
+cp -a /etc/NetworkManager/system-connections/. "$SNAP/nm-system-connections/" 2>/dev/null || true
+# DNS resolver file
+cp -P /etc/resolv.conf "$SNAP/resolv.conf" 2>/dev/null || true
+# Operational state (for restore + audit)
+ip route show table main  > "$SNAP/routes.txt"        2>/dev/null || true
+ip route show default     > "$SNAP/default-route.txt" 2>/dev/null || true
+ip -br addr               > "$SNAP/addrs.txt"         2>/dev/null || true
+# Was dnsmasq active at snapshot? (so rollback knows whether to stop it)
+rm -f "$SNAP/dnsmasq-was-active" "$SNAP/dnsmasq-was-inactive"
+if systemctl is-active --quiet dnsmasq; then : > "$SNAP/dnsmasq-was-active"
+else : > "$SNAP/dnsmasq-was-inactive"; fi
+
+# Firewall known-good: which manager DRIVES THE LIVE RULESET at snapshot time?
+# Detect by the actual loaded ruleset, NOT service unit state: ufw.service can
+# linger "active" after the edge table took over (it leaves a zombie unit even
+# though its iptables chains were flushed), and nftables.service is oneshot. The
+# governing firewall is whoever owns the live ruleset. This MUST agree with
+# net-rollback's edge_loaded() or the baseline inverts (the 2026-06-05 flap).
+# net-rollback restores THIS manager: edge => reload nftables; ufw => restart ufw.
+rm -f "$SNAP/fw-ufw-active" "$SNAP/fw-nftables-active"
+if nft list table inet edge >/dev/null 2>&1; then
+  : > "$SNAP/fw-nftables-active"
+elif systemctl is-active --quiet ufw; then
+  : > "$SNAP/fw-ufw-active"
+fi
+# Live rulesets — forensic/audit only; restore is service-driven, not blob-replay.
+nft list ruleset > "$SNAP/nft-ruleset.txt" 2>/dev/null || true
+iptables-save    > "$SNAP/iptables.txt"    2>/dev/null || true
+ip6tables-save   > "$SNAP/ip6tables.txt"   2>/dev/null || true
+
+date -Iseconds > "$SNAP/taken-at" 2>/dev/null || date > "$SNAP/taken-at"
+
+DEF="$(cat "$SNAP/default-route.txt" 2>/dev/null)"
+FW="none"; [ -f "$SNAP/fw-ufw-active" ] && FW="ufw"; [ -f "$SNAP/fw-nftables-active" ] && FW="nftables"
+log "captured known-good state -> $SNAP  (default: ${DEF:-NONE}; firewall: $FW)"

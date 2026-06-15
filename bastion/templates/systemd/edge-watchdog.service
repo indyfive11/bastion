@@ -1,0 +1,17 @@
+[Unit]
+Description=edge-watchdog — standing egress/relay self-heal
+Documentation=man:nft(8)
+After=network.target nftables.service wg-quick@{{ interfaces.wg_vps_iface }}.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/edge-watchdog
+Restart=always
+RestartSec=10
+# Recovery tool: needs root for nft/iptables/ip/ping + conntrack read. Kept deliberately
+# UN-sandboxed (subtle confinement breakage on a self-heal tool is worse than the gain).
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

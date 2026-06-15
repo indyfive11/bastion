@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+# edge-ctl — operator control + human kill switch for the AI firewall layer.
+# Fixed-purpose ROOT tool (granted via /etc/sudoers.d/edge-ctl). Self-re-execs under sudo.
+# It ONLY touches the ai_* sets / the edge-ai timer / the spool — never the base firewall.
+#
+#   edge-ctl status                 # timer state, ai_* set counts, last analysis, recent audit
+#   edge-ctl panic                  # FLUSH all ai_* sets NOW + clear the spool (immediate undo)
+#   edge-ctl ai-disable             # stop+disable edge-ai.timer, then panic (full stop)
+#   edge-ctl ai-enable              # enable+start edge-ai.timer (arm)
+#   edge-ctl rollback <id>          # remove the elements applied by one audit record id
+#   edge-ctl proposals              # show pending propose_base_change suggestions
+#
+import json, os, subprocess, sys, time
+
+AI_SETS  = ["ai_block", "ai_ratelimit", "ai_tarpit"]
+FAM, TBL = "inet", "edge"
+INTENTS  = "/var/lib/edge-ai/intents.json"
+SIGNALS  = "/var/lib/edge-ai/signals.json"
+PROPOSALS= "/var/lib/edge-ai/proposals.jsonl"
+AUDIT    = "/var/log/edge-reconciler/audit.jsonl"
+TIMER    = "edge-ai.timer"
+
+def ensure_root():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", "-n", "/usr/local/sbin/edge-ctl"] + sys.argv[1:])
+
+def nft(*args):
+    return subprocess.run(["nft", *args], capture_output=True, text=True)
+
+def audit(rec):
+    rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(AUDIT, "a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception as e:
+        print(f"warn: audit write failed: {e}", file=sys.stderr)
+
+def set_count(s):
+    p = nft("-j", "list", "set", FAM, TBL, s)
+    if p.returncode != 0:
+        return None
+    try:
+        data = json.loads(p.stdout)
+        for obj in data.get("nftables", []):
+            st = obj.get("set")
+            if st and st.get("name") == s:
+                return len(st.get("elem", []) or [])
+    except Exception:
+        return None
+    return 0
+
+def flush_ai_sets():
+    out = {}
+    for s in AI_SETS:
+        p = nft("flush", "set", FAM, TBL, s)
+        out[s] = "flushed" if p.returncode == 0 else f"ERR:{p.stderr.strip()[:80]}"
+    return out
+
+def clear_spool():
+    try:
+        now = int(time.time())
+        tmp = INTENTS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "generated_epoch": now, "backend": "edge-ctl:cleared",
+                       "intents": []}, f)
+        os.replace(tmp, INTENTS)
+        return True
+    except Exception as e:
+        print(f"warn: could not clear spool: {e}", file=sys.stderr); return False
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+
+def cmd_status():
+    print("== edge-ai timer ==")
+    en = systemctl("is-enabled", TIMER).stdout.strip() or "?"
+    ac = systemctl("is-active", TIMER).stdout.strip() or "?"
+    print(f"  {TIMER}: enabled={en} active={ac}")
+    print("== ai_* set element counts ==")
+    for s in AI_SETS:
+        print(f"  {s}: {set_count(s)}")
+    print("== last analysis (intents.json) ==")
+    try:
+        with open(INTENTS) as f:
+            doc = json.load(f)
+        age = int(time.time()) - doc.get("generated_epoch", 0)
+        print(f"  backend={doc.get('backend')} intents={len(doc.get('intents',[]))} age={age}s")
+    except Exception as e:
+        print(f"  (none: {e})")
+    try:
+        age = int(time.time()) - json.load(open(SIGNALS)).get("generated_epoch", 0)
+        print(f"  signals age={age}s")
+    except Exception:
+        pass
+    print("== recent ai audit rows ==")
+    try:
+        rows = [json.loads(l) for l in open(AUDIT)][-200:]
+        ai = [r for r in rows if r.get("set") in AI_SETS][-6:]
+        for r in ai:
+            print(f"  id={r.get('id')} set={r.get('set')} applied={r.get('desired_count')} "
+                  f"rejected={r.get('rejected_count')} ts={r.get('ts')}")
+        if not ai:
+            print("  (no ai audit rows yet)")
+    except Exception as e:
+        print(f"  (audit unavailable: {e})")
+    return 0
+
+def cmd_panic():
+    res = flush_ai_sets()
+    clear_spool()
+    audit({"event": "edge-ctl", "action": "panic", "flush": res})
+    print("PANIC: flushed ai_* sets + cleared spool")
+    for s, r in res.items():
+        print(f"  {s}: {r}")
+    return 0
+
+def cmd_ai_disable():
+    systemctl("disable", "--now", TIMER)
+    res = flush_ai_sets(); clear_spool()
+    audit({"event": "edge-ctl", "action": "ai-disable", "flush": res})
+    print(f"AI DISABLED: {TIMER} stopped+disabled; ai_* flushed; spool cleared")
+    return 0
+
+def cmd_ai_enable():
+    p = systemctl("enable", "--now", TIMER)
+    audit({"event": "edge-ctl", "action": "ai-enable", "rc": p.returncode})
+    if p.returncode == 0:
+        print(f"AI ENABLED: {TIMER} enabled+started")
+    else:
+        print(f"enable failed: {p.stderr.strip()}")
+    return p.returncode
+
+def cmd_rollback(rid):
+    try:
+        rows = [json.loads(l) for l in open(AUDIT)]
+    except Exception as e:
+        print(f"cannot read audit: {e}"); return 1
+    rec = next((r for r in rows if str(r.get("id")) == str(rid) and r.get("set") in AI_SETS), None)
+    if not rec:
+        print(f"no ai audit record with id={rid}"); return 1
+    s = rec["set"]; elems = rec.get("ai_elements", [])
+    if not elems:
+        print(f"record {rid} has no ai_elements to remove"); return 1
+    # remove from live set
+    removed = []
+    for c in elems:
+        p = nft("delete", "element", FAM, TBL, s, "{ " + c + " }")
+        removed.append((c, "ok" if p.returncode == 0 else p.stderr.strip()[:60]))
+    # remove from spool so the reconciler won't re-add
+    try:
+        doc = json.load(open(INTENTS))
+        before = len(doc.get("intents", []))
+        doc["intents"] = [i for i in doc.get("intents", [])
+                          if f"{i.get('cidr')}" not in elems and f"{i.get('cidr')}/32" not in elems
+                          and i.get("cidr") not in [e.rstrip("/32") for e in elems]]
+        tmp = INTENTS + ".tmp"
+        json.dump(doc, open(tmp, "w")); os.replace(tmp, INTENTS)
+        pruned = before - len(doc["intents"])
+    except Exception as e:
+        pruned = f"spool-prune-failed:{e}"
+    audit({"event": "edge-ctl", "action": "rollback", "id": rid, "set": s,
+           "removed": removed, "spool_pruned": pruned})
+    print(f"ROLLBACK id={rid} set={s}: removed {len(removed)} elements; spool pruned={pruned}")
+    for c, st in removed:
+        print(f"  {c}: {st}")
+    return 0
+
+def cmd_proposals():
+    try:
+        rows = [json.loads(l) for l in open(PROPOSALS)][-20:]
+    except FileNotFoundError:
+        print("(no proposals)"); return 0
+    for r in rows:
+        print(f"  [{r.get('ts', r.get('backend'))}] {r.get('description','')[:160]}")
+    return 0
+
+def main():
+    ensure_root()
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__); return 0
+    c = args[0]
+    if c == "status":    return cmd_status()
+    if c == "panic":     return cmd_panic()
+    if c == "ai-disable":return cmd_ai_disable()
+    if c == "ai-enable": return cmd_ai_enable()
+    if c == "rollback":
+        if len(args) < 2: print("usage: edge-ctl rollback <id>"); return 1
+        return cmd_rollback(args[1])
+    if c == "proposals": return cmd_proposals()
+    print(f"unknown command: {c}\n{__doc__}"); return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

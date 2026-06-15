@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# edge-reconciler — the SOLE writer to the managed nft sets in `table inet edge`.
+#
+# Architecture (see plan Stage 3/6 + memory feedback_elegance_over_brute_force):
+#   Intelligence SOURCES (CrowdSec detection-only, threat feeds, and -- Stage 6 -- the AI
+#   analyzer) hold ZERO firewall privilege. They only produce desired-state. THIS service,
+#   running as root via systemd (no sudo, no NOPASSWD broadening), is the only thing that
+#   writes nft. Every candidate from EVERY source is validated against the never-block
+#   allowlist + a per-source CIDR-width floor BEFORE it can enter a set. Reconcile is
+#   idempotent + atomic (per-set flush+refill in one `nft -f` transaction). Append-only audit.
+#
+# Safety properties:
+#   * A source read that ERRORS leaves that set UNTOUCHED (never flush-to-empty on error);
+#     elements self-expire via their nft `timeout`, so a dead source self-heals, not strands.
+#   * No candidate overlapping the allowlist (loopback/RFC1918/VPS/DNS/Anthropic/...) or
+#     broader than the source's floor can ever reach a set -- enforced here, below the AI.
+#   * The data plane (chains/policy/NAT) is static; this only moves set ELEMENTS.
+#
+# Modes:  edge-reconciler            -> one reconcile pass (driven by .timer)
+#         edge-reconciler --dry-run  -> compute + audit decisions, do NOT touch nft
+#
+import ipaddress, json, subprocess, sys, time, os
+
+# Base table holding the managed sets. Edge mode -> `inet edge`; endpoint mode -> `inet bastion`.
+# Sourced from /etc/bastion/machine.env (NFT_TABLE) via the unit's EnvironmentFile; the generic
+# fallback keeps the reference edge behaviour when machine.env is absent.
+TABLE        = os.environ.get("NFT_TABLE", "inet edge")
+ALLOWLIST    = "/etc/edge-reconciler/policy.allowlist"
+FEED_FILE    = "/var/lib/edge-feed/blk_feed.list"   # written by edge-feed-fetch (DynamicUser)
+INTENTS_FILE = "/var/lib/edge-ai/intents.json"      # written by edge-ai-analyze (Stage 6)
+AUDIT        = "/var/log/edge-reconciler/audit.jsonl"
+DEFAULT_FEED_TTL = 90000        # 25h: a dead feed fetcher self-heals (refresh is daily)
+AI_MAX_TTL   = 86400            # 24h hard ceiling on any AI-applied element
+AI_MAX_ADDS_PER_RUN = 64        # invariant #4: blast-radius cap across all ai_* sets per run
+# typed AI verb -> managed set. Verbs NOT here (e.g. propose_base_change) can never apply.
+ACTION_SET = {"block_src": "ai_block", "ratelimit_src": "ai_ratelimit", "tarpit_src": "ai_tarpit"}
+
+# Per managed set: which source feeds it + the smallest prefixlen allowed (width floor).
+# CrowdSec bans are ~/32; feeds may carry curated broader blocks. AI (Stage 6) = /24 strict.
+SETS = {
+    "cs_block":     {"source": "cscli", "min_prefix": 16},
+    "blk_feed":     {"source": "feed",  "min_prefix": 8},
+    "ai_block":     {"source": "ai",    "min_prefix": 24},
+    "ai_ratelimit": {"source": "ai",    "min_prefix": 24},
+    "ai_tarpit":    {"source": "ai",    "min_prefix": 24},
+}
+
+DRYRUN = "--dry-run" in sys.argv[1:]
+
+def log(msg):
+    sys.stderr.write(f"edge-reconciler: {msg}\n")
+
+def load_allowlist():
+    nets = []
+    try:
+        with open(ALLOWLIST) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    nets.append(ipaddress.ip_network(line, strict=False))
+    except FileNotFoundError:
+        log(f"WARNING: allowlist {ALLOWLIST} missing -- failing CLOSED (reject all)")
+        return None
+    return nets
+
+def parse_duration(s):
+    # CrowdSec durations look like "1h0m0s", "3h59m59.12s", "-2m3s" (expired). -> int seconds.
+    if not s:
+        return 0
+    neg = s.startswith("-")
+    s = s.lstrip("-")
+    total, num = 0.0, ""
+    units = {"h": 3600, "m": 60, "s": 1}
+    for ch in s:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif ch in units:
+            total += float(num or 0) * units[ch]
+            num = ""
+    return int(-total if neg else total)
+
+def validate(value, allow, min_prefix):
+    # returns (ok, reason, normalized_str). IPv4 only for now.
+    try:
+        net = ipaddress.ip_network(value, strict=False)
+    except ValueError as e:
+        return False, f"unparseable({e})", None
+    if net.version != 4:
+        return False, "not-ipv4", None
+    if allow is None:
+        return False, "allowlist-missing-failclosed", None
+    if net.prefixlen < min_prefix:
+        return False, f"cidr-too-broad(/{net.prefixlen}<{min_prefix})", None
+    for a in allow:
+        if a.version == 4 and net.overlaps(a):
+            return False, f"allowlisted({a})", None
+    return True, "", str(net)
+
+# ---------- sources (return dict {normalized_cidr: ttl_seconds} or None on hard error) ----
+def desired_cscli(allow, min_prefix):
+    try:
+        out = subprocess.run(["cscli", "decisions", "list", "-o", "json"],
+                             capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        log(f"cscli exec failed: {e} -- leaving cs_block untouched")
+        return None, []
+    if out.returncode != 0:
+        log(f"cscli rc={out.returncode}: {out.stderr.strip()[:200]} -- leaving cs_block untouched")
+        return None, []
+    body = out.stdout.strip()
+    if not body or body == "null":
+        return {}, []                      # genuinely no decisions -> empty desired
+    try:
+        alerts = json.loads(body)
+    except json.JSONDecodeError as e:
+        log(f"cscli json parse error: {e} -- leaving cs_block untouched")
+        return None, []
+    desired, rejected = {}, []
+    for alert in (alerts or []):
+        for dec in (alert.get("decisions") or []):
+            if dec.get("type") != "ban":
+                continue
+            if dec.get("scope") not in ("Ip", "Range"):
+                continue
+            ttl = parse_duration(dec.get("duration", ""))
+            if ttl <= 0:
+                continue
+            ok, reason, norm = validate(dec.get("value", ""), allow, min_prefix)
+            if not ok:
+                rejected.append({"value": dec.get("value"), "reason": reason})
+                continue
+            desired[norm] = max(desired.get(norm, 0), ttl)
+    return desired, rejected
+
+def desired_feed(allow, min_prefix):
+    if not os.path.exists(FEED_FILE):
+        return {}, []                      # no feed file yet -> empty (not an error)
+    try:
+        with open(FEED_FILE) as f:
+            lines = f.readlines()
+    except Exception as e:
+        log(f"feed read failed: {e} -- leaving blk_feed untouched")
+        return None, []
+    desired, rejected = {}, []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        ok, reason, norm = validate(line, allow, min_prefix)
+        if not ok:
+            rejected.append({"value": line, "reason": reason})
+            continue
+        desired[norm] = DEFAULT_FEED_TTL
+    return desired, rejected
+
+def desired_ai_all(allow, min_prefix):
+    # AI SOURCE: one spool (intents.json) feeds THREE sets, partitioned by typed action.
+    # Returns (desired_by_set, rejected_by_set). Missing spool -> empty desired (no AI actions,
+    # sets reconcile to empty). Read/parse error -> (None, ...) so EVERY ai_* set is left
+    # UNTOUCHED (self-heal via existing TTLs), matching the other sources' fail-safe behavior.
+    sets = list(ACTION_SET.values())
+    per = {s: {} for s in sets}
+    rej = {s: [] for s in sets}
+    if not os.path.exists(INTENTS_FILE):
+        return per, rej
+    try:
+        with open(INTENTS_FILE) as f:
+            doc = json.load(f)
+    except Exception as e:
+        log(f"ai spool read/parse failed: {e} -- leaving ai_* untouched")
+        return None, rej
+    now = int(time.time())
+    added = 0
+    for it in (doc.get("intents") or []):
+        setname = ACTION_SET.get(it.get("action"))
+        if not setname:
+            continue                          # unknown/propose verb -> never applies
+        # absolute expiry -> remaining ttl: a DEAD analyzer's entries count down & drop out
+        try:
+            remaining = int(it.get("expires")) - now
+        except (TypeError, ValueError):
+            rej[setname].append({"value": it.get("cidr"), "reason": "bad-expires"}); continue
+        if remaining <= 0:
+            rej[setname].append({"value": it.get("cidr"), "reason": "expired"}); continue
+        remaining = min(remaining, AI_MAX_TTL)
+        ok, reason, norm = validate(it.get("cidr", ""), allow, min_prefix)
+        if not ok:
+            rej[setname].append({"value": it.get("cidr"), "reason": reason}); continue
+        if added >= AI_MAX_ADDS_PER_RUN:
+            rej[setname].append({"value": norm, "reason": "blast-cap"}); continue
+        if norm not in per[setname]:
+            added += 1
+        per[setname][norm] = max(per[setname].get(norm, 0), remaining)
+    return per, rej
+
+def dedupe_intervals(desired):
+    # nftables `interval` sets reject OVERLAPPING elements; combining feeds creates overlaps
+    # (a /32 inside a /24, adjacent blocks, etc.). Collapse to a minimal non-overlapping set.
+    # Uniform-TTL (feeds): assign that TTL to every merged block (O(n log n)). Mixed-TTL
+    # (CrowdSec, small): give each merged block the MAX TTL of the originals it covers.
+    if not desired:
+        return desired
+    nets = [ipaddress.ip_network(c) for c in desired]
+    merged = list(ipaddress.collapse_addresses(nets))
+    ttls = set(desired.values())
+    if len(ttls) == 1:
+        t = next(iter(ttls))
+        return {str(m): t for m in merged}
+    out = {}
+    for m in merged:
+        lo, hi, best = int(m.network_address), int(m.broadcast_address), 0
+        for c, t in desired.items():
+            n = ipaddress.ip_network(c)
+            if int(n.network_address) >= lo and int(n.broadcast_address) <= hi:
+                best = max(best, t)
+        out[str(m)] = best
+    return out
+
+# ---------- nft apply (atomic per set) ----------
+def current_set(setname):
+    try:
+        out = subprocess.run(["nft", "-j", "list", "set", TABLE.split()[0], TABLE.split()[1], setname],
+                             capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout)
+        elems = set()
+        for obj in data.get("nftables", []):
+            s = obj.get("set")
+            if not s:
+                continue
+            for e in s.get("elem", []) or []:
+                # element may be {"elem":{"val":...,"timeout":...}} or a bare value/prefix
+                v = e
+                if isinstance(e, dict) and "elem" in e:
+                    v = e["elem"].get("val", e["elem"])
+                if isinstance(v, dict) and "prefix" in v:
+                    p = v["prefix"]
+                    elems.add(f"{p['addr']}/{p['len']}")
+                elif isinstance(v, str):
+                    elems.add(v)
+        return elems
+    except Exception:
+        return None
+
+def reconcile_set(setname, desired):
+    # atomic flush+refill in one transaction. desired: {cidr: ttl}
+    fam, tbl = TABLE.split()
+    lines = [f"flush set {fam} {tbl} {setname}"]
+    if desired:
+        elems = ", ".join(f"{cidr} timeout {ttl}s" for cidr, ttl in desired.items())
+        lines.append(f"add element {fam} {tbl} {setname} {{ {elems} }}")
+    script = "\n".join(lines) + "\n"
+    if DRYRUN:
+        return True, "dry-run"
+    p = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True, text=True)
+    if p.returncode != 0:
+        return False, p.stderr.strip()[:300]
+    return True, "ok"
+
+def audit(record):
+    record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(AUDIT, "a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as e:
+        log(f"audit write failed: {e}")
+
+def main():
+    allow = load_allowlist()
+    summary = {"dry_run": DRYRUN, "sets": {}}
+    # AI source feeds 3 sets from ONE spool -> read it once, partition by action.
+    ai_desired, ai_rejected = desired_ai_all(allow, 24)
+    for setname, cfg in SETS.items():
+        if cfg["source"] == "cscli":
+            desired, rejected = desired_cscli(allow, cfg["min_prefix"])
+        elif cfg["source"] == "feed":
+            desired, rejected = desired_feed(allow, cfg["min_prefix"])
+        elif cfg["source"] == "ai":
+            rejected = ai_rejected.get(setname, [])
+            desired = None if ai_desired is None else dict(ai_desired.get(setname, {}))
+        else:
+            continue
+        if desired is None:
+            summary["sets"][setname] = {"skipped": "source-error-left-untouched",
+                                        "rejected": rejected}
+            audit({"event": "reconcile", "set": setname, "result": "skipped-source-error",
+                   "rejected": rejected})
+            continue
+        raw_count = len(desired)
+        desired = dedupe_intervals(desired)   # collapse overlaps for nft interval sets
+        before = current_set(setname)
+        ok, detail = reconcile_set(setname, desired)
+        rec = {"event": "reconcile", "set": setname, "source": cfg["source"],
+               "candidate_count": raw_count, "desired_count": len(desired),
+               "rejected_count": len(rejected),
+               "rejected": rejected[:50], "applied": ok, "detail": detail}
+        if cfg["source"] == "ai":
+            # rollback handle for edge-ctl: id -> (set, exact elements applied)
+            rec["id"] = f"{int(time.time())}-{setname}"
+            rec["ai_elements"] = list(desired.keys())
+        if before is not None:
+            rec["before_count"] = len(before)
+        # noise guard: for the high-frequency ai sets, don't audit a pure no-op
+        # (empty desired, nothing rejected, set already empty).
+        noop = (cfg["source"] == "ai" and not desired and not rejected
+                and (before is None or len(before) == 0))
+        if not noop:
+            audit(rec)
+        summary["sets"][setname] = {"desired": len(desired), "rejected": len(rejected),
+                                    "applied": ok, "detail": detail}
+    print(json.dumps(summary, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

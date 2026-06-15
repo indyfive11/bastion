@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# edge-ai-backend-claude — DEFAULT backend. Implements the provider-agnostic contract
+# (signals JSON on stdin -> intent-envelope JSON on stdout) by calling the Anthropic
+# Messages API with plain urllib (NO vendor SDK). Swappable: nothing else imports this.
+#
+# Key from env ANTHROPIC_API_KEY (systemd EnvironmentFile). Model from EDGE_AI_MODEL
+# (set by the analyzer) or MODEL in backend.conf. Structured output is FORCED via a tool
+# whose input_schema mirrors intent.schema.json, so the model can only emit typed intents.
+#
+import json, os, sys, urllib.request, urllib.error
+
+API_URL = "https://api.anthropic.com/v1/messages"
+BACKENDCONF = "/etc/edge-ai/backend.conf"
+
+SYSTEM = (
+    "You are a defensive network-firewall analyst for an internet edge gateway. You are given "
+    "SANITIZED observations of PUBLIC source IPs that have been hitting the edge (event types + "
+    "counts; plus which we have already actioned). Decide, conservatively, which sources warrant "
+    "a graduated defensive response. Rules you MUST follow:\n"
+    "- Act ONLY on clear evidence of abuse (repeated auth failures, CrowdSec scenarios, scanning).\n"
+    "- Prefer the lightest effective response: ratelimit_src or tarpit_src for ambiguous/low-volume; "
+    "block_src only for clear, high-confidence malicious sources.\n"
+    "- CIDRs must be IPv4 and no broader than /24 (use /32 unless several IPs in one /24 clearly "
+    "act together). Never propose private/internal ranges; you only ever see public IPs.\n"
+    "- Set ttl (seconds) proportional to confidence: hours for probable, up to 24h for certain.\n"
+    "- If you have no high-confidence action, return an empty intents list. Do not invent threats.\n"
+    "- Use propose_base_change ONLY to suggest a structural/base-config change for a human to review; "
+    "it is never auto-applied."
+)
+
+INTENT_ITEM_SCHEMA = {
+    "type": "object",
+    "required": ["action", "ttl", "reason"],
+    "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["block_src", "ratelimit_src", "tarpit_src", "propose_base_change"]},
+        "cidr": {"type": "string", "description": "IPv4 host or /24../32 network; required for block/ratelimit/tarpit"},
+        "ttl": {"type": "integer", "minimum": 60, "maximum": 86400},
+        "reason": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "description": {"type": "string", "description": "for propose_base_change only"},
+    },
+}
+TOOL = {
+    "name": "submit_intents",
+    "description": "Submit the typed, bounded firewall intents derived from the observations.",
+    "input_schema": {
+        "type": "object",
+        "required": ["intents"],
+        "additionalProperties": False,
+        "properties": {"intents": {"type": "array", "items": INTENT_ITEM_SCHEMA}},
+    },
+}
+
+def log(m): sys.stderr.write(f"edge-ai-backend-claude: {m}\n")
+
+def model():
+    m = os.environ.get("EDGE_AI_MODEL")
+    if m: return m
+    try:
+        with open(BACKENDCONF) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("MODEL="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return "claude-opus-4-8"
+
+def main():
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        log("ANTHROPIC_API_KEY not set in environment"); return 2
+    signals = sys.stdin.read()
+    mdl = model()
+    user = ("Sanitized edge observations (JSON). Decide defensive intents per your rules; "
+            "call submit_intents exactly once.\n\n" + signals)
+    body = {
+        "model": mdl, "max_tokens": 2048, "system": SYSTEM,
+        "tools": [TOOL], "tool_choice": {"type": "tool", "name": "submit_intents"},
+        "messages": [{"role": "user", "content": user}],
+    }
+    req = urllib.request.Request(
+        API_URL, data=json.dumps(body).encode(),
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            resp = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300] if hasattr(e, "read") else ""
+        log(f"HTTP {e.code}: {detail}"); return 3
+    except Exception as e:
+        log(f"request failed: {e}"); return 3
+    intents = None
+    for block in resp.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == "submit_intents":
+            intents = (block.get("input") or {}).get("intents")
+            break
+    if intents is None:
+        log(f"no submit_intents tool_use in response; stop_reason={resp.get('stop_reason')}")
+        return 4
+    print(json.dumps({"version": 1, "backend": f"claude:{mdl}", "intents": intents}))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

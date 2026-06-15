@@ -1,0 +1,11 @@
+[Unit]
+Description=edge-ai analysis timer (arm via 'bastion ai enable'; interval from machine.conf ai.timer_interval)
+
+[Timer]
+OnActiveSec=5min
+OnUnitActiveSec={{ ai.timer_interval }}
+RandomizedDelaySec=300
+Persistent=false
+
+[Install]
+WantedBy=timers.target

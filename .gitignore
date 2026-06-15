@@ -1,0 +1,21 @@
+# Local machine state — NEVER commit
+machine.conf
+machine.env
+secrets.conf
+*.local
+
+# Installation-specific value denylist (loaded by `make leak-check`) — NEVER commit
+.leak-denylist
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

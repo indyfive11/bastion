@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# notify-alert — unified failure notifier for a bastion node.
+#
+# HARD RULE (no arch-leak on unencrypted channels): architectural detail — hostnames,
+# unit names, device paths, mount layout, failure-mode logic — must NEVER cross an
+# unencrypted boundary. Therefore:
+#   * EXTERNAL sinks (public ntfy topic, external email) emit ONLY the fixed degraded-only
+#     template: no service names, no paths, no host.
+#   * FULL detail goes ONLY to operator-controlled channels — the local journal (always,
+#     stays on-box) and an OPTIONAL internal ntfy reachable over a trusted network
+#     (ZeroTier / WireGuard) behind auth.
+# Always exits 0 so a notifier hiccup never cascades into more failures.
+set -u
+
+CONF=/etc/bastion/notify-alert.conf
+[ -r "$CONF" ] && . "$CONF"
+
+HOST="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
+NOW="$(date '+%FT%T %Z')"
+
+# --- DETAILED message (internal-only) -----------------------------------
+if [ "$#" -ge 1 ] && [ -n "${1:-}" ]; then
+  D_TITLE="$1"
+  D_BODY="${2:-}"
+elif [ -n "${SMARTD_MESSAGE:-}" ]; then
+  D_TITLE="SMART: ${SMARTD_FAILTYPE:-alert} on ${SMARTD_DEVICE:-disk} (${HOST})"
+  D_BODY="${SMARTD_FULLMESSAGE:-$SMARTD_MESSAGE}"
+else
+  D_TITLE="Alert from ${HOST}"
+  D_BODY="(no message body)"
+fi
+DETAIL="host: ${HOST}
+time: ${NOW}
+
+${D_BODY}"
+
+# --- EXTERNAL template (degraded-only — NO architectural detail) ---------
+EXT_TITLE="Service alert — degraded"
+EXT_BODY="Time: ${NOW}. Status: degraded. Action: see runbook for recovery."
+
+# 1) Local journal — always, full detail (never leaves the box).
+if command -v logger >/dev/null 2>&1; then
+  printf '%s\n%s\n' "${D_TITLE}" "${DETAIL}" \
+    | logger -t notify-alert -p daemon.warning
+fi
+
+# 2) Internal ntfy (full detail) — ONLY over an operator-controlled network.
+#    Configure INTERNAL_NTFY_URL (+ optional INTERNAL_NTFY_AUTH) in the conf.
+if [ -n "${INTERNAL_NTFY_URL:-}" ]; then
+  curl -fsS --max-time 15 \
+    ${INTERNAL_NTFY_AUTH:+-H "Authorization: ${INTERNAL_NTFY_AUTH}"} \
+    -H "Title: ${D_TITLE}" \
+    -H "Priority: high" \
+    -H "Tags: warning,floppy_disk" \
+    -d "${DETAIL}" \
+    "${INTERNAL_NTFY_URL}" >/dev/null 2>&1 || true
+fi
+
+# 3) Public ntfy — EXTERNAL: degraded-only template ONLY.
+if [ -n "${NTFY_TOPIC:-}" ]; then
+  curl -fsS --max-time 15 \
+    -H "Title: ${EXT_TITLE}" \
+    -H "Priority: high" \
+    -H "Tags: warning" \
+    -d "${EXT_BODY}" \
+    "${NTFY_SERVER:-https://ntfy.sh}/${NTFY_TOPIC}" >/dev/null 2>&1 || true
+fi
+
+# 4) External email — EXTERNAL: degraded-only template ONLY.
+if [ -n "${ALERT_EMAIL:-}" ] && command -v mail >/dev/null 2>&1; then
+  printf '%s\n' "${EXT_BODY}" | mail -s "${EXT_TITLE}" "${ALERT_EMAIL}" >/dev/null 2>&1 || true
+fi
+
+exit 0

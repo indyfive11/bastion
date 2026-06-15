@@ -1,0 +1,11 @@
+[Unit]
+Description=daily bastion DNS sinkhole refresh
+
+[Timer]
+OnBootSec=8min
+OnCalendar=daily
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

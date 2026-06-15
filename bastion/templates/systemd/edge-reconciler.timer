@@ -1,0 +1,11 @@
+[Unit]
+Description=periodic edge-reconciler pass (reconcile managed nft sets from all sources)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
