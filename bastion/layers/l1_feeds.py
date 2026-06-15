@@ -42,6 +42,8 @@ class L1Feeds(Layer):
             self.install_unit(ctx, unit)
         for d in self.runtime_dirs:
             sys.path(d).mkdir(parents=True, exist_ok=True)
+        # Cap the reconciler audit log (append-only, written ~every 60s) — B5.
+        self.install_logrotate(ctx, "edge-reconciler")
 
         if sys.is_live:
             sys.run("systemctl", "daemon-reload")

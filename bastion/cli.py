@@ -316,7 +316,11 @@ def cmd_firewall(args: argparse.Namespace) -> int:
 # `bastion ai <action>` maps to edge-ctl, the L3 operator kill switch (Commandment #6). edge-ctl
 # is the implementation (it enforces root and does the nft flush / spool clear / timer toggle); this
 # surfaces the human kill switch on the top-level CLI, as the docs and L3 install message promise.
-_AI_ACTIONS = {"enable": "ai-enable", "disable": "ai-disable", "panic": "panic", "status": "status"}
+# proposals = list the human-review queue (propose_base_change); rollback <id> = undo one audit
+# record's applied elements. edge-ctl self-elevates (`sudo -n`) for every subcommand, so all of
+# these need root regardless. (D3 will add `ai proposals apply/reject`; today it is list-only.)
+_AI_ACTIONS = {"enable": "ai-enable", "disable": "ai-disable", "panic": "panic", "status": "status",
+               "proposals": "proposals", "rollback": "rollback"}
 
 
 def cmd_ai(args: argparse.Namespace) -> int:
@@ -331,7 +335,14 @@ def cmd_ai(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     edge_ctl = str(sys_.path(f"{ctx.sbin_dir}/edge-ctl"))
-    return sys_.run(edge_ctl, _AI_ACTIONS[args.action], capture=False).returncode
+    argv = [edge_ctl, _AI_ACTIONS[args.action]]
+    if args.action == "rollback":
+        if not getattr(args, "id", None):
+            print("bastion ai rollback needs an audit id: `bastion ai rollback <id>` "
+                  "(see ids in `bastion ai proposals` / the reconciler audit log)", file=sys.stderr)
+            return 1
+        argv.append(args.id)
+    return sys_.run(*argv, capture=False).returncode
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -358,6 +369,193 @@ def cmd_check(args: argparse.Namespace) -> int:
         rc = sys_.run(str(sys_.path(rel)), capture=False).returncode
         rc_total = rc_total or rc
     return rc_total
+
+
+# --- A1: thin top-level wrappers over the operational scripts (founding-doc §9). The capability
+#     lives in the script; these just surface it on the unified `bastion` CLI so an operator never
+#     has to remember `net-snapshot`/`net-rollback`/`net-confirm`/`bastion-recovery` by name. ---
+def _run_sbin(ctx: Context, name: str, *args: str, need_root: bool = True) -> int:
+    sys_ = ctx.system
+    rel = f"{ctx.sbin_dir}/{name}"
+    if not sys_.exists(rel):
+        print(f"bastion: {name} not installed — install the layer that ships it first "
+              "(e.g. L6 for the net-* tools, L0 for bastion-recovery)", file=sys.stderr)
+        return 1
+    if need_root and os.geteuid() != 0 and sys_.root == Path("/"):
+        print(f"bastion {name.replace('bastion-', '')}: needs root — run with sudo", file=sys.stderr)
+        return 1
+    return sys_.run(str(sys_.path(rel)), *args, capture=False).returncode
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Capture the current known-good network/firewall state (net-snapshot) for later rollback."""
+    return _run_sbin(build_context(args), "net-snapshot")
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    """Restore the last snapshot (net-rollback) — idempotent, gentle; safe when state matches."""
+    return _run_sbin(build_context(args), "net-rollback", getattr(args, "reason", None) or "manual")
+
+
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Confirm egress is genuinely up + stable, then disarm the watchdog (net-confirm)."""
+    return _run_sbin(build_context(args), "net-confirm")
+
+
+def cmd_recovery(args: argparse.Namespace) -> int:
+    """Operate the bastion-recovery rescue service (start/stop/extend/status)."""
+    # status is read-only (it just reports the rescue user/timer/ports); the mutating actions
+    # create the ephemeral user + OTP and toggle the transient unit, so they require root.
+    return _run_sbin(build_context(args), "bastion-recovery", args.action,
+                     need_root=args.action != "status")
+
+
+_UPDATE_UNITS = {"feeds": "edge-feed.service", "dnsblock": "edge-dnsblock.service"}
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Trigger a feed/dnsblock refresh now (the systemd oneshot the timer normally runs), instead
+    of waiting for the timer. The unit keeps the same sandboxing/StateDirectory as the scheduled run."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    if os.geteuid() != 0 and sys_.root == Path("/"):
+        print("bastion update: needs root — run with sudo", file=sys.stderr)
+        return 1
+    unit = _UPDATE_UNITS[args.target]
+    print(f"bastion update: running {unit} now...")
+    rc = sys_.run("systemctl", "start", unit, capture=False).returncode
+    if rc == 0:
+        extra = " — the reconciler applies the refreshed list within ~60s" if args.target == "feeds" else ""
+        print(f"  {unit} completed{extra}.")
+    else:
+        print(f"  failed to run {unit} — is the layer that provides it installed?", file=sys.stderr)
+    return rc
+
+
+# --- B3: drift detection. Compare each active-layer managed config (and machine.env) to what
+#     `bastion generate` would produce right now, so hand-edits / stale files / a failed reload
+#     surface instead of silently diverging from machine.conf. ---
+def _drift_report(ctx: Context, templates_dir: Path) -> tuple[list[tuple[str, str]], int]:
+    """Returns (drift, n_ok): drift is a list of (dest, 'MISSING'|'DRIFTED'); n_ok counts files
+    whose on-disk content matches the freshly-rendered template byte-for-byte."""
+    sys_, config, mode = ctx.system, ctx.config, ctx.mode
+    active_rels = active_template_rels(config, mode)
+    drift: list[tuple[str, str]] = []
+    n_ok = 0
+    for rel, abs_path in iter_templates(templates_dir):
+        if rel.as_posix() not in active_rels:
+            continue
+        dest = manifest_dest(rel, mode, Path("/"))
+        if dest is None:
+            continue
+        want = templates.render_file(abs_path, config)
+        live = sys_.path(str(dest))
+        if not live.exists():
+            drift.append((str(dest), "MISSING"))
+        elif live.read_text() != want:
+            drift.append((str(dest), "DRIFTED"))
+        else:
+            n_ok += 1
+    env_dest = "/etc/bastion/machine.env"
+    env_live = sys_.path(env_dest)
+    want_env = state.render_machine_env(config)
+    if not env_live.exists():
+        drift.append((env_dest, "MISSING"))
+    elif env_live.read_text() != want_env:
+        drift.append((env_dest, "DRIFTED"))
+    else:
+        n_ok += 1
+    return drift, n_ok
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    ctx = build_context(args)
+    if not ctx.config:
+        print("bastion verify: no machine.conf — run `bastion setup` / `bastion generate` first",
+              file=sys.stderr)
+        return 1
+    templates_dir = find_templates_dir(getattr(args, "templates", None))
+    drift, n_ok = _drift_report(ctx, templates_dir)
+    print(f"bastion verify (mode={ctx.mode}, root={ctx.system.root}): "
+          f"{n_ok} generated file(s) match disk")
+    for dest, status in drift:
+        print(f"  [{status}] {dest}")
+    if drift:
+        print(f"  {len(drift)} file(s) differ from `bastion generate`. Re-run `bastion generate` "
+              "(then `bastion firewall reload` for the ruleset) to reconcile — or fold your "
+              "hand-edits back into machine.conf.")
+        return 1
+    print("  no drift — live configs match what generate would produce.")
+    return 0
+
+
+# --- D2: one-shot triage. Encodes the dogfood hunt (missing binaries, drift, firewall not
+#     persisted, recovery missing, AI off, unreadable secret) as a single read-only command. ---
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ctx = build_context(args)
+    sys_ = ctx.system
+    results: list[tuple[str, str, str]] = []
+
+    def add(level: str, name: str, detail: str = "") -> None:
+        results.append((level, name, detail))
+
+    if not ctx.config:
+        add("FAIL", "machine.conf", "absent — run `bastion setup` / `bastion generate`")
+    else:
+        add("OK", "machine.conf", f"mode={ctx.mode}, layers={ctx.config.get('machine', {}).get('layers', '')}")
+
+    add("OK", "nft binary") if sys_.command_exists("nft") else \
+        add("FAIL", "nft binary", "nftables not installed — the firewall cannot load")
+
+    if sys_.exists("/etc/nftables.conf"):
+        if sys_.is_live and not sys_.unit_enabled("nftables.service"):
+            add("WARN", "firewall persistence",
+                "nftables.service NOT enabled — the ruleset won't reload on reboot "
+                "(`sudo systemctl enable nftables`)")
+        else:
+            add("OK", "firewall ruleset", "/etc/nftables.conf present")
+    else:
+        add("WARN", "firewall ruleset", "/etc/nftables.conf absent — run `bastion generate`")
+
+    if ctx.config and sys_.is_live and sys_.is_root:
+        fam, tbl = ("inet", "bastion") if ctx.mode == "endpoint" else ("inet", "edge")
+        add("OK", "base table", f"{fam} {tbl} loaded") if sys_.nft_table_exists(fam, tbl) else \
+            add("WARN", "base table", f"{fam} {tbl} not loaded — `bastion firewall reload`")
+
+    if ctx.config:
+        try:
+            drift, _ = _drift_report(ctx, find_templates_dir(getattr(args, "templates", None)))
+            add("WARN", "config drift", f"{len(drift)} file(s) differ — see `bastion verify`") \
+                if drift else add("OK", "config drift", "none")
+        except Exception as exc:                                       # noqa: BLE001
+            add("WARN", "config drift", f"could not check ({exc})")
+
+    add("OK", "recovery", "bastion-recovery installed") \
+        if sys_.exists(f"{ctx.sbin_dir}/bastion-recovery") else \
+        add("WARN", "recovery", "bastion-recovery missing — reinstall L0 (Commandment: always present)")
+
+    layers = [x.strip() for x in (ctx.config.get("machine", {}).get("layers", "") if ctx.config else "").split(",")]
+    if "l3" in layers:
+        if sys_.is_live and not sys_.unit_enabled("edge-ai.timer"):
+            add("WARN", "ai timer", "edge-ai.timer not enabled — AI analysis is off (`bastion ai enable`)")
+        else:
+            add("OK", "ai timer", "L3 selected")
+        env = "/etc/edge-ai/claude.env"
+        if sys_.exists(env):
+            try:
+                sys_.read(env)
+                add("OK", "ai secret", f"{env} readable")
+            except Exception:                                          # noqa: BLE001
+                add("WARN", "ai secret", f"{env} present but unreadable")
+
+    print(f"bastion doctor (mode={ctx.mode}, root={sys_.root})")
+    for level, name, detail in results:
+        print(f"  [{level:<4}] {name}" + (f" — {detail}" if detail else ""))
+    fails = sum(1 for lvl, _, _ in results if lvl == "FAIL")
+    warns = sum(1 for lvl, _, _ in results if lvl == "WARN")
+    oks = sum(1 for lvl, _, _ in results if lvl == "OK")
+    print(f"  {fails} fail, {warns} warn, {oks} ok")
+    return 1 if fails else 0
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -433,11 +631,53 @@ def build_parser() -> argparse.ArgumentParser:
     fw.set_defaults(func=cmd_firewall)
 
     ai = sub.add_parser("ai", help="control the L3 AI analysis layer (operator kill switch)")
-    ai.add_argument("action", choices=["enable", "disable", "panic", "status"],
-                    help="enable/disable arm the AI timer; panic flushes ai_* now; status shows state")
+    ai.add_argument("action", choices=["enable", "disable", "panic", "status", "proposals", "rollback"],
+                    help="enable/disable arm the AI timer; panic flushes ai_* now; status shows state; "
+                         "proposals lists the human-review queue; rollback <id> undoes one audit record")
+    ai.add_argument("id", nargs="?", help="audit id for `rollback`")
     ai.add_argument("--conf", help="path to machine.conf")
     ai.add_argument("--root", help="operate under this base dir instead of /")
     ai.set_defaults(func=cmd_ai)
+
+    snap = sub.add_parser("snapshot", help="capture known-good network/firewall state (net-snapshot)")
+    snap.add_argument("--conf", help="path to machine.conf")
+    snap.add_argument("--root", help="operate under this base dir instead of /")
+    snap.set_defaults(func=cmd_snapshot)
+
+    rb = sub.add_parser("rollback", help="restore the last snapshot (net-rollback)")
+    rb.add_argument("reason", nargs="?", help="optional reason string recorded in the log")
+    rb.add_argument("--conf", help="path to machine.conf")
+    rb.add_argument("--root", help="operate under this base dir instead of /")
+    rb.set_defaults(func=cmd_rollback)
+
+    cf = sub.add_parser("confirm", help="confirm egress is stable, then disarm the watchdog (net-confirm)")
+    cf.add_argument("--conf", help="path to machine.conf")
+    cf.add_argument("--root", help="operate under this base dir instead of /")
+    cf.set_defaults(func=cmd_confirm)
+
+    rec = sub.add_parser("recovery", help="operate the bastion-recovery rescue service")
+    rec.add_argument("action", choices=["start", "stop", "extend", "status"])
+    rec.add_argument("--conf", help="path to machine.conf")
+    rec.add_argument("--root", help="operate under this base dir instead of /")
+    rec.set_defaults(func=cmd_recovery)
+
+    upd = sub.add_parser("update", help="refresh threat feeds / DNS blocklist now (run the timer's oneshot)")
+    upd.add_argument("target", choices=["feeds", "dnsblock"])
+    upd.add_argument("--conf", help="path to machine.conf")
+    upd.add_argument("--root", help="operate under this base dir instead of /")
+    upd.set_defaults(func=cmd_update)
+
+    vfy = sub.add_parser("verify", help="check live configs match what `bastion generate` would produce")
+    vfy.add_argument("--conf", help="path to machine.conf")
+    vfy.add_argument("--templates", help="path to templates/ dir")
+    vfy.add_argument("--root", help="inspect under this base dir instead of /")
+    vfy.set_defaults(func=cmd_verify)
+
+    doc = sub.add_parser("doctor", help="triage a sick box (binaries, drift, persistence, recovery, AI)")
+    doc.add_argument("--conf", help="path to machine.conf")
+    doc.add_argument("--templates", help="path to templates/ dir")
+    doc.add_argument("--root", help="inspect under this base dir instead of /")
+    doc.set_defaults(func=cmd_doctor)
 
     chk = sub.add_parser("check", help="run connectivity/flow checks (wraps L6 flowcheck/lan-verify)")
     chk.add_argument("--full", action="store_true",

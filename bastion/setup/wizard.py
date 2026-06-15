@@ -84,9 +84,67 @@ def normalize_timer_interval(raw: str) -> str | None:
     return s
 
 
+# --- answer validators (B8: typo-catching at the wizard boundary, NOT a security control —
+#     the real gate is `nft -c` + reconciler re-validation; this just stops a fat-fingered CIDR
+#     surfacing three steps later as an opaque dnsmasq/nft failure). Each accepts blank (the
+#     caller decides whether blank is allowed); only a *non-blank, malformed* value is rejected. ---
+def _v_port(v: str) -> bool:
+    return not v or (v.isdigit() and 1 <= int(v) <= 65535)
+
+
+def _v_ip(v: str) -> bool:
+    if not v:
+        return True
+    try:
+        ipaddress.ip_address(v)
+        return True
+    except ValueError:
+        return False
+
+
+def _v_cidr(v: str) -> bool:
+    if not v:
+        return True
+    try:
+        ipaddress.ip_network(v, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def _v_hosts(v: str) -> bool:
+    """Comma-separated single IPs and/or CIDRs (the nft trusted_hosts element list)."""
+    if not v:
+        return True
+    for part in (p.strip() for p in v.split(",") if p.strip()):
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            return False
+    return True
+
+
+def _v_iface(v: str) -> bool:
+    """A plausible Linux interface name (IFNAMSIZ caps the kernel name at 15 chars)."""
+    return not v or (len(v) <= 15 and re.fullmatch(r"[A-Za-z0-9._@:-]+", v) is not None)
+
+
+# --set keys whose values carry a typed format — validated at parse time so a scripted/repeatable
+# setup fails loud on a typo instead of writing a broken machine.conf (mirrors the interactive
+# re-prompt). timer_interval is validated separately (systemd time-span grammar).
+_SET_VALIDATORS = {
+    "lan_cidr": (_v_cidr, "a CIDR like 192.168.1.0/24"),
+    "lan_ip": (_v_ip, "an IP like 192.168.1.1"),
+    "gateway": (_v_ip, "an IP like 192.168.1.1"),
+    "ssh_port": (_v_port, "a port in 1–65535"),
+    "trusted_hosts": (_v_hosts, "comma-separated IPs/CIDRs"),
+}
+
+
 def parse_overrides(pairs) -> dict[str, str]:
     """Parse `--set key=value` strings into an answers-override dict. Raises ValueError on a
-    malformed pair or an unknown key (listing the valid keys) — fail loud, never silently drop."""
+    malformed pair, an unknown key (listing the valid keys), or a typed value that fails its
+    validator — fail loud, never silently drop."""
     out: dict[str, str] = {}
     for pair in pairs or []:
         key, sep, value = pair.partition("=")
@@ -99,6 +157,10 @@ def parse_overrides(pairs) -> dict[str, str]:
         if key == "timer_interval" and normalize_timer_interval(value) is None:
             raise ValueError(f"--set timer_interval {value!r} is not a valid systemd time span "
                              "(e.g. 4h, 30min, 90s, 2h30m)")
+        if key in _SET_VALIDATORS and value:
+            fn, hint = _SET_VALIDATORS[key]
+            if not fn(value):
+                raise ValueError(f"--set {key} {value!r} is invalid — expected {hint}.")
         out[key] = value
     return out
 
@@ -293,6 +355,19 @@ class Wizard:
             return options[int(raw) - 1]
         return raw if raw in options else default
 
+    def _ask_validated(self, prompt: str, default: str, validator, hint: str) -> str:
+        """Like _ask, but re-prompts until the answer passes `validator` (B8). Blank is always
+        accepted (the validators treat blank as 'unset' — the caller/skeleton decides if that's
+        OK). Non-interactive: never loop on a bad detected default — take it and move on (the
+        detected value should already be valid; a bad one is surfaced later by generate)."""
+        while True:
+            v = self._ask(prompt, default)
+            if validator(v):
+                return v
+            self.out(f"  '{v}' isn't valid — expected {hint}.")
+            if self.assume_defaults:
+                return default
+
     def _current_timer_interval(self) -> str:
         """Default for the AI-cadence prompt: an existing live machine.conf value (preserve it on
         reinstall), else the shipped skeleton default — never lose a deliberate operator setting."""
@@ -366,9 +441,24 @@ class Wizard:
         notes = self._secrets_step(profile, answers)
         notes += self._alerts_step(profile)
 
-        # build the conf now that all answers are gathered
+        # build the conf now that all answers are gathered. A4: if a machine.conf already exists,
+        # overlay the skeleton with it FIRST so operator hand-edits the wizard never prompts for
+        # (e.g. ai.depth, a custom layer list) survive a re-run — detection + the answers above
+        # still take precedence (they flow in as the high-priority layer of build_machine_conf).
         base = state.load_conf(self.example_path)
+        existing = self._load_existing_conf()
+        if existing:
+            base = self._merge_conf(base, existing)
+            self.out("  found an existing machine.conf — preserving settings you didn't change "
+                     "(your answers + detection still take precedence).")
         config = build_machine_conf(d, profile, answers, base)
+
+        # C1: final review/confirm before ANYTHING is written or installed.
+        if not self._confirm_step(config, mode, profile):
+            self.out("  aborted at confirmation — nothing was written or installed.")
+            return WizardResult(config=config, mode=mode, profile=profile, dry_run=self.dry_run,
+                                notes=["setup aborted at the confirmation step; "
+                                       "nothing written or installed."])
 
         # 6. GENERATE — preview in dry-run; live, write machine.conf + render templates/env.
         out("\n[6/8] Generate" + (" (preview)" if self.dry_run else ""))
@@ -422,23 +512,87 @@ class Wizard:
         self.out(f"  layers: {PROFILE_LAYERS.get(chosen, '(custom — select in machine.conf)')}")
         return chosen
 
+    def _load_existing_conf(self) -> dict | None:
+        """The machine.conf already on the box (root-prefixed for --root staging), or None. Used by
+        A4 to carry an operator's prior hand-edits into a re-run instead of clobbering them."""
+        p = self.sys.path("/etc/bastion/machine.conf")
+        if not p.exists():
+            return None
+        try:
+            return state.load_conf(p)
+        except Exception:
+            return None   # an unreadable/garbled conf must not wedge setup — fall back to skeleton
+
+    @staticmethod
+    def _merge_conf(base: dict, overlay: dict) -> dict:
+        """Section-wise overlay: overlay's keys win over base's, base supplies any the overlay omits
+        (so every skeleton key still exists — the generate-resolves-everything invariant holds)."""
+        out = {sec: dict(items) for sec, items in base.items()}
+        for sec, items in overlay.items():
+            dst = out.setdefault(sec, {})
+            for k, v in items.items():
+                dst[k] = v
+        return out
+
+    def _confirm_step(self, config: dict, mode: str, profile: str) -> bool:
+        """C1: show what will be written/installed and ask to proceed. Returns True to go ahead.
+        Dry-run writes nothing (just preview the summary → True); non-interactive can't answer a
+        prompt, so it proceeds (the operator opted into unattended). Interactive default is N —
+        an explicit yes is required before the live write+install."""
+        m = config.get("machine", {})
+        net = config.get("network", {})
+        ifc = config.get("interfaces", {})
+        self.out("\n[review] About to apply this configuration:")
+        self.out(f"  mode: {mode}    profile: {profile}")
+        self.out(f"  layers: {m.get('layers', '')}")
+        self.out(f"  ssh port: {config.get('ports', {}).get('ssh', '')}")
+        if mode == "edge":
+            self.out(f"  interfaces: LAN {ifc.get('lan', '') or '-'} / WAN {ifc.get('wan', '') or '-'}")
+            self.out(f"  LAN: {net.get('lan_cidr', '') or '-'} "
+                     f"(this box {net.get('lan_ip', '') or '-'}), gateway {net.get('gateway', '') or '-'}")
+        else:
+            self.out(f"  interface: {ifc.get('lan', '') or '-'}")
+        self.out(f"  trusted hosts (full inbound): {net.get('trusted_hosts', '') or 'none'}")
+        self.out(f"  packages: {', '.join(self._active_packages(config)) or 'none'}")
+        if self.dry_run:
+            self.out("  (dry-run — nothing will be written or installed.)")
+            return True
+        if self.assume_defaults:
+            self.out("  (non-interactive — proceeding.)")
+            return True
+        return self._confirm("Proceed — write machine.conf and install the above?", default=False)
+
     def _layer_questions(self, d: detectmod.Detection, mode: str, profile: str) -> dict:
         a: dict = {}
-        a["ssh_port"] = self._ask("SSH port (the port sshd already listens on)", str(d.ssh_port))
-        a["trusted_hosts"] = self._ask(
+        known_ifaces = {i.name for i in d.physical_ifaces()}
+
+        def iface_answer(prompt: str, default: str) -> str:
+            name = self._ask_validated(prompt, default, _v_iface, "a NIC name like eth0/wlan0")
+            if name and known_ifaces and name not in known_ifaces and not self.assume_defaults:
+                self.out(f"  note: '{name}' isn't among the detected interfaces "
+                         f"({', '.join(sorted(known_ifaces)) or 'none'}) — continuing in case it "
+                         "comes up later.")
+            return name
+
+        a["ssh_port"] = self._ask_validated("SSH port (the port sshd already listens on)",
+                                             str(d.ssh_port), _v_port, "a port in 1–65535")
+        a["trusted_hosts"] = self._ask_validated(
             "IPs allowed FULL inbound access (e.g. a desktop you admin this box from) — "
-            "comma-separated, blank = none (typical)", "")
+            "comma-separated, blank = none (typical)", "", _v_hosts, "comma-separated IPs/CIDRs")
         if mode == "edge":
-            a["lan_iface"] = self._ask("LAN interface (NIC facing your local network, e.g. eth0)",
-                                       d.lan_iface or "")
-            a["wan_iface"] = self._ask("WAN interface (NIC facing the internet/modem, e.g. eth1)",
-                                       d.wan_iface or "")
-            a["lan_cidr"] = self._ask("LAN subnet in CIDR (e.g. 192.168.1.0/24)", d.lan_cidr or "")
-            a["lan_ip"] = self._ask("This box's LAN IP (e.g. 192.168.1.1)", d.lan_ip or "")
-            a["gateway"] = self._ask("Upstream gateway IP — your modem/router (e.g. 192.168.1.1)",
-                                     d.gateway or "")
+            a["lan_iface"] = iface_answer("LAN interface (NIC facing your local network, e.g. eth0)",
+                                          d.lan_iface or "")
+            a["wan_iface"] = iface_answer("WAN interface (NIC facing the internet/modem, e.g. eth1)",
+                                          d.wan_iface or "")
+            a["lan_cidr"] = self._ask_validated("LAN subnet in CIDR (e.g. 192.168.1.0/24)",
+                                                d.lan_cidr or "", _v_cidr, "a CIDR like 192.168.1.0/24")
+            a["lan_ip"] = self._ask_validated("This box's LAN IP (e.g. 192.168.1.1)",
+                                              d.lan_ip or "", _v_ip, "an IP like 192.168.1.1")
+            a["gateway"] = self._ask_validated(
+                "Upstream gateway IP — your modem/router (e.g. 192.168.1.1)",
+                d.gateway or "", _v_ip, "an IP like 192.168.1.1")
         else:
-            a["lan_iface"] = self._ask(
+            a["lan_iface"] = iface_answer(
                 "Network interface this box uses (e.g. eth0 / wlan0)", d.lan_iface or "")
             if not self.assume_defaults:
                 self.out("  endpoint mode — DNS/DHCP, WireGuard-server, relay and gateway "
@@ -671,13 +825,17 @@ class Wizard:
         """§10 step 7. Live root install → batch-install packages, then run each active layer's
         install(); dry-run / --root staging → preview the package plan only (non-mutating)."""
         from ..layers import base as layerbase
-        fw = layerbase.blocking_conflicting_firewall(self.sys) if self.sys.is_live else None
+        # A6: probe the LIVE host's firewall even for a staged/dry preview — a ufw/firewalld
+        # conflict is a property of the host the ruleset eventually loads on, not of the staging
+        # root. is_live is False under --root, but `systemctl is-active` still queries the real
+        # host, so the preview now warns instead of looking clean and aborting only at the real apply.
+        fw = layerbase.blocking_conflicting_firewall(self.sys)
 
         if self.dry_run or not self.sys.is_live:
             notes = []
             if fw:
-                self.out(f"  NOTE: {fw} is active — bastion's ruleset would flush it. Disable it "
-                         f"(`sudo systemctl disable --now {fw}`) before a live install.")
+                self.out(f"  NOTE: {fw} is active on this host — bastion's ruleset would flush it. "
+                         f"Disable it (`sudo systemctl disable --now {fw}`) before a live install.")
                 notes.append(f"{fw} active — disable before a live install (its rules would be flushed).")
             return self._package_plan(config, mode), notes
 

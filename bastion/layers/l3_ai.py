@@ -49,6 +49,8 @@ class L3AiAnalysis(Layer):
             self.render_to(ctx, template_rel, dest)
         for unit in self.units:
             self.install_unit(ctx, unit)
+        # Cap the append-only AI proposal queue (proposals.jsonl) — B5.
+        self.install_logrotate(ctx, "edge-ai")
 
         if sys.is_live:
             # Unprivileged service identity for the analyzer (idempotent).

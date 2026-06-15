@@ -145,6 +145,15 @@ class Layer(abc.ABC):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(tmpl.render_file(src, ctx.config))
 
+    def install_logrotate(self, ctx: Context, name: str) -> None:
+        """Install a static logrotate drop-in from templates/logrotate/<name> to
+        /etc/logrotate.d/<name> — caps bastion's append-only state (B5). Idempotent overwrite;
+        these are plain config (no placeholders), so a verbatim copy, not a render."""
+        src = ctx.templates_dir / "logrotate" / name
+        out = ctx.system.path(f"/etc/logrotate.d/{name}")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(src.read_text())
+
     # --- the interface every layer implements -----------------------------
     @abc.abstractmethod
     def install(self, ctx: Context) -> None: ...

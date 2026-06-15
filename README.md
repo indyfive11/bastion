@@ -260,6 +260,12 @@ bastion never rewrites your resolver config.
 | `bastion layer <install\|uninstall\|status> <id>` | manage a single layer |
 | `bastion firewall <reload\|status>` | reconcile / inspect the nft ruleset |
 | `bastion ai <enable\|disable\|panic\|status>` | control the optional AI layer (kill switch) |
+| `bastion ai <proposals\|rollback <id>>` | list the AI human-review queue / undo one applied change |
+| `bastion verify` | check live configs still match what `generate` would produce (drift detection) |
+| `bastion doctor` | one-shot triage: binaries, drift, firewall persistence, recovery, AI |
+| `bastion snapshot \| rollback [reason] \| confirm` | capture / restore known-good network state; confirm egress then disarm the watchdog |
+| `bastion recovery <start\|stop\|extend\|status>` | operate the out-of-band rescue service |
+| `bastion update <feeds\|dnsblock>` | refresh threat feeds / DNS blocklist now (don't wait for the timer) |
 | `bastion check [--full\|--lan]` | read-only flow & LAN verification |
 
 ## Design principles

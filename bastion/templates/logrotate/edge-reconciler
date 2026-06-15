@@ -1,0 +1,13 @@
+# bastion L1 — rotate the reconciler audit log. edge-reconciler appends a JSON record on every
+# reconcile (~every 60s) plus edge-ctl rollback/panic events, so this file grows unbounded on a
+# long-running edge. copytruncate: the writers open-append per record (no held fd), and truncate-
+# in-place keeps the path stable for them.
+/var/log/edge-reconciler/*.jsonl {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

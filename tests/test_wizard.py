@@ -466,3 +466,109 @@ def test_generate_apply_aborts_on_incomplete_conf(tmp_path, capsys):
     assert any("aborted" in n for n in notes)
     assert not (tmp_path / "etc/bastion/machine.conf").exists()
     assert "ABORT" in capsys.readouterr().out
+
+
+# --- B8: input validation (typo-catching at the wizard boundary) ----------
+def test_validators_accept_valid_reject_garbage():
+    assert wizard._v_cidr("192.168.1.0/24") and not wizard._v_cidr("192.168.1.0/99")
+    assert wizard._v_ip("10.0.0.1") and not wizard._v_ip("10.0.0.300")
+    assert wizard._v_port("65535") and not wizard._v_port("0") and not wizard._v_port("70000")
+    assert wizard._v_hosts("1.2.3.4, 5.6.7.0/24") and not wizard._v_hosts("1.2.3.4, nope")
+    assert wizard._v_iface("eth0") and not wizard._v_iface("eth 0") and not wizard._v_iface("x" * 16)
+    # blank is always accepted — the caller/skeleton decides whether unset is allowed.
+    assert wizard._v_ip("") and wizard._v_cidr("") and wizard._v_hosts("") and wizard._v_port("")
+
+
+def test_parse_overrides_rejects_typed_garbage():
+    for bad in ("lan_cidr=not-a-cidr", "lan_ip=999.1.1.1", "gateway=10.0.0.300",
+                "ssh_port=70000", "trusted_hosts=10.0.0.2,nope"):
+        with pytest.raises(ValueError):
+            wizard.parse_overrides([bad])
+
+
+def test_parse_overrides_accepts_valid_typed():
+    out = wizard.parse_overrides(["lan_cidr=192.168.5.0/24", "lan_ip=192.168.5.1",
+                                  "gateway=192.168.5.254", "ssh_port=2222",
+                                  "trusted_hosts=10.0.0.2,10.0.0.0/24"])
+    assert out["lan_cidr"] == "192.168.5.0/24" and out["ssh_port"] == "2222"
+
+
+def test_ask_validated_reprompts_until_valid():
+    answers = iter(["999.999.0.0/24", "192.168.9.0/24"])
+    w = wizard.Wizard(edge_system(), assume_defaults=False, example_conf=str(EXAMPLE),
+                      inp=lambda p: next(answers), out=lambda *a: None)
+    assert w._ask_validated("LAN subnet", "", wizard._v_cidr, "a CIDR") == "192.168.9.0/24"
+
+
+# --- C1: final review/confirm screen --------------------------------------
+def _confirm_wiz(inp, *, dry_run=False, assume=False):
+    return wizard.Wizard(edge_system(), dry_run=dry_run, assume_defaults=assume,
+                         example_conf=str(EXAMPLE), inp=inp, out=lambda *a: None)
+
+
+def test_confirm_step_no_aborts():
+    assert _confirm_wiz(lambda p: "n")._confirm_step(state.load_conf(EXAMPLE), "edge", "full-edge") is False
+
+
+def test_confirm_step_yes_proceeds():
+    assert _confirm_wiz(lambda p: "y")._confirm_step(state.load_conf(EXAMPLE), "edge", "full-edge") is True
+
+
+def test_confirm_step_default_is_no():
+    assert _confirm_wiz(lambda p: "")._confirm_step(state.load_conf(EXAMPLE), "edge", "full-edge") is False
+
+
+def test_confirm_step_dry_run_never_prompts():
+    seen = []
+    w = _confirm_wiz(lambda p: seen.append(p) or "n", dry_run=True)
+    assert w._confirm_step(state.load_conf(EXAMPLE), "edge", "full-edge") is True
+    assert seen == []
+
+
+def test_run_aborts_before_writing_when_confirm_declined(monkeypatch):
+    # _confirm_step returns before step-6 generate, so nothing is written even on root == /.
+    w = wizard.Wizard(edge_system(), dry_run=False, assume_defaults=True, example_conf=str(EXAMPLE),
+                      out=lambda *a: None)
+    monkeypatch.setattr(w, "_confirm_step", lambda *a: False)
+    res = w.run()
+    assert res.written == []
+    assert any("aborted at the confirmation" in n for n in res.notes)
+
+
+# --- A4: honor an existing machine.conf on re-run -------------------------
+def test_merge_conf_overlay_wins_base_fills_gaps():
+    base = {"ai": {"depth": "regular", "model": "x"}, "machine": {"mode": "edge"}}
+    overlay = {"ai": {"depth": "expert"}, "ports": {"ssh": "2200"}}
+    out = wizard.Wizard._merge_conf(base, overlay)
+    assert out["ai"]["depth"] == "expert"      # overlay wins
+    assert out["ai"]["model"] == "x"           # base fills the gap
+    assert out["ports"]["ssh"] == "2200"       # new section carried over
+    assert out["machine"]["mode"] == "edge"
+
+
+def test_existing_ai_depth_survives_rerun(tmp_path):
+    # A hand-edited [ai] depth (the wizard never prompts for it) must not silently revert to the
+    # skeleton default (regular) on a re-run — A4 overlays the existing conf into the base.
+    p = tmp_path / "etc" / "bastion" / "machine.conf"
+    p.parent.mkdir(parents=True)
+    p.write_text("[machine]\nmode = edge\n[ai]\ndepth = expert\n")
+    s = edge_system()
+    s.root = tmp_path
+    w = wizard.Wizard(s, dry_run=True, profile="full-edge", assume_defaults=True,
+                      example_conf=str(EXAMPLE), out=lambda *a: None)
+    assert w._load_existing_conf()["ai"]["depth"] == "expert"
+    res = w.run()
+    assert res.config["ai"]["depth"] == "expert"
+
+
+# --- A6: staged/dry preview still reports a live host firewall conflict ----
+def test_install_step_reports_host_firewall_in_dry_run():
+    s = edge_system()
+    s._have = set(s._have) | {"ufw"}          # unit_active("ufw") -> True
+    lines: list[str] = []
+    w = wizard.Wizard(s, dry_run=True, assume_defaults=True, example_conf=str(EXAMPLE),
+                      out=lambda *a: lines.append(" ".join(str(x) for x in a)))
+    cfg = wizard.build_machine_conf(detect.detect(s), "full-edge", {}, state.load_conf(EXAMPLE))
+    _plan, notes = w._install_step(cfg, "edge")
+    assert any("ufw" in n for n in notes)
+    assert any("ufw is active" in line for line in lines)

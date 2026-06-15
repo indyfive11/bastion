@@ -68,3 +68,29 @@ def test_ai_errors_when_edge_ctl_absent(monkeypatch, capsys):
     assert cli.cmd_ai(args) == 1
     assert "edge-ctl not installed" in capsys.readouterr().err
     assert fake.calls == []   # never shelled out
+
+
+def test_ai_proposals_maps_to_edge_ctl(monkeypatch):
+    fake = FakeSystem(Path("/staged"))
+    _patch_ctx(monkeypatch, fake)
+    args = cli.build_parser().parse_args(["ai", "proposals", "--root", "/staged"])
+    assert cli.cmd_ai(args) == 0
+    assert any(c[1] == "proposals" for c in fake.calls), fake.calls
+
+
+def test_ai_rollback_passes_id(monkeypatch):
+    fake = FakeSystem(Path("/staged"))
+    _patch_ctx(monkeypatch, fake)
+    args = cli.build_parser().parse_args(["ai", "rollback", "1234-99-ai_block", "--root", "/staged"])
+    assert cli.cmd_ai(args) == 0
+    call = next(c for c in fake.calls if c[1] == "rollback")
+    assert call[2] == "1234-99-ai_block"
+
+
+def test_ai_rollback_without_id_errors(monkeypatch, capsys):
+    fake = FakeSystem(Path("/staged"))
+    _patch_ctx(monkeypatch, fake)
+    args = cli.build_parser().parse_args(["ai", "rollback", "--root", "/staged"])
+    assert cli.cmd_ai(args) == 1
+    assert "audit id" in capsys.readouterr().err
+    assert fake.calls == []   # never shelled out

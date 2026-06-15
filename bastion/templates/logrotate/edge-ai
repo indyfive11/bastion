@@ -1,0 +1,12 @@
+# bastion L3 — rotate the AI human-review proposal queue. edge-ai-analyze appends a record to
+# proposals.jsonl for every base/access change it wants a human to approve (propose_base_change);
+# the queue is never auto-trimmed, so cap it. copytruncate keeps the append path stable for the
+# unprivileged analyzer.
+/var/lib/edge-ai/proposals.jsonl {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
