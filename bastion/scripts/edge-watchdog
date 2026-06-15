@@ -42,6 +42,8 @@ WAN_IF=${WAN_IF:-}                             # WAN/uplink interface (edge mode
 GATEWAY=${GATEWAY:-}                           # LAN default gateway IP
 RELAY_IF=${RELAY_IF:-}                         # upstream relay/tunnel interface (optional)
 LAN_NET=${LAN_NET:-}                           # LAN CIDR
+LAN_IP=${LAN_IP:-}                             # this node's LAN IP (DNS-leak local-chain classifier)
+DNS_UPSTREAM=${DNS_UPSTREAM:-}                 # local stub resolver host#port (DNS-leak-watch gate)
 RELAY_DST=${RELAY_DST:-}                       # relay far-end probe target (optional)
 EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints (ISP-up signal)
 EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
@@ -127,6 +129,57 @@ lan_relay_broken(){
   [ "${replied:-0}" -eq 0 ] && return 0
   return 1
 }
+# resolv_leak / resolved_upstreams_leak: mirror flowcheck's host-resolver leak guard so a leak that
+# appears AFTER setup (e.g. a later DHCP renew re-points /etc/resolv.conf at the ISP's resolver, or
+# systemd-resolved starts forwarding to it) is noticed in steady state — flowcheck only fires at
+# check-time. "Local" = loopback (incl. resolved's 127.0.0.53) or this node's LAN_IP; anything else
+# is a leak past the hardened dnsmasq->unbound->VPS chain. Echoes the leaking server(s), rc 0 = leak.
+# Both honor the same RESOLV_CONF / RESOLVECTL test overrides as flowcheck.
+resolved_upstreams_leak(){
+  local rc="${RESOLVECTL:-resolvectl}" srv leak=""
+  command -v "$rc" >/dev/null 2>&1 || return 1
+  for srv in $("$rc" dns 2>/dev/null | sed 's/^[^:]*://' | tr ' ' '\n' | sed 's/#.*$//' | grep -E '^[0-9a-fA-F:.]+$'); do
+    case "$srv" in
+      127.*|::1|::|"$LAN_IP"|"") ;;
+      *) leak="$leak $srv" ;;
+    esac
+  done
+  [ -n "$leak" ] && { echo "$leak"; return 0; }
+  return 1
+}
+resolv_leak(){
+  local f="${RESOLV_CONF:-/etc/resolv.conf}" ns leak="" stub_resolved=""
+  [ -r "$f" ] || return 1
+  for ns in $(awk '/^[[:space:]]*nameserver/{print $2}' "$f"); do
+    case "$ns" in
+      127.0.0.53)          stub_resolved=1 ;;
+      127.*|::1|"$LAN_IP") ;;
+      *) leak="$leak $ns" ;;
+    esac
+  done
+  [ -z "$leak" ] && [ -n "$stub_resolved" ] && { leak=$(resolved_upstreams_leak) || leak=""; }
+  [ -n "$leak" ] && { echo "$leak"; return 0; }
+  return 1
+}
+# dns_leak_watch: active surfacing of the host-resolver leak in steady state. Edge-only, and only
+# when a loopback stub chain is expected (DNS_UPSTREAM is loopback) — an endpoint or an external
+# upstream legitimately points elsewhere. Alert-once + latch (clear on recovery), exactly like the
+# WAN-carrier guard, so it gets the GENERIC no-arch-leak ntfy push for free. ALERT ONLY: bastion
+# never rewrites resolv.conf — that's the OS/operator's network config (narrowest scope).
+dns_leak_watch(){
+  [ "$MODE" = endpoint ] && return 0
+  case "${DNS_UPSTREAM%%#*}" in 127.*|::1) ;; *) return 0 ;; esac
+  local leak
+  if leak=$(resolv_leak); then
+    [ -f "$RUN/dns-leak-alerted" ] || {
+      alert "host resolver leak — /etc/resolv.conf bypasses the local DNS chain (points at$leak) — check DHCP/resolv.conf"
+      : > "$RUN/dns-leak-alerted"
+    }
+  elif [ -f "$RUN/dns-leak-alerted" ]; then
+    rm -f "$RUN/dns-leak-alerted"
+    alert "host resolver leak cleared — resolv.conf back on the local DNS chain"
+  fi
+}
 
 # ---------- heals (graduated) ----------
 heal_light(){   # cheapest: atomic reload of the governing firewall's config (re-adds relay rules)
@@ -166,6 +219,7 @@ evaluate(){
       lan_relay_broken && alert "LAN relay STILL degraded after light heal — escalating to full rollback" && heal_full
       return
     fi
+    dns_leak_watch
     maybe_refresh
     return
   fi

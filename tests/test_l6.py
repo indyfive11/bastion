@@ -49,3 +49,28 @@ def test_l6_does_not_install_operator_alert_conf(tmp_path):
     layers.get("l6").install(_ctx(tmp_path, state.load_conf(EXAMPLE)))
     assert not (tmp_path / "etc/bastion/notify-alert.conf").exists()
     assert layers.get("l6").template_dests == ()
+
+
+def test_flowcheck_resolv_leak_probes_resolved_upstreams():
+    # Deep host-resolver leak guard: when resolv.conf is the systemd-resolved stub (127.0.0.53),
+    # resolv_leak must probe resolved's *upstreams* (resolvectl) so a "resolved -> ISP" forward is
+    # caught — not just a direct public nameserver in resolv.conf.
+    body = (SCRIPTS / "flowcheck").read_text()
+    assert "resolved_upstreams_leak()" in body
+    assert "resolvectl" in body
+    assert "127.0.0.53)" in body                  # the stub is special-cased, then probed deeper
+    assert 'leak=$(resolved_upstreams_leak)' in body
+    # the stale "deferred polish-phase item" caveat must be gone now that it's implemented
+    assert "deferred polish-phase item" not in body
+
+
+def test_edge_watchdog_actively_surfaces_dns_leak():
+    # The resolv_leak guard must run in edge-watchdog's steady-state loop (not only at flowcheck
+    # time), alert-once + latch like the WAN-carrier guard, and NEVER rewrite resolv.conf.
+    body = (SCRIPTS / "edge-watchdog").read_text()
+    assert "dns_leak_watch()" in body
+    assert "resolv_leak()" in body                # the probe is carried here too (mirrors flowcheck)
+    assert "dns-leak-alerted" in body             # alert-once latch file
+    assert "dns_leak_watch\n" in body             # wired into evaluate()'s healthy path
+    # edge-only + loopback-stub gate (an endpoint / external upstream legitimately points elsewhere)
+    assert '[ "$MODE" = endpoint ] && return 0' in body

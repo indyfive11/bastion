@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.7] - 2026-06-15
+
+A polish pass completing the deferred edge-resilience add-ons from the ES field
+findings. Two needed work (both below); the third — the nft TCP-MSS clamp on
+forwarded traffic — turned out to already be in the edge ruleset.
+
+### Added
+
+- **The host-resolver leak guard now runs continuously, not just at check-time.**
+  `flowcheck`'s `resolv_leak` only fired when an operator ran a check, so a leak
+  introduced *later* (a DHCP renew re-pointing `/etc/resolv.conf` at the ISP's public
+  resolver, bypassing the hardened dnsmasq→unbound→VPS chain) stayed silent until the
+  next manual check. `edge-watchdog`'s steady-state loop now carries `dns_leak_watch`:
+  it alerts once and latches (clearing on recovery), exactly like the WAN-carrier guard,
+  so the leak is surfaced in steady state and gets the generic no-arch-leak alert push.
+  Alert-only — bastion never rewrites `resolv.conf` (the OS/operator's network config).
+  Edge mode only, and only when a loopback stub chain is expected.
+
+### Fixed
+
+- **The resolver-leak guard could be fooled by systemd-resolved.** When
+  `/etc/resolv.conf` points at the resolved stub (`127.0.0.53`), the check trusted it as
+  "local" and stopped — but `resolved` itself may forward to the ISP's resolver, so the
+  lookups still leaked. `flowcheck` (and the mirrored `edge-watchdog` probe) now parse
+  `resolvectl` for resolved's effective upstreams and flag any non-local one, stripping
+  the DNS-over-TLS `#servername` annotation so an address like `9.9.9.9#dns.quad9.net`
+  still matches. Best-effort: with no systemd-resolved present, the deep check is a no-op.
+
 ## [1.0.6] - 2026-06-15
 
 ### Documentation

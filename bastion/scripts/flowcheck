@@ -26,23 +26,48 @@ dns_q(){ # dns_q <server> <port> <name>
   esac
 }
 
+# resolved_upstreams_leak — deep check behind the systemd-resolved stub. When resolv.conf points at
+# 127.0.0.53 the base nameserver scan calls it "local" and stops, but `resolved` itself may forward
+# to the ISP's public resolver (so lookups still leak past the hardened dnsmasq->unbound->VPS chain).
+# When `resolvectl` is present, parse its effective upstream servers and flag any non-local one.
+# Best-effort: resolvectl absent (no systemd-resolved) => clean. Echoes leaking upstream(s); rc 0 =
+# leak, rc 1 = clean/not-applicable. RESOLVECTL overridable for tests.
+resolved_upstreams_leak(){
+  local rc="${RESOLVECTL:-resolvectl}" srv leak=""
+  command -v "$rc" >/dev/null 2>&1 || return 1
+  # `resolvectl dns` prints "<scope>: <server...>"; take the servers after each line's first colon.
+  # A DoT upstream is annotated "9.9.9.9#dns.example" — strip the "#servername" so the IP still
+  # matches (link-local "fe80::..%iface" keeps its % and is dropped as a non-ISP scope).
+  for srv in $("$rc" dns 2>/dev/null | sed 's/^[^:]*://' | tr ' ' '\n' | sed 's/#.*$//' | grep -E '^[0-9a-fA-F:.]+$'); do
+    case "$srv" in
+      127.*|::1|::|"$LAN_IP"|"") ;;    # loopback / unset / this node — fine
+      *) leak="$leak $srv" ;;          # a real upstream resolved is forwarding to
+    esac
+  done
+  [ -n "$leak" ] && { echo "$leak"; return 0; }
+  return 1
+}
+
 # resolv_leak — does the host's OWN /etc/resolv.conf bypass the hardened local DNS chain? Catches the
 # class of leak where WAN DHCP overwrites resolv.conf with the ISP's public resolver, so this node's
 # lookups skip dnsmasq->unbound->VPS entirely. "Local" = loopback (127.0.0.0/8, ::1 — covers the :5335
 # stub AND systemd-resolved's 127.0.0.53) or this node's own LAN_IP (its dnsmasq). Any other (public)
 # nameserver is a leak. Only meaningful when a local chain is expected (loopback stub — the caller
-# gates on that). CAVEAT: if resolv.conf IS the systemd-resolved stub (127.0.0.53) this passes even if
-# resolved itself forwards to the ISP — a deeper `resolvectl` probe is a deferred polish-phase item.
+# gates on that). If resolv.conf IS the systemd-resolved stub (127.0.0.53), resolved_upstreams_leak()
+# probes one level deeper so a "resolved -> ISP" forward is caught too.
 # Echoes the leaking server(s); rc 0 = leak found, rc 1 = clean. RESOLV_CONF overridable for tests.
 resolv_leak(){
-  local f="${RESOLV_CONF:-/etc/resolv.conf}" ns leak=""
+  local f="${RESOLV_CONF:-/etc/resolv.conf}" ns leak="" stub_resolved=""
   [ -r "$f" ] || return 1
   for ns in $(awk '/^[[:space:]]*nameserver/{print $2}' "$f"); do
     case "$ns" in
-      127.*|::1|"$LAN_IP") ;;          # local chain — fine
+      127.0.0.53)          stub_resolved=1 ;;   # systemd-resolved stub — local, but probe its upstreams
+      127.*|::1|"$LAN_IP") ;;                    # local chain — fine
       *) leak="$leak $ns" ;;
     esac
   done
+  # No direct leak, but resolv.conf is the resolved stub: check where resolved actually forwards.
+  [ -z "$leak" ] && [ -n "$stub_resolved" ] && { leak=$(resolved_upstreams_leak) || leak=""; }
   [ -n "$leak" ] && { echo "$leak"; return 0; }
   return 1
 }
