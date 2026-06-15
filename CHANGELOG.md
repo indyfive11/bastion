@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-06-14
+
+### Fixed
+
+- **Endpoint mode hardening.** `bastion setup` now blanks edge-only configuration
+  (relay, WireGuard, gateway, DHCP, DNS upstream) when building an endpoint machine
+  config, so endpoint nodes no longer inherit stale edge values from the example skeleton.
+- `flowcheck` / `bastion check` is now mode-aware: an endpoint no longer reports false
+  failures for edge-only flows (relay handshake, WireGuard server interface, local DNS
+  listener, ISP-DNS-leak guard).
+- `edge-watchdog` never rolls back on an endpoint: a sustained egress loss on a
+  non-routing node is alert-only — it has no edge config to repair, and rolling back
+  edge network state could disrupt an ordinary workstation.
+
 ## [1.0.0] - 2026-06-14
 
 First public release.

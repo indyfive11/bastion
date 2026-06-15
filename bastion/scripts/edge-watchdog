@@ -45,6 +45,7 @@ LAN_NET=${LAN_NET:-}                           # LAN CIDR
 RELAY_DST=${RELAY_DST:-}                       # relay far-end probe target (optional)
 EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints (ISP-up signal)
 EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
+MODE=${MODE:-edge}                            # edge | endpoint — endpoint never rolls back (no edge config to repair)
 
 log(){ logger -t edge-watchdog "$*"; }
 # alert(): FULL detail to local journal; external push (only if configured) is GENERIC.
@@ -173,6 +174,15 @@ evaluate(){
   fails=$((fails+1))
   log "egress check failed (${fails}/${EGRESS_FAIL_TRIPS})"
   [ "$fails" -lt "$EGRESS_FAIL_TRIPS" ] && return
+
+  # Endpoint mode: this node doesn't route, has no relay, and its firewall is `inet bastion` (NOT
+  # the `inet edge` table config_ok repairs); net-rollback is an edge-recovery tool. A sustained
+  # egress loss here is almost always the host's own uplink (wifi/cable) — alert only, NEVER roll
+  # back an endpoint (rolling back edge network state could disrupt an ordinary workstation).
+  if [ "$MODE" = endpoint ]; then
+    alert "sustained egress loss on endpoint node — ALERT ONLY (no rollback; check this host's uplink)"
+    fails=0; return
+  fi
 
   # sustained egress failure — physical uplink FIRST: a rollback can't restore a route over a
   # dead carrier, and treating the OS-removed default route as "our config broken" here is the

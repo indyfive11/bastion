@@ -149,6 +149,20 @@ def test_build_machine_conf_endpoint_blanks_wan():
     assert conf["machine"]["mode"] == "endpoint"
     assert conf["machine"]["layers"] == "l0,l1,l2,l3,l6"
     assert conf["interfaces"]["wan"] == ""
+    # edge-only fields blanked: no stale edge values for flowcheck/edge-watchdog to misread
+    assert conf["interfaces"]["wg_vps_iface"] == ""
+    assert conf["interfaces"]["wg_server_iface"] == ""
+    assert conf["network"]["gateway"] == ""
+    assert conf["network"]["lan_ip"] == ""
+    assert conf["network"]["dns_upstream"] == ""
+    assert conf["network"]["dhcp_range_start"] == ""
+    assert conf["monitoring"]["relay_dst"] == ""
+    # kept: the endpoint ruleset uses these
+    assert conf["network"]["lan_cidr"] != ""
+    assert conf["ports"]["ssh"] != ""
+    # and the endpoint ruleset still resolves with the blanks in place
+    endpoint_nft = REPO / "bastion" / "templates" / "nftables-endpoint.nft"
+    assert templates.check_file(endpoint_nft, conf) == []
 
 
 def test_build_machine_conf_resolves_all_templates():

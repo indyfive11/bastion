@@ -148,4 +148,9 @@ def render_machine_env(config: dict[str, dict[str, str]]) -> str:
     nft_table = "inet bastion" if mode == "endpoint" else "inet edge"
     lines.append(f"NFT_TABLE={_shell_quote(nft_table)}")
 
+    # Mode signal — flowcheck (and other scripts) gate edge-only flows (relay tunnel, WG server,
+    # local DNS chain) on this, so an endpoint never false-fails checks for subsystems it lacks
+    # even if its conf still carries leftover edge values.
+    lines.append(f"MODE={_shell_quote(mode)}")
+
     return "\n".join(lines) + "\n"

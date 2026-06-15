@@ -8,6 +8,7 @@ WG_SERVER_IF=${WG_SERVER_IF:-}         # WireGuard server interface (optional)
 LAN_IP=${LAN_IP:-}                     # this node's LAN IP (for the local DNS listen check)
 DNS_UPSTREAM=${DNS_UPSTREAM:-}         # local stub resolver, host#port (e.g. 127.0.0.1#5335)
 EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
+MODE=${MODE:-edge}                     # edge | endpoint — endpoint skips edge-only flows (relay/WG/local-DNS)
 
 pass=0; fail=0
 ck(){ if eval "$2" >/dev/null 2>&1; then echo "  PASS  $1"; pass=$((pass+1)); else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
@@ -58,6 +59,12 @@ ck "DNS resolves (getent)" 'getent hosts github.com'
 # reference edge profile). Probe the CONFIGURED host#port — querying 127.0.0.1:53 finds nothing
 # (dnsmasq listens on LAN_IP:53, unbound on :5335). Only when the upstream is a loopback stub;
 # an external dns_upstream has no local stub to test.
+# Edge-only flows: the hardened local DNS chain (dnsmasq->unbound stub + the resolv.conf leak
+# guard), the upstream relay tunnel, the WireGuard server iface, and the local DNS listener. An
+# endpoint node has NONE of these (no L4/L5/relay) and may carry leftover edge values in its env,
+# so skip them all in endpoint mode — otherwise they false-fail on a perfectly healthy endpoint
+# (e.g. a laptop whose resolv.conf legitimately points at its router/ISP resolver).
+if [ "$MODE" != endpoint ]; then
 stub_host=${DNS_UPSTREAM%%#*}
 stub_port=${DNS_UPSTREAM##*#}; [ "$stub_port" = "$DNS_UPSTREAM" ] && stub_port=53
 case "$stub_host" in
@@ -76,6 +83,7 @@ esac
 [ -n "$RELAY_IF" ] && ck "relay handshake fresh (<180s)" 'a=$(sudo -n wg show '"$RELAY_IF"' latest-handshakes 2>/dev/null | awk "{print \$2}"); n=$(date +%s 2>/dev/null || echo 0); [ -n "$a" ] && [ "$a" -gt 0 ] && [ $((n-a)) -lt 180 ]'
 [ -n "$WG_SERVER_IF" ] && ck "WireGuard server iface present" 'sudo -n wg show '"$WG_SERVER_IF"
 [ -n "$LAN_IP" ] && ck "local DNS listening ${LAN_IP}:53" 'ss -uln | grep -q "'"$LAN_IP"':53"'
+fi
 
 echo "== summary: $pass pass / $fail fail =="
 [ "$fail" -eq 0 ]

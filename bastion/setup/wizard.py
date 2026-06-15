@@ -141,6 +141,23 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
 
     if "secrets_file" in answers:
         put("machine", "secrets_file", answers["secrets_file"])
+
+    if mode == "endpoint":
+        # An endpoint doesn't route, tunnel, or serve DNS/DHCP, so blank the edge-only fields the
+        # (edge-shaped) skeleton carries — otherwise the generated machine.env hands stale edge
+        # values to flowcheck/edge-watchdog, which then false-fail or run edge recovery on a node
+        # that has no edge config. Kept: lan / lan_cidr / trusted_hosts / ssh (the endpoint ruleset
+        # uses these); wan is already blanked above.
+        for sec, key in (
+            ("interfaces", "zt_iface"), ("interfaces", "wg_vps_iface"),
+            ("interfaces", "wg_server_iface"),
+            ("network", "lan_ip"), ("network", "gateway"), ("network", "zt_cidr"),
+            ("network", "wg_server_cidr"), ("network", "dns_upstream"),
+            ("network", "dhcp_range_start"), ("network", "dhcp_range_end"),
+            ("network", "dhcp_lease"),
+            ("monitoring", "relay_dst"), ("monitoring", "dnsblock_sources"),
+        ):
+            conf.setdefault(sec, {})[key] = ""
     return conf
 
 
