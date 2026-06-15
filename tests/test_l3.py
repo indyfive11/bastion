@@ -90,3 +90,13 @@ def test_killswitch_panic_fails_loud_on_flush_error():
     # both kill-switch paths return 1 on failure
     assert body.count("return 1 if (failed or not spool_ok) else 0") >= 1
     assert "PANIC INCOMPLETE" in body
+
+
+def test_rollback_spool_prune_does_not_use_rstrip():
+    # `str.rstrip("/32")` strips a CHARACTER CLASS ({/,3,2}), not the literal "/32": e.g.
+    # "1.2.3.23/32".rstrip("/32") -> "1.2.3.". That would make the spool-prune miss the intent
+    # and let the reconciler RE-ADD a rolled-back block. The fix must use suffix slicing instead.
+    assert "1.2.3.23/32".rstrip("/32") == "1.2.3."        # the documented footgun, pinned
+    body = (SCRIPTS / "edge-ctl").read_text()
+    assert '.rstrip("/32")' not in body
+    assert 'e[:-3] if e.endswith("/32") else e' in body

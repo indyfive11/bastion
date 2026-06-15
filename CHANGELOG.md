@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] - 2026-06-15
+
+### Fixed
+
+- **A rolled-back AI block could be silently re-applied.** `edge-ctl rollback`
+  pruned the intent spool with `str.rstrip("/32")`, which strips any trailing run of
+  the characters `/`, `3`, `2` rather than the literal `/32` suffix — so an address like
+  `1.2.3.23/32` was mangled to `1.2.3.` and never matched the spooled intent. The intent
+  survived, and the reconciler re-added the block on its next pass, undoing the operator's
+  rollback. The prune now matches the address by exact and suffix-sliced forms.
+
 ## [1.0.4] - 2026-06-15
 
 A second dogfooding/audit pass over the safety mechanisms and the layer

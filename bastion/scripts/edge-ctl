@@ -187,13 +187,18 @@ def cmd_rollback(rid):
     for c in elems:
         p = nft("delete", "element", FAM, TBL, s, "{ " + c + " }")
         removed.append((c, "ok" if p.returncode == 0 else p.stderr.strip()[:60]))
-    # remove from spool so the reconciler won't re-add
+    # remove from spool so the reconciler won't re-add. Match the intent cidr against the audit
+    # element in its bare and /32 forms. NOTE: use suffix slicing, NOT str.rstrip — rstrip with a
+    # "/32" argument strips any trailing run of the chars '/', '3', '2', so "1.2.3.23/32" becomes
+    # "1.2.3." and the prune would miss the intent, letting the reconciler RE-ADD the rolled-back block.
     try:
+        bare = {e[:-3] if e.endswith("/32") else e for e in elems}   # "x/32" -> "x", others as-is
         doc = json.load(open(INTENTS))
         before = len(doc.get("intents", []))
         doc["intents"] = [i for i in doc.get("intents", [])
-                          if f"{i.get('cidr')}" not in elems and f"{i.get('cidr')}/32" not in elems
-                          and i.get("cidr") not in [e.rstrip("/32") for e in elems]]
+                          if str(i.get("cidr")) not in elems
+                          and f"{i.get('cidr')}/32" not in elems
+                          and str(i.get("cidr")) not in bare]
         tmp = INTENTS + ".tmp"
         json.dump(doc, open(tmp, "w")); os.replace(tmp, INTENTS)
         pruned = before - len(doc["intents"])
