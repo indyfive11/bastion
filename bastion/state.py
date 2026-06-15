@@ -58,14 +58,25 @@ def find_conf(explicit: str | Path | None = None) -> Path:
 
 
 def write_conf(config: dict[str, dict[str, str]], path: str | Path) -> None:
-    """Write a nested dict back to an INI file at ``path``."""
+    """Write a nested dict back to an INI file at ``path``, atomically.
+
+    Render to a temp file in the same directory then ``os.replace()`` — a crash or
+    interruption mid-write can never leave a truncated/corrupt machine.conf on disk
+    (the live file is either the old contents or the complete new contents).
+    """
     cp = _parser()
     for section, items in config.items():
         cp[section] = {k: str(v) for k, v in items.items()}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as fh:
-        cp.write(fh)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        with tmp.open("w") as fh:
+            cp.write(fh)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def load_secrets(path: str | Path) -> dict[str, str]:
@@ -79,16 +90,26 @@ def load_secrets(path: str | Path) -> dict[str, str]:
 
 
 def write_secrets(secrets: dict[str, str], path: str | Path) -> None:
-    """Write secrets.conf chmod 600. Never rendered into any template output."""
+    """Write secrets.conf chmod 600, atomically. Never rendered into any template output.
+
+    The temp file is created 0600 from the start, so the secret never touches disk
+    world-readable; ``os.replace()`` then swaps it into place (the destination inherits
+    the temp file's 0600 mode), so a crash mid-write can't leave a partial or
+    wrongly-permissioned secrets file.
+    """
     cp = _parser()
     cp["secrets"] = {k: str(v) for k, v in secrets.items()}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Create with restrictive mode from the start, then write.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        cp.write(fh)
-    os.chmod(path, 0o600)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            cp.write(fh)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 # --- machine.env rendering -------------------------------------------------

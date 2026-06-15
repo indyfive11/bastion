@@ -97,6 +97,11 @@ Notes:
 - **`pacman` or `apt`** (used to install layer packages during setup)
 - **root** for any live install (loading nft rules, installing systemd units, installing packages)
 
+> **Distro support.** Arch (and Arch-based) is the **primary, regularly-tested** target.
+> Debian/Ubuntu (`apt`) is supported but less exercised — report issues. **Fedora/RHEL-family
+> (`dnf`) is detected but not yet driven**: setup will tell you so and list the packages to
+> install by hand. systemd is assumed throughout.
+
 ## Install
 
 **Arch (AUR):**
@@ -199,7 +204,18 @@ about before you start:
 5. **Lock the SSH port down carefully.** Expert depth and tight rulesets can change the SSH port.
    The always-installed **`bastion-recovery`** service (disabled by default) is your console-only
    lifeline if you lock yourself out — it auto-detects live sshd ports and opens a time-boxed
-   rescue path. Know it's there before you tighten access.
+   rescue path. Start it **from a local console / IPMI**, read back the port + one-time password it
+   prints, SSH in, fix the config, then stop it:
+
+   ```sh
+   sudo systemctl start bastion-recovery     # opens a time-boxed rescue sshd (auto-detected ports)
+   sudo journalctl -u bastion-recovery -n 20 # reads back: bound port(s), reachable IP(s), OTP
+   sudo bastion-recovery extend              # (over the rescue session) extend the window if needed
+   sudo systemctl stop bastion-recovery      # tears it all down; the main firewall is untouched
+   ```
+
+   It self-destructs after `[recovery] window_seconds` (default 1800). Test it once before you need
+   it — start it, confirm you can reach the announced port, then stop it.
 
 ## Operating it
 
@@ -209,6 +225,30 @@ bastion check --full           # read-only flow + LAN-client verification
 bastion firewall reload        # reconcile the nft ruleset
 bastion ai enable | panic      # arm the AI layer / kill switch (instant disarm)
 ```
+
+### Tuning the AI layer (L3)
+
+The AI layer is opt-in and provider-agnostic. Two knobs in `machine.conf [ai]` shape how it runs:
+
+- **`timer_interval`** — how often the collect → analyze → reconcile cycle runs, as a systemd time
+  span (`4h`, `30min`, `90s`, `2h30m`, `1d`; **case-sensitive**: `m` = minutes, `M` = months). To
+  change the cadence after install, edit `timer_interval`, then:
+
+  ```sh
+  bastion generate          # re-render edge-ai.timer
+  bastion ai enable         # daemon-reload + restart so the new interval takes effect
+  ```
+
+- **`depth`** — `regular` (default) / `advanced` / `expert`: how much config the AI is *shown*.
+  It controls breadth of context, **not** authority — base/access changes (e.g. the SSH port) are
+  always routed to a human-review queue and never auto-applied at any depth.
+
+### DNS-leak guard (edge mode)
+
+When the hardened local resolver chain is expected (a loopback `dns_upstream`), the L6 watchdog
+and `bastion check` actively flag a `/etc/resolv.conf` (or systemd-resolved upstream) that points
+at a public/ISP resolver — e.g. after a DHCP renew silently re-points it. It **alerts only**;
+bastion never rewrites your resolver config.
 
 ## CLI
 

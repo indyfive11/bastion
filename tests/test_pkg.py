@@ -50,6 +50,16 @@ def test_detect_manager_explicit_name_wins():
     assert pkg.detect_manager(FakeSystem(set(), have=("pacman",)), "apt").name == "apt"
 
 
+def test_unsupported_present_names_dnf():
+    # Fedora-style box: dnf is the only manager → no supported manager, but it's recognized
+    # as detected-but-unimplemented (clean message), not "no package manager at all".
+    fedora = FakeSystem(set(), have=("dnf",))
+    assert pkg.detect_manager(fedora) is None
+    assert pkg.unsupported_present(fedora) == "Fedora/RHEL-family (dnf)"
+    # A supported box returns None (nothing unsupported to flag).
+    assert pkg.unsupported_present(FakeSystem(set(), have=("pacman",))) is None
+
+
 def test_get_manager_unknown_raises():
     try:
         pkg.get_manager("nix")

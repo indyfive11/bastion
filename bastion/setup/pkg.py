@@ -127,6 +127,26 @@ class Apt(PackageManager):
 
 _MANAGERS: dict[str, type[PackageManager]] = {"pacman": Pacman, "apt": Apt}
 
+# Package managers bastion can DETECT but does not yet drive. When one of these is the only
+# manager present (e.g. Fedora/RHEL-family ships dnf), the installer surfaces a clear
+# "not yet supported" message instead of a generic "no package manager found" — so the
+# operator knows their distro is recognized, just unimplemented. Adding a manager = move it
+# into _MANAGERS with a PackageManager subclass.
+UNSUPPORTED_BINARIES: tuple[tuple[str, str], ...] = (
+    ("dnf", "Fedora/RHEL-family (dnf)"),
+)
+
+
+def unsupported_present(sys: System) -> str | None:
+    """Label of a known-but-unimplemented package manager present on this system, else None.
+
+    Lets the installer distinguish "your distro's manager isn't supported yet" (actionable)
+    from "no recognizable package manager at all"."""
+    for binary, label in UNSUPPORTED_BINARIES:
+        if sys.command_exists(binary):
+            return label
+    return None
+
 
 def get_manager(name: str) -> PackageManager:
     """Return a PackageManager by name. Falls back to pacman-binary / apt-binary detection

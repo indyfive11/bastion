@@ -11,7 +11,7 @@
 # though intents.json persists (the reconciler applies timeout = expires - now). On ANY
 # error we leave the previous intents.json UNTOUCHED so its entries keep expiring normally.
 #
-import json, os, subprocess, sys, time
+import json, os, shlex, subprocess, sys, time
 
 BACKENDCONF = "/etc/edge-ai/backend.conf"
 SCHEMA      = "/etc/edge-ai/intent.schema.json"
@@ -51,7 +51,9 @@ def main():
         die(f"cannot read/parse {SIGNALS}: {e}")
 
     # ---- invoke the pluggable backend (the provider-agnostic process contract) ----
-    cmd = cfg["BACKEND_CMD"].split()
+    # shlex.split so a BACKEND_CMD with quoted/spaced arguments parses correctly
+    # (e.g. `/usr/bin/python3 /opt/my backend.py --flag`), not naive whitespace split.
+    cmd = shlex.split(cfg["BACKEND_CMD"])
     env = dict(os.environ)
     env["EDGE_AI_MODEL"] = str(cfg["MODEL"])
     try:

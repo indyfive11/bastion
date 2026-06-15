@@ -424,16 +424,25 @@ class Wizard:
 
     def _layer_questions(self, d: detectmod.Detection, mode: str, profile: str) -> dict:
         a: dict = {}
-        a["ssh_port"] = self._ask("SSH port", str(d.ssh_port))
-        a["trusted_hosts"] = self._ask("Trusted management IPs (comma-separated, blank=none)", "")
+        a["ssh_port"] = self._ask("SSH port (the port sshd already listens on)", str(d.ssh_port))
+        a["trusted_hosts"] = self._ask(
+            "IPs allowed FULL inbound access (e.g. a desktop you admin this box from) — "
+            "comma-separated, blank = none (typical)", "")
         if mode == "edge":
-            a["lan_iface"] = self._ask("LAN interface", d.lan_iface or "")
-            a["wan_iface"] = self._ask("WAN interface", d.wan_iface or "")
-            a["lan_cidr"] = self._ask("LAN subnet (CIDR)", d.lan_cidr or "")
-            a["lan_ip"] = self._ask("This node's LAN IP", d.lan_ip or "")
-            a["gateway"] = self._ask("Upstream gateway", d.gateway or "")
+            a["lan_iface"] = self._ask("LAN interface (NIC facing your local network, e.g. eth0)",
+                                       d.lan_iface or "")
+            a["wan_iface"] = self._ask("WAN interface (NIC facing the internet/modem, e.g. eth1)",
+                                       d.wan_iface or "")
+            a["lan_cidr"] = self._ask("LAN subnet in CIDR (e.g. 192.168.1.0/24)", d.lan_cidr or "")
+            a["lan_ip"] = self._ask("This box's LAN IP (e.g. 192.168.1.1)", d.lan_ip or "")
+            a["gateway"] = self._ask("Upstream gateway IP — your modem/router (e.g. 192.168.1.1)",
+                                     d.gateway or "")
         else:
-            a["lan_iface"] = self._ask("LAN interface", d.lan_iface or "")
+            a["lan_iface"] = self._ask(
+                "Network interface this box uses (e.g. eth0 / wlan0)", d.lan_iface or "")
+            if not self.assume_defaults:
+                self.out("  endpoint mode — DNS/DHCP, WireGuard-server, relay and gateway "
+                         "settings don't apply here and are skipped.")
         return a
 
     def _secrets_step(self, profile: str, answers: dict) -> list[str]:
@@ -471,8 +480,9 @@ class Wizard:
             key_env = None
             if backend_cmd and not self.assume_defaults and \
                     self._confirm("Does this backend need an API key/secret?", default=False):
-                key_env = (self._ask("Env var the backend reads the secret from", "API_KEY")
-                           or "API_KEY").strip()
+                key_env = (self._ask(
+                    "Env var the backend reads the secret from (e.g. ANTHROPIC_API_KEY)", "API_KEY")
+                    or "API_KEY").strip()
         else:
             backend_cmd, model, key_env = provider.backend_cmd, provider.default_model, provider.key_env
 
@@ -753,15 +763,18 @@ class Wizard:
                 addr_default, port_default, allowed_default = "", "", "0.0.0.0/0"
 
             address = self._ask(f"{iface} Address (this node's tunnel IP/CIDR)", addr_default)
-            listen_port = self._ask(f"{iface} ListenPort (blank = none)", port_default)
+            listen_port = self._ask(
+                f"{iface} ListenPort — UDP port this end listens on (blank = none, for a dial-out client)",
+                port_default)
             mtu = self._ask(f"{iface} MTU (blank = auto; lower e.g. 1340 for CGNAT/PPPoE/nested tunnels)", "")
-            peer_pub = self._ask(f"{iface} peer public key", "")
+            peer_pub = self._ask(f"{iface} peer public key (the OTHER end's WireGuard public key)", "")
             if not peer_pub:
                 self.out(f"  no peer key entered — skipping {iface} (complete its conf manually).")
                 notes.append(f"{iface} left unconfigured (no peer public key).")
                 continue
             peer_endpoint = self._ask(f"{iface} peer Endpoint host:port (blank = peer dials in)", "")
-            allowed_ips = self._ask(f"{iface} AllowedIPs", allowed_default)
+            allowed_ips = self._ask(
+                f"{iface} AllowedIPs — subnets routed through this tunnel", allowed_default)
             if not address or not allowed_ips:
                 self.out(f"  {iface}: Address and AllowedIPs are required — skipping.")
                 notes.append(f"{iface} left unconfigured (missing Address/AllowedIPs).")
@@ -784,7 +797,8 @@ class Wizard:
             self.out("  ZeroTier: non-interactive — join with `zerotier-cli join <network-id>` "
                      "after setup.")
             return []
-        net = self._ask("ZeroTier network ID to join (blank = skip)", "").strip()
+        net = self._ask(
+            "ZeroTier network ID to join — 16-char ID from my.zerotier.com (blank = skip)", "").strip()
         if not net:
             self.out("  no ZeroTier network ID — skipping join.")
             return []
@@ -797,6 +811,17 @@ class Wizard:
                  "manually.")
         return ["ZeroTier join failed; run `zerotier-cli join <network-id>` manually."]
 
+    def _no_manager_msg(self, pkgs: list[str]) -> str:
+        """Message when no supported package manager resolved. Names a detected-but-unsupported
+        manager (e.g. Fedora's dnf) explicitly so the operator knows it's unimplemented, not absent.
+        Supported managers today: pacman (Arch) and apt (Debian/Ubuntu)."""
+        unsupported = pkgmod.unsupported_present(self.sys)
+        if unsupported:
+            return (f"{unsupported} is detected but not yet supported by bastion "
+                    "(supported: Arch/pacman, Debian-Ubuntu/apt) — install these manually, "
+                    f"then re-run: {', '.join(pkgs)}")
+        return f"no supported package manager — ensure installed: {', '.join(pkgs)}"
+
     def _batch_install_packages(self, config: dict) -> list[str]:
         mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))
         pkgs = self._active_packages(config)
@@ -804,7 +829,7 @@ class Wizard:
             self.out("  no packages required by the selected layers.")
             return pkgs
         if mgr is None:
-            self.out(f"  no supported package manager — ensure installed: {', '.join(pkgs)}")
+            self.out("  " + self._no_manager_msg(pkgs))
             return pkgs
         res = mgr.install(self.sys, pkgs)
         if not res.command and not res.unavailable:
@@ -848,7 +873,7 @@ class Wizard:
         mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))
         pkgs = self._active_packages(config)
         if mgr is None:
-            self.out(f"  no supported package manager detected; packages needed: {', '.join(pkgs)}")
+            self.out("  " + self._no_manager_msg(pkgs))
             return pkgs
         self.out(f"  package manager: {mgr.name}")
         self.out(f"  needed by selected layers: {', '.join(pkgs) or 'none'}")

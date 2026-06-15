@@ -296,8 +296,11 @@ def main():
                "rejected_count": len(rejected),
                "rejected": rejected[:50], "applied": ok, "detail": detail}
         if cfg["source"] == "ai":
-            # rollback handle for edge-ctl: id -> (set, exact elements applied)
-            rec["id"] = f"{int(time.time())}-{setname}"
+            # rollback handle for edge-ctl: id -> (set, exact elements applied).
+            # Nanosecond clock + pid (not whole seconds) so two reconcile passes landing
+            # in the same wall-clock second can't mint the same id and make `edge-ctl
+            # rollback <id>` ambiguous. edge-ctl treats the id as an opaque string.
+            rec["id"] = f"{time.time_ns()}-{os.getpid()}-{setname}"
             rec["ai_elements"] = list(desired.keys())
         if before is not None:
             rec["before_count"] = len(before)

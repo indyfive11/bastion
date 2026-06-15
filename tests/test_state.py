@@ -49,6 +49,28 @@ def test_write_secrets_is_chmod_600(tmp_path):
     assert mode == 0o600
 
 
+def test_write_conf_atomic_no_tmp_left(tmp_path):
+    # Atomic write: completes cleanly, leaves no stray temp file, round-trips.
+    p = tmp_path / "machine.conf"
+    state.write_conf({"machine": {"mode": "endpoint"}}, p)
+    assert state.load_conf(p)["machine"]["mode"] == "endpoint"
+    assert list(tmp_path.glob(".*tmp")) == []
+    # Overwriting an existing conf is also atomic and replaces contents.
+    state.write_conf({"machine": {"mode": "edge"}}, p)
+    assert state.load_conf(p)["machine"]["mode"] == "edge"
+    assert list(tmp_path.glob(".*tmp")) == []
+
+
+def test_write_secrets_atomic_no_tmp_left_and_600(tmp_path):
+    sp = tmp_path / "secrets.conf"
+    state.write_secrets({"anthropic_api_key": "a"}, sp)
+    # Rewriting stays atomic, 0600, and never leaves a world-readable temp behind.
+    state.write_secrets({"anthropic_api_key": "b"}, sp)
+    assert state.load_secrets(sp)["anthropic_api_key"] == "b"
+    assert stat.S_IMODE(os.stat(sp).st_mode) == 0o600
+    assert list(tmp_path.glob(".*tmp")) == []
+
+
 def test_render_machine_env_maps_and_derives(tmp_path):
     p = tmp_path / "machine.conf"
     p.write_text(MACHINE_CONF)
