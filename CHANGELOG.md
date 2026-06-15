@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.8] - 2026-06-15
+
+### Added
+
+- **The AI analysis cadence is now a first-class control knob.** `ai.timer_interval`
+  (how often `edge-ai` runs — rendered into `edge-ai.timer`'s `OnUnitActiveSec`) was a
+  silent 4h default. `bastion setup` now prompts for it and validates the value as a
+  systemd time span (`4h`, `30min`, `90s`, `2h30m`, `1d`), re-asking on bad input and
+  preserving an existing value on reinstall. It is also settable non-interactively with
+  `--set timer_interval=...`, with the same validation — a bad value is a clean error,
+  not a traceback. To change the cadence after install: edit `ai.timer_interval`, run
+  `bastion generate`, then `bastion ai enable`.
+
+### Fixed
+
+- **Re-arming the AI now applies a changed interval.** `bastion ai enable`
+  (`edge-ctl ai-enable`) previously ran a bare `systemctl enable --now`, so a regenerated
+  `edge-ai.timer` with a new interval would not take effect while a timer was already
+  running on the old cadence. It now `daemon-reload`s and restarts the timer, so
+  re-running `bastion ai enable` after changing the interval is enough to apply it.
+
 ## [1.0.7] - 2026-06-15
 
 A polish pass completing the deferred edge-resilience add-ons from the ES field

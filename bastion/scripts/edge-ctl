@@ -163,7 +163,12 @@ def cmd_ai_disable():
     return 0
 
 def cmd_ai_enable():
-    p = systemctl("enable", "--now", TIMER)
+    # daemon-reload first so a regenerated edge-ai.timer (changed ai.timer_interval) is picked up,
+    # then enable + restart so the CURRENT on-disk cadence is what arms — re-running `ai enable`
+    # after editing the interval is enough to apply it (no stale running timer on the old value).
+    systemctl("daemon-reload")
+    systemctl("enable", TIMER)
+    p = systemctl("restart", TIMER)
     audit({"event": "edge-ctl", "action": "ai-enable", "rc": p.returncode})
     if p.returncode == 0:
         print(f"AI ENABLED: {TIMER} enabled+started")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import getpass
 import ipaddress
+import re
 import sys as _sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,40 @@ SETTABLE_KEYS: tuple[str, ...] = (
 )
 
 
+# AI analysis cadence — the per-operator control knob for how often edge-ai runs (rendered into
+# edge-ai.timer's OnUnitActiveSec). Skeleton default; the wizard prompts for it and validates.
+DEFAULT_TIMER_INTERVAL = "4h"
+
+# systemd.time(7) span units. CASE-SENSITIVE on purpose: lowercase `m`/`min` = minutes, uppercase
+# `M` = months — so this regex must not be compiled with IGNORECASE or the two would collapse.
+_TS_UNITS = (r"(?:usec|us|msec|ms|seconds?|secs?|s|minutes?|min|m|"
+             r"hours?|hr|h|days?|d|weeks?|w|months?|M|years?|y)")
+_TS_PART = re.compile(r"(\d+(?:\.\d+)?)\s*" + _TS_UNITS)
+
+
+def normalize_timer_interval(raw: str) -> str | None:
+    """Validate an AI-cadence value the way systemd would parse OnUnitActiveSec. Accepts a bare
+    integer (= seconds) or one-or-more ``<number><unit>`` spans — e.g. ``4h``, ``30min``, ``90s``,
+    ``2h30m``, ``1d 12h``. Returns the cleaned string, or ``None`` if systemd would reject it, so a
+    bad knob is caught at setup/generate time instead of failing the timer load. Case matters:
+    ``m`` = minutes, ``M`` = months (mirrors systemd.time(7))."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+", s):
+        return s                      # bare integer => seconds
+    pos = 0
+    saw = False
+    for m in _TS_PART.finditer(s):
+        if s[pos:m.start()].strip():  # non-whitespace junk before/between tokens
+            return None
+        saw = True
+        pos = m.end()
+    if not saw or s[pos:].strip():    # nothing matched, or trailing junk
+        return None
+    return s
+
+
 def parse_overrides(pairs) -> dict[str, str]:
     """Parse `--set key=value` strings into an answers-override dict. Raises ValueError on a
     malformed pair or an unknown key (listing the valid keys) — fail loud, never silently drop."""
@@ -60,7 +95,11 @@ def parse_overrides(pairs) -> dict[str, str]:
             raise ValueError(f"--set must be key=value (got {pair!r})")
         if key not in SETTABLE_KEYS:
             raise ValueError(f"--set: unknown key {key!r}; valid keys: {', '.join(SETTABLE_KEYS)}")
-        out[key] = value.strip()
+        value = value.strip()
+        if key == "timer_interval" and normalize_timer_interval(value) is None:
+            raise ValueError(f"--set timer_interval {value!r} is not a valid systemd time span "
+                             "(e.g. 4h, 30min, 90s, 2h30m)")
+        out[key] = value
     return out
 
 
@@ -159,7 +198,12 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
     if "ai_depth" in answers:
         put("ai", "depth", answers["ai_depth"])
     if "timer_interval" in answers:
-        put("ai", "timer_interval", answers["timer_interval"])
+        iv = normalize_timer_interval(answers["timer_interval"])
+        if iv is None:
+            raise ValueError(
+                f"ai.timer_interval {answers['timer_interval']!r} is not a valid systemd time "
+                "span (e.g. 4h, 30min, 90s, 2h30m)")
+        put("ai", "timer_interval", iv)
     if "ai_backend_cmd" in answers:
         put("ai", "backend_cmd", answers["ai_backend_cmd"])
     if "ai_model" in answers:
@@ -248,6 +292,30 @@ class Wizard:
         if raw.isdigit() and 1 <= int(raw) <= len(options):
             return options[int(raw) - 1]
         return raw if raw in options else default
+
+    def _current_timer_interval(self) -> str:
+        """Default for the AI-cadence prompt: an existing live machine.conf value (preserve it on
+        reinstall), else the shipped skeleton default — never lose a deliberate operator setting."""
+        for p in (self.sys.path("etc/bastion/machine.conf"), self.example_path):
+            try:
+                v = state.load_conf(p).get("ai", {}).get("timer_interval", "").strip()
+                if normalize_timer_interval(v):
+                    return v
+            except Exception:
+                continue
+        return DEFAULT_TIMER_INTERVAL
+
+    def _ask_timer_interval(self, default: str) -> str:
+        """Prompt for the AI run cadence, re-asking until the value is a systemd time span."""
+        while True:
+            raw = self._ask("AI analysis interval — how often edge-ai runs (systemd time span)",
+                            default)
+            iv = normalize_timer_interval(raw)
+            if iv:
+                return iv
+            self.out(f"  '{raw}' isn't a valid time span — try e.g. 4h, 30min, 90s, 2h30m.")
+            if self.assume_defaults:   # non-interactive: never loop on a bad default
+                return default
 
     # --- flow ---
     def run(self) -> WizardResult:
@@ -377,6 +445,12 @@ class Wizard:
         if "l3" not in layers.split(","):
             self.out("  no AI layer selected — no API key needed.")
             return []
+
+        # AI run cadence (the per-operator control knob, rendered into edge-ai.timer). Applies to
+        # every backend incl. mock, so ask before the backend/key handling. Respect an explicit
+        # --set timer_interval (already in answers); only prompt interactively.
+        if "timer_interval" not in answers and not self.assume_defaults:
+            answers["timer_interval"] = self._ask_timer_interval(self._current_timer_interval())
 
         detected = ai_backend.detect_backend(self.sys)
 

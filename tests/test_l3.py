@@ -92,6 +92,15 @@ def test_killswitch_panic_fails_loud_on_flush_error():
     assert "PANIC INCOMPLETE" in body
 
 
+def test_ai_enable_applies_regenerated_timer_interval():
+    # Re-arming after the operator changes ai.timer_interval must pick up the regenerated
+    # edge-ai.timer: daemon-reload + restart, not a bare `enable --now` that would leave a stale
+    # running timer on the old cadence.
+    body = (SCRIPTS / "edge-ctl").read_text()
+    assert 'systemctl("daemon-reload")' in body
+    assert 'systemctl("restart", TIMER)' in body
+
+
 def test_rollback_spool_prune_does_not_use_rstrip():
     # `str.rstrip("/32")` strips a CHARACTER CLASS ({/,3,2}), not the literal "/32": e.g.
     # "1.2.3.23/32".rstrip("/32") -> "1.2.3.". That would make the spool-prune miss the intent

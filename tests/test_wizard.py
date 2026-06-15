@@ -189,6 +189,49 @@ def test_wizard_writes_confirmed_mode_over_detection():
     assert result.config["interfaces"]["wan"] == ""   # endpoint blanks WAN
 
 
+# --- AI run-cadence control knob (ai.timer_interval) -----------------------
+
+def test_normalize_timer_interval_accepts_systemd_spans():
+    for v in ["4h", "30min", "90s", "2h30m", "1d 12h", "45m", "1d", "3600", "1week", "12hr"]:
+        assert wizard.normalize_timer_interval(v) == v
+
+def test_normalize_timer_interval_rejects_junk():
+    for v in ["", "   ", "soon", "4 hours please", "every 4h", "4h!", "h4", "4hh", "-2h"]:
+        assert wizard.normalize_timer_interval(v) is None
+
+def test_normalize_timer_interval_is_case_sensitive_minutes_vs_months():
+    # systemd.time(7): lowercase m = minutes, uppercase M = months — both valid, never collapsed.
+    assert wizard.normalize_timer_interval("30m") == "30m"
+    assert wizard.normalize_timer_interval("6M") == "6M"
+
+def test_build_machine_conf_validates_timer_interval():
+    base = state.load_conf(EXAMPLE)
+    d = detect.detect(edge_system())
+    conf = wizard.build_machine_conf(d, "full-edge", {"timer_interval": "2h30m"}, base)
+    assert conf["ai"]["timer_interval"] == "2h30m"
+    with pytest.raises(ValueError):
+        wizard.build_machine_conf(d, "full-edge", {"timer_interval": "whenever"}, base)
+
+def test_wizard_set_timer_interval_non_interactively():
+    wiz = wizard.Wizard(edge_system(), dry_run=True, profile="full-edge",
+                        assume_defaults=True, example_conf=str(EXAMPLE),
+                        overrides={"timer_interval": "15min"})
+    result = wiz.run()
+    assert result.config["ai"]["timer_interval"] == "15min"
+
+def test_ask_timer_interval_reasks_until_valid():
+    feed = iter(["garbage", "2h"])
+    wiz = wizard.Wizard(edge_system(), dry_run=True, profile="full-edge",
+                        assume_defaults=False, example_conf=str(EXAMPLE),
+                        inp=lambda *_: next(feed), out=lambda *_: None)
+    assert wiz._ask_timer_interval("4h") == "2h"
+
+def test_current_timer_interval_falls_back_to_skeleton(tmp_path):
+    # No live /etc/bastion/machine.conf under this root -> the shipped skeleton default (4h).
+    wiz = wizard.Wizard(System(root=tmp_path), example_conf=str(EXAMPLE), assume_defaults=True)
+    assert wiz._current_timer_interval() == "4h"
+
+
 def test_parse_overrides_valid_and_invalid():
     assert wizard.parse_overrides(["trusted_hosts=10.0.0.2", "ssh_port=1111"]) == {
         "trusted_hosts": "10.0.0.2", "ssh_port": "1111"}
@@ -200,6 +243,10 @@ def test_parse_overrides_valid_and_invalid():
         wizard.parse_overrides(["no_equals_sign"])
     with pytest.raises(ValueError):
         wizard.parse_overrides(["bogus_key=x"])   # unknown key is a hard error, not silent
+    # a bad timer_interval value is caught at the --set chokepoint (clean error, not a traceback)
+    assert wizard.parse_overrides(["timer_interval=2h30m"]) == {"timer_interval": "2h30m"}
+    with pytest.raises(ValueError):
+        wizard.parse_overrides(["timer_interval=whenever"])
 
 
 def test_wizard_set_override_wins_non_interactively():

@@ -62,7 +62,10 @@ ssh = 22
 backend_cmd = /usr/local/sbin/edge-ai-backend-claude
 model = claude-opus-4-8
 max_intents = 32
-# systemd OnUnitActiveSec for edge-ai.timer
+# How often edge-ai runs (the AI run-cadence control knob; rendered into edge-ai.timer's
+# OnUnitActiveSec). Any systemd time span: 4h, 30min, 90s, 2h30m, 1d. The wizard prompts for and
+# validates this; after editing it, re-render (bastion generate / layer install l3) and re-arm
+# (bastion ai enable) to apply. Note: m = minutes, M = months.
 timer_interval = 4h
 # regular | advanced | expert — controls how much config the AI is SHOWN, not what it can apply.
 # In every depth, base/access changes (e.g. SSH port) are proposed to the human-review queue
