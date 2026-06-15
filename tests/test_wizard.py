@@ -189,6 +189,30 @@ def test_wizard_writes_confirmed_mode_over_detection():
     assert result.config["interfaces"]["wan"] == ""   # endpoint blanks WAN
 
 
+def test_parse_overrides_valid_and_invalid():
+    assert wizard.parse_overrides(["trusted_hosts=10.0.0.2", "ssh_port=1111"]) == {
+        "trusted_hosts": "10.0.0.2", "ssh_port": "1111"}
+    assert wizard.parse_overrides(None) == {}
+    # value may contain '=' (split on first only)
+    assert wizard.parse_overrides(["ai_model=a=b"]) == {"ai_model": "a=b"}
+    import pytest
+    with pytest.raises(ValueError):
+        wizard.parse_overrides(["no_equals_sign"])
+    with pytest.raises(ValueError):
+        wizard.parse_overrides(["bogus_key=x"])   # unknown key is a hard error, not silent
+
+
+def test_wizard_set_override_wins_non_interactively():
+    # The whole point: trusted_hosts (which detection can't know) is settable via --set even
+    # when running non-interactively (assume_defaults=True), where a prompt would be skipped.
+    wiz = wizard.Wizard(edge_system(), dry_run=True, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE),
+                        overrides={"trusted_hosts": "192.168.192.50", "ssh_port": "2222"})
+    result = wiz.run()
+    assert result.config["network"]["trusted_hosts"] == "192.168.192.50"
+    assert result.config["ports"]["ssh"] == "2222"
+
+
 def test_wizard_dry_run_edge(capsys):
     wiz = wizard.Wizard(edge_system(), dry_run=True, profile="full-edge",
                         assume_defaults=True, example_conf=str(EXAMPLE))

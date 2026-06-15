@@ -51,8 +51,9 @@ _DISTRO_PKG = {
 class Iface:
     name: str
     kind: str            # ethernet | wifi | wireguard | zerotier | loopback | virtual | other
-    up: bool
+    up: bool             # administratively up (UP flag) — NOT proof of a live link
     addrs: list[str] = field(default_factory=list)   # IPv4 CIDRs, e.g. "10.0.1.1/24"
+    carrier: bool = False  # link is actually up (LOWER_UP) — an unplugged NIC is up but not carrier
 
     @property
     def physical(self) -> bool:
@@ -119,10 +120,12 @@ def parse_interfaces(link_text: str, addr_text: str) -> list[Iface]:
             continue
         name = m.group(1).strip()
         flags = set(m.group(2).split(","))
-        # Admin-up if the UP flag is set; carrier (LOWER_UP) is a separate signal we don't require.
+        # Admin-up if the UP flag is set; carrier (LOWER_UP, and not NO-CARRIER) means a live link.
+        # An unplugged NIC reports UP but no carrier — mode detection must not count it as a network.
         up = "UP" in flags
+        carrier = "LOWER_UP" in flags and "NO-CARRIER" not in flags
         ifaces.append(Iface(name=name, kind=classify_iface(name, flags), up=up,
-                            addrs=addrs.get(name, [])))
+                            addrs=addrs.get(name, []), carrier=carrier))
     return ifaces
 
 
@@ -161,10 +164,20 @@ def parse_os_release(text: str) -> str:
 
 
 def propose_mode(interfaces: list[Iface], default_iface: str | None) -> str:
-    """Edge if ≥2 physical interfaces are present (router-between-networks shape),
-    else endpoint. A proposal only — the wizard makes the user confirm (§10 step 2)."""
-    phys = [i for i in interfaces if i.physical]
-    return "edge" if len(phys) >= 2 else "endpoint"
+    """Edge if the box looks like a router, else endpoint. A proposal only — the wizard
+    makes the user confirm (§10 step 2).
+
+    Heuristic (refined after a 2-NIC laptop with an unplugged wired port mis-proposed edge):
+    a client whose default route rides a Wi-Fi interface is an endpoint — routers take a
+    wired uplink. Otherwise require ≥2 physical interfaces with a live link (carrier); a NIC
+    that is administratively UP but has no carrier (e.g. an unplugged laptop ethernet port)
+    is not a second network and does not make a router.
+    """
+    default = next((i for i in interfaces if i.name == default_iface), None)
+    if default is not None and default.kind == "wifi":
+        return "endpoint"
+    linked_phys = [i for i in interfaces if i.physical and i.carrier]
+    return "edge" if len(linked_phys) >= 2 else "endpoint"
 
 
 def propose_lan_wan(interfaces: list[Iface], default_iface: str | None,
@@ -178,7 +191,14 @@ def propose_lan_wan(interfaces: list[Iface], default_iface: str | None,
     phys = [i for i in interfaces if i.physical]
     names = [i.name for i in phys]
     if mode == "endpoint":
-        lan = default_iface if default_iface in names else (names[0] if names else None)
+        if default_iface in names:
+            return default_iface, None
+        # No usable default-route iface: prefer one with a live link and an address (a real
+        # NIC) over an unplugged/unconfigured port, so lan_cidr derives from a real address
+        # rather than falling back to the example skeleton's placeholder subnet.
+        addressed = [i.name for i in phys if i.carrier and i.addrs]
+        linked = [i.name for i in phys if i.carrier]
+        lan = next(iter(addressed or linked or names), None)
         return lan, None
     # edge: WAN = the default-route interface; LAN = the best remaining candidate,
     # preferring one that is up and already carries an address (a configured NIC beats a
@@ -226,8 +246,7 @@ def detect(sys: System) -> Detection:
     default_iface, gateway = parse_default_route(route_text)
 
     sshd_t = sys.run("sshd", "-T").stdout
-    sshd_config = sys.read("/etc/ssh/sshd_config") if sys.exists("/etc/ssh/sshd_config") else ""
-    ssh_port = parse_ssh_port(sshd_t, sshd_config)
+    ssh_port = parse_ssh_port(sshd_t, _sshd_config_text(sys))
 
     os_release = sys.read("/etc/os-release") if sys.exists("/etc/os-release") else ""
     distro = parse_os_release(os_release)
@@ -249,6 +268,24 @@ def detect(sys: System) -> Detection:
         proposed_mode=mode, lan_iface=lan_iface, wan_iface=wan_iface,
         lan_ip=lan_ip, lan_cidr=lan_cidr,
     )
+
+
+def _sshd_config_text(sys: System) -> str:
+    """sshd_config plus its drop-ins, drop-ins first. `sshd -T` needs root, so when it is denied
+    the wizard falls back to parsing config files — and modern distros set `Port` in a drop-in
+    (e.g. /etc/ssh/sshd_config.d/10-hardened.conf), not the main file. The `Include` sits at the
+    top of sshd_config and first-match wins, so drop-in values take precedence."""
+    parts: list[str] = []
+    dropin = sys.path("/etc/ssh/sshd_config.d")
+    if dropin.is_dir():
+        for f in sorted(dropin.glob("*.conf")):
+            try:
+                parts.append(f.read_text())
+            except OSError:
+                pass
+    if sys.exists("/etc/ssh/sshd_config"):
+        parts.append(sys.read("/etc/ssh/sshd_config"))
+    return "\n".join(parts)
 
 
 def _detect_pkg_binary(sys: System) -> str:

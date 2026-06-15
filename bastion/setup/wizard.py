@@ -37,6 +37,32 @@ EDGE_PROFILES = ("full-edge", "basic-edge")
 ENDPOINT_PROFILES = ("full-endpoint", "minimal-endpoint")
 DEFAULT_PROFILE = {"edge": "full-edge", "endpoint": "full-endpoint"}
 
+# Answer keys settable non-interactively via `bastion setup --set key=value`. These are the
+# same flat keys build_machine_conf() consumes, so a --set value overrides BOTH detection and
+# any prompt default — the supported way to script/reproduce a setup (e.g. trusted_hosts, which
+# detection cannot know). An unknown key is a hard error, never silently ignored.
+SETTABLE_KEYS: tuple[str, ...] = (
+    "mode", "profile", "layers",
+    "lan_iface", "wan_iface", "lan_cidr", "lan_ip", "gateway",
+    "dhcp_range_start", "dhcp_range_end", "trusted_hosts", "dns_upstream",
+    "ssh_port", "ai_depth", "timer_interval", "ai_backend_cmd", "ai_model", "secrets_file",
+)
+
+
+def parse_overrides(pairs) -> dict[str, str]:
+    """Parse `--set key=value` strings into an answers-override dict. Raises ValueError on a
+    malformed pair or an unknown key (listing the valid keys) — fail loud, never silently drop."""
+    out: dict[str, str] = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if not sep:
+            raise ValueError(f"--set must be key=value (got {pair!r})")
+        if key not in SETTABLE_KEYS:
+            raise ValueError(f"--set: unknown key {key!r}; valid keys: {', '.join(SETTABLE_KEYS)}")
+        out[key] = value.strip()
+    return out
+
 
 def profile_mode(profile: str) -> str | None:
     if profile in EDGE_PROFILES:
@@ -177,7 +203,8 @@ class WizardResult:
 class Wizard:
     def __init__(self, sys: System, *, dry_run: bool = False, profile: str | None = None,
                  no_ai: bool = True, inp=input, out=print, assume_defaults: bool | None = None,
-                 example_conf: str | None = None, secret_inp=getpass.getpass):
+                 example_conf: str | None = None, secret_inp=getpass.getpass,
+                 overrides: dict[str, str] | None = None):
         self.sys = sys
         self.dry_run = dry_run
         self.profile_arg = profile
@@ -185,8 +212,13 @@ class Wizard:
         self.inp = inp
         self.out = out
         self.secret_inp = secret_inp   # hidden input for secrets (getpass); injectable for tests
+        # `--set key=value` answers: override detection AND prompt defaults, in either mode.
+        self.overrides = overrides or {}
         # Non-interactive (no tty / piped) -> accept every detected/proposed default.
         self.assume_defaults = (not _sys.stdin.isatty()) if assume_defaults is None else assume_defaults
+        # Was non-interactive auto-detected (vs. explicitly requested, e.g. by tests)? Used to
+        # surface a discoverable hint that --set is how you override defaults without a TTY.
+        self._auto_noninteractive = assume_defaults is None and self.assume_defaults
         self.example_path = find_example_conf(example_conf)
 
     # --- prompt helpers ---
@@ -222,6 +254,9 @@ class Wizard:
         out = self.out
         out("== bastion setup " + ("(DRY RUN — nothing will be written/installed) ==" if self.dry_run
                                     else "==") )
+        if self._auto_noninteractive:
+            out("  (non-interactive: no TTY detected — accepting detected defaults; "
+                "override any value with --set KEY=VALUE)")
 
         # 1. DETECT
         out("\n[1/8] Detecting topology...")
@@ -236,12 +271,13 @@ class Wizard:
         if mode_default != d.proposed_mode:
             out(f"  (detection proposed {d.proposed_mode}; --profile {self.profile_arg} "
                 f"implies {mode_default})")
-        mode = self._choose("Confirm mode", ["edge", "endpoint"], mode_default)
+        mode = self.overrides.get("mode") or self._choose("Confirm mode", ["edge", "endpoint"],
+                                                          mode_default)
         self._conflict_warn(d, mode)
 
         # 3. PROFILE
         out("\n[3/8] Profile")
-        profile = self._select_profile(mode)
+        profile = self.overrides.get("profile") or self._select_profile(mode)
 
         # 4. LAYER CONFIGURATION (essential machine.conf values; user confirms detected ones)
         out("\n[4/8] Layer configuration")
@@ -250,6 +286,11 @@ class Wizard:
         # (and --profile), instead of build_machine_conf silently falling back to detection's
         # proposed_mode when the two disagree.
         answers["mode"] = mode
+        # `--set key=value` wins over both detection and prompt answers — the scriptable path
+        # for values a prompt would otherwise own (e.g. trusted_hosts).
+        if self.overrides:
+            answers.update(self.overrides)
+            out("  applied --set: " + ", ".join(f"{k}={v}" for k, v in self.overrides.items()))
 
         # 5. SECRETS — the L3 API key and the L6 alert sinks: both are operator/secret config written
         #    out-of-band (chmod 600), never into machine.conf.

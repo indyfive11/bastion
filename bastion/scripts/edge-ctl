@@ -13,7 +13,28 @@
 import json, os, subprocess, sys, time
 
 AI_SETS  = ["ai_block", "ai_ratelimit", "ai_tarpit"]
-FAM, TBL = "inet", "edge"
+
+
+def _nft_table():
+    """The managed nft table: `inet edge` (edge) or `inet bastion` (endpoint). Read NFT_TABLE
+    from the environment, else /etc/bastion/machine.env. Hardcoding `inet edge` would make the
+    kill switch (panic/ai-disable/rollback) silently target a table that DOES NOT EXIST on an
+    endpoint — leaving AI-imposed blocks in place. Falls back to inet edge for older configs."""
+    val = os.environ.get("NFT_TABLE", "")
+    if not val:
+        try:
+            with open("/etc/bastion/machine.env") as f:
+                for line in f:
+                    if line.strip().startswith("NFT_TABLE="):
+                        val = line.split("=", 1)[1].strip().strip("'\"")
+                        break
+        except OSError:
+            pass
+    parts = val.split()
+    return (parts[0], parts[1]) if len(parts) == 2 else ("inet", "edge")
+
+
+FAM, TBL = _nft_table()
 INTENTS  = "/var/lib/edge-ai/intents.json"
 SIGNALS  = "/var/lib/edge-ai/signals.json"
 PROPOSALS= "/var/lib/edge-ai/proposals.jsonl"

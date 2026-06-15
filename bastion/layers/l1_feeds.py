@@ -8,7 +8,7 @@ mode-dependent (`inet edge` vs `inet bastion`); it is selected via NFT_TABLE in 
 """
 from __future__ import annotations
 
-from .base import Layer, Context, LayerStatus, HealthCheck
+from .base import Layer, Context, LayerStatus, HealthCheck, nft_set_health
 
 
 class L1Feeds(Layer):
@@ -90,7 +90,7 @@ class L1Feeds(Layer):
             HealthCheck("curl present (feed fetch)", sys.command_exists("curl")),
             HealthCheck("edge-reconciler installed", sys.exists(f"{ctx.sbin_dir}/edge-reconciler")),
             HealthCheck("edge-feed-fetch installed", sys.exists(f"{ctx.sbin_dir}/edge-feed-fetch")),
-            HealthCheck("blk_feed set present", sys.nft_set_exists(family, table, "blk_feed")),
+            nft_set_health(sys, "blk_feed set present", family, table, "blk_feed"),
             HealthCheck("reconciler timer active", sys.unit_active("edge-reconciler.timer")),
             HealthCheck("feed timer active", sys.unit_active("edge-feed.timer")),
         ]

@@ -29,9 +29,10 @@ ip link set "$LAN_IF" up 2>/dev/null || true
 # 2) FIREWALL manager — restore the one that was known-good at snapshot.
 # Done early: a broken ruleset is the likeliest thing killing traffic, so fix it
 # before route/DNS. UFW is allow-out by default, so egress returns the moment it's up.
-# Detection keys on the ACTUAL loaded ruleset ('table inet edge'), not service state
-# (nftables.service is oneshot RemainAfterExit=no — its active state is unreliable).
-edge_loaded(){ nft list table inet edge >/dev/null 2>&1; }
+# Detection keys on the ACTUAL loaded bastion table (inet edge on an edge node, inet bastion on
+# an endpoint — from machine.env's NFT_TABLE), not service state (nftables.service is oneshot
+# RemainAfterExit=no — its active state is unreliable).
+edge_loaded(){ nft list table ${NFT_TABLE:-inet edge} >/dev/null 2>&1; }
 
 # The upstream relay (LAN -> relay interface) may live in iptables/UFW config.
 # After restoring UFW, ALSO ensure it live — belt-and-suspenders so LAN clients never

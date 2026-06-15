@@ -7,6 +7,7 @@ crashes for a non-root user.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -23,6 +24,12 @@ class System:
         """True only when operating on the real root (not a staged tree) and not dry-run.
         Live system mutations (systemctl, nft -f) must be gated on this."""
         return self.root == Path("/") and not self.dry_run
+
+    @property
+    def is_root(self) -> bool:
+        """Running as uid 0. nftables list queries require root, so non-root health checks
+        cannot distinguish "table absent" from "permission denied" — see HealthCheck.unknown."""
+        return os.geteuid() == 0
 
     def path(self, p: str) -> Path:
         return self.root / str(p).lstrip("/")

@@ -2,6 +2,10 @@
 # net-snapshot — capture current known-good network state for net-rollback.
 # Runs as root (via net-snapshot.service). Writes to /var/lib/net-safe/snapshot.
 STATE=/var/lib/net-safe; SNAP="$STATE/snapshot"
+# NFT_TABLE (inet edge on edge, inet bastion on endpoint) — must match net-rollback's
+# edge_loaded() or the firewall-manager baseline inverts. Generic fallback keeps topology out
+# of the repo; the live node always has machine.env.
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
 log(){ logger -t net-safe "net-snapshot: $*"; }
 mkdir -p "$SNAP/nm-system-connections" /run/net-safe
 
@@ -26,7 +30,7 @@ else : > "$SNAP/dnsmasq-was-inactive"; fi
 # net-rollback's edge_loaded() or the baseline inverts (the 2026-06-05 flap).
 # net-rollback restores THIS manager: edge => reload nftables; ufw => restart ufw.
 rm -f "$SNAP/fw-ufw-active" "$SNAP/fw-nftables-active"
-if nft list table inet edge >/dev/null 2>&1; then
+if nft list table ${NFT_TABLE:-inet edge} >/dev/null 2>&1; then
   : > "$SNAP/fw-nftables-active"
 elif systemctl is-active --quiet ufw; then
   : > "$SNAP/fw-ufw-active"

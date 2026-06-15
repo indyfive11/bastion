@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-06-15
+
+Endpoint-mode dogfooding pass: a live install on an ordinary laptop surfaced a
+cluster of bugs where edge assumptions leaked into endpoint mode, plus a wizard
+gap. None affect edge nodes; all were found and fixed against a real endpoint.
+
+### Fixed
+
+- **The AI kill switch was inert on endpoint nodes.** `edge-ctl panic`,
+  `edge-ctl ai-disable`, and `edge-ctl rollback` hardcoded the `inet edge` table, so on
+  an endpoint (whose table is `inet bastion`) they flushed a table that does not exist
+  and **printed success while doing nothing**. `edge-ctl` now reads `NFT_TABLE` from the
+  environment / `machine.env`. The human kill switch works in both modes.
+- **The firewall did not survive a reboot.** `bastion layer install l0` loaded the
+  ruleset with `nft -f` but never enabled `nftables.service`, so the firewall was gone
+  after a reboot. L0 install now `systemctl enable --now nftables`; uninstall disables it.
+- **`net-snapshot` / `net-rollback` hardcoded `inet edge`** when detecting the
+  known-good firewall, the same class of bug as the kill switch. Both now honor
+  `NFT_TABLE`.
+- **Mode detection misread an endpoint as an edge node.** A Wi-Fi laptop was proposed
+  as `edge` and offered an unplugged NIC and an example subnet. Detection now treats a
+  Wi-Fi default route as endpoint, requires two **carrier-up** physical NICs for edge,
+  and prefers an up, addressed interface for the endpoint LAN.
+- **SSH-port detection missed `sshd_config.d/*.conf` drop-ins** during non-root setup,
+  so a non-default SSH port could be lost. Detection now reads the drop-in directory.
+- **Read-only health checks reported false failures.** nft table/set checks that need
+  root now report `[????] needs root to verify` instead of `[FAIL]` when run unprivileged.
+- **`flowcheck` mislabeled a loaded firewall as inactive.** `nftables.service` is a
+  oneshot unit, so `is-active` reads `inactive` even when the ruleset is loaded.
+  `flowcheck` now reports `is-enabled` (the truthful persistence signal).
+- **`lan-verify` showed a misleading error on endpoints.** It now reports cleanly that
+  LAN-client relay verification is not applicable to a non-routing endpoint.
+
+### Added
+
+- **`bastion setup --set KEY=VALUE`** (repeatable) — set any wizard answer
+  non-interactively, so setup is fully scriptable. Previously a piped (non-TTY) run
+  silently accepted all detected defaults with no way to override a value such as
+  `trusted_hosts`. Unknown keys are rejected.
+
 ## [1.0.2] - 2026-06-14
 
 ### Fixed

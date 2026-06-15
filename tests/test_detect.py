@@ -66,6 +66,21 @@ def test_parse_ssh_port():
     assert detect.parse_ssh_port("", "") == 22
 
 
+def test_sshd_config_text_includes_dropins():
+    # The real port often lives in a drop-in, not the main sshd_config; non-root detection
+    # (sshd -T denied) must still find it. Drop-ins come first (first-match wins).
+    import tempfile
+    from pathlib import Path
+    from bastion.system import System
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "etc/ssh/sshd_config.d").mkdir(parents=True)
+        (root / "etc/ssh/sshd_config").write_text("# main config, no Port line\n")
+        (root / "etc/ssh/sshd_config.d/10-hardened.conf").write_text("Port 1111\n")
+        text = detect._sshd_config_text(System(root=root))
+        assert detect.parse_ssh_port("", text) == 1111
+
+
 def test_parse_os_release():
     assert detect.parse_os_release('ID=arch\nNAME="Arch Linux"\n') == "arch"
     assert detect.parse_os_release('NAME="Debian"\nID=debian\n') == "debian"
@@ -78,6 +93,39 @@ def test_propose_mode():
     one = detect.parse_interfaces(
         "2: enp3s0: <BROADCAST,MULTICAST,UP> mtu 1500 state UP mode DEFAULT\n", ADDR)
     assert detect.propose_mode(one, "enp3s0") == "endpoint"       # 1 physical NIC
+
+
+def test_propose_mode_wifi_uplink_is_endpoint():
+    # Laptop shape that previously mis-proposed edge: an UP Wi-Fi default route plus a DOWN
+    # wired port. A client whose uplink is Wi-Fi is an endpoint, not a router.
+    link = ("2: enp1s0: <BROADCAST,MULTICAST> mtu 1500 state DOWN mode DEFAULT\n"
+            "3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP mode DEFAULT\n")
+    addr = "3: wlan0    inet 192.168.1.175/24 brd 192.168.1.255 scope global wlan0\n"
+    ifaces = detect.parse_interfaces(link, addr)
+    assert detect.propose_mode(ifaces, "wlan0") == "endpoint"
+
+
+def test_propose_mode_unplugged_second_nic_is_endpoint():
+    # Two wired NICs but the second is admin-UP with NO-CARRIER (cable unplugged) — it is not a
+    # live second network, so this is an endpoint, not a router. Guards the carrier-vs-admin-up trap.
+    link = ("2: enp3s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP mode DEFAULT\n"
+            "3: enp4s0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 state DOWN mode DEFAULT\n")
+    ifaces = detect.parse_interfaces(link, ADDR)
+    assert ifaces[1].up and not ifaces[1].carrier   # admin-up but no link
+    assert detect.propose_mode(ifaces, "enp3s0") == "endpoint"
+
+
+def test_propose_lan_wan_endpoint_prefers_up_addressed_iface():
+    # No default route resolved; a DOWN wired port plus an UP+addressed Wi-Fi iface. The LAN
+    # must be the live iface so lan_cidr derives a real subnet, not the example placeholder.
+    link = ("2: enp1s0: <BROADCAST,MULTICAST> mtu 1500 state DOWN mode DEFAULT\n"
+            "3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP mode DEFAULT\n")
+    addr = "3: wlan0    inet 192.168.1.175/24 brd 192.168.1.255 scope global wlan0\n"
+    ifaces = detect.parse_interfaces(link, addr)
+    lan, wan = detect.propose_lan_wan(ifaces, None, "endpoint")
+    assert lan == "wlan0" and wan is None
+    ip, cidr = detect.lan_addr_of(ifaces, lan)
+    assert ip == "192.168.1.175" and cidr == "192.168.1.0/24"
 
 
 def test_propose_lan_wan_edge():

@@ -64,6 +64,7 @@ class _FwSys(System):
     def __init__(self, root, active_fw=None):
         super().__init__(root=root)
         self._active_fw = active_fw
+        self.calls = []
 
     @property
     def is_live(self) -> bool:
@@ -76,6 +77,7 @@ class _FwSys(System):
         return True
 
     def run(self, *args, **kwargs):
+        self.calls.append(tuple(args))
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -106,6 +108,56 @@ def test_l0_install_override_env_allows_takeover(tmp_path, monkeypatch):
 def test_l0_install_no_conflict_proceeds(tmp_path):
     layers.get("l0").install(_fw_ctx(tmp_path, None))    # nothing active
     assert (tmp_path / "etc/nftables.conf").is_file()
+
+
+def test_l0_install_enables_nftables_for_persistence(tmp_path):
+    # The ruleset must survive a reboot: L0 enables nftables.service (whose ExecStart reloads
+    # /etc/nftables.conf) rather than only loading it once with `nft -f`.
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    assert ("systemctl", "enable", "--now", "nftables") in sysobj.calls
+
+
+def test_l0_uninstall_disables_nftables(tmp_path):
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").uninstall(ctx)
+    assert ("systemctl", "disable", "nftables") in sysobj.calls
+
+
+def test_nft_health_unknown_when_live_and_nonroot():
+    # On a live host without root, `nft list` is denied — report unknown, not a false FAIL.
+    from bastion.layers.base import nft_table_health, nft_set_health
+
+    class S(System):
+        @property
+        def is_live(self): return True
+        @property
+        def is_root(self): return False
+        def nft_table_exists(self, *a): raise AssertionError("must not query nft when non-root")
+        def nft_set_exists(self, *a): raise AssertionError("must not query nft when non-root")
+
+    t = nft_table_health(S(), "base ruleset", "inet", "bastion")
+    assert t.unknown and not t.ok and "root" in t.detail
+    s = nft_set_health(S(), "blk_feed", "inet", "edge", "blk_feed")
+    assert s.unknown and not s.ok
+
+
+def test_nft_health_queries_when_root():
+    from bastion.layers.base import nft_table_health
+
+    class S(System):
+        @property
+        def is_live(self): return True
+        @property
+        def is_root(self): return True
+        def nft_table_exists(self, *a): return True
+
+    t = nft_table_health(S(), "base ruleset", "inet", "bastion")
+    assert t.ok and not t.unknown
 
 
 def test_cli_status_on_fresh_root_returns_zero(tmp_path, capsys):

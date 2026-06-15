@@ -3,8 +3,18 @@
 # AND getting replies. Reads conntrack (the FORWARD path the node's own egress test can't
 # see). Run while a LAN client is generating traffic. Closes the "LAN-client blind spot".
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+MODE=${MODE:-edge}
 LAN_NET=${LAN_NET:-}                   # LAN CIDR, e.g. 10.0.1.0/24
 RELAY_DST=${RELAY_DST:-}               # relay masquerade addr (this node's relay-side IP)
+
+# Edge-only: an endpoint does not route/masquerade for LAN clients, so there is no relay
+# forward path to verify. Report N/A cleanly instead of the misleading "set LAN_NET and
+# RELAY_DST" (those are intentionally blank on an endpoint), mirroring flowcheck's mode gating.
+if [ "$MODE" = endpoint ]; then
+  echo "lan-verify: N/A on an endpoint node — this check verifies edge LAN-client relay"
+  echo "forwarding, which an endpoint (defense-in-depth, non-routing) does not do."
+  exit 0
+fi
 
 # Conntrack source: the procfs file when present, else `conntrack -L` (conntrack-tools). Modern
 # kernels ship with CONFIG_NF_CONNTRACK_PROCFS off, so /proc/net/nf_conntrack is ABSENT even though

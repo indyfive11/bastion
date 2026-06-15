@@ -3,7 +3,7 @@ bastion-recovery service. Foundation for every profile; prerequisite of all othe
 """
 from __future__ import annotations
 
-from .base import (Layer, Context, LayerStatus, HealthCheck,
+from .base import (Layer, Context, LayerStatus, HealthCheck, nft_table_health,
                    FirewallConflict, blocking_conflicting_firewall)
 
 
@@ -62,10 +62,18 @@ class L0Core(Layer):
 
         if sys.is_live:
             sys.run("systemctl", "daemon-reload")
-            # Validate then load the base ruleset.
+            # Validate, then load the base ruleset by enabling nftables.service as the canonical
+            # loader. Its ExecStart is `nft -f /etc/nftables.conf` — the exact file we just wrote —
+            # so `enable --now` both loads it now AND persists it across reboot (without this the
+            # ruleset is lost on the next boot and nothing reloads it), and makes
+            # `systemctl is-active nftables` a truthful report of firewall state. Fall back to a
+            # direct (non-persistent) load only if the service is unavailable.
             conf = str(sys.path("/etc/nftables.conf"))
             if sys.run("nft", "-c", "-f", conf).returncode == 0:
-                sys.run("nft", "-f", conf)
+                if sys.run("systemctl", "enable", "--now", "nftables").returncode != 0:
+                    print("l0: WARNING — could not enable nftables.service; loading the ruleset "
+                          "directly (it will NOT persist across reboot)")
+                    sys.run("nft", "-f", conf)
             else:
                 print("l0: WARNING — rendered nftables.conf failed `nft -c`; not loaded")
         else:
@@ -78,6 +86,9 @@ class L0Core(Layer):
         sys = ctx.system
         if sys.is_live:
             sys.run("systemctl", "stop", "bastion-recovery")
+            # Stop persisting our ruleset (install() enabled it) so the flushed table is not
+            # reloaded from /etc/nftables.conf on the next boot.
+            sys.run("systemctl", "disable", "nftables")
             family, table = self._nft_table(ctx)
             sys.run("nft", "delete", "table", family, table)
         for unit in self.units:
@@ -109,7 +120,7 @@ class L0Core(Layer):
         return [
             HealthCheck("nft binary present", sys.command_exists("nft")),
             HealthCheck("sshd present (recovery)", sys.command_exists("sshd")),
-            HealthCheck(f"base ruleset loaded ({family} {table})", sys.nft_table_exists(family, table)),
+            nft_table_health(sys, f"base ruleset loaded ({family} {table})", family, table),
             HealthCheck("recovery unit installed", sys.exists("/etc/systemd/system/bastion-recovery.service")),
             HealthCheck("policy.allowlist non-empty",
                         allowlist.is_file() and allowlist.stat().st_size > 0),

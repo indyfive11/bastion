@@ -174,7 +174,7 @@ def _print_status(st, show_health: bool, ctx: Context, layer) -> None:
         print(f"       {st.detail}")
     if show_health:
         for chk in layer.health_check(ctx):
-            mark = "OK  " if chk.ok else "FAIL"
+            mark = "????" if getattr(chk, "unknown", False) else ("OK  " if chk.ok else "FAIL")
             print(f"       [{mark}] {chk.name}" + (f" — {chk.detail}" if chk.detail else ""))
 
 
@@ -322,13 +322,19 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     """Interactive setup wizard (§10). Phase 5: rule-based; --dry-run writes nothing."""
-    from .setup.wizard import Wizard
+    from .setup.wizard import Wizard, parse_overrides
     root = Path(getattr(args, "root", None) or "/")
     if not args.dry_run and os.geteuid() != 0 and root == Path("/"):
         print("bastion setup requires root (or use --dry-run / --root for a staged preview)",
               file=sys.stderr)
         return 1
-    wiz = Wizard(System(root=root), dry_run=args.dry_run, profile=args.profile, no_ai=args.no_ai)
+    try:
+        overrides = parse_overrides(getattr(args, "set", None))
+    except ValueError as e:
+        print(f"bastion setup: {e}", file=sys.stderr)
+        return 1
+    wiz = Wizard(System(root=root), dry_run=args.dry_run, profile=args.profile, no_ai=args.no_ai,
+                 overrides=overrides)
     result = wiz.run()
     if result.notes:
         print("\nnotes:")
@@ -348,6 +354,9 @@ def build_parser() -> argparse.ArgumentParser:
                        "minimal-endpoint|custom)")
     setup.add_argument("--no-ai", action="store_true",
                        help="skip AI-assisted setup (Phase 5 is always rule-based; flag reserved)")
+    setup.add_argument("--set", action="append", metavar="KEY=VALUE", dest="set",
+                       help="set a config answer non-interactively (overrides detection + prompts); "
+                            "repeatable, e.g. --set trusted_hosts=10.0.0.2 --set ssh_port=1111")
     setup.add_argument("--root", help="operate under this base dir instead of / (staged preview/testing)")
     setup.set_defaults(func=cmd_setup)
 

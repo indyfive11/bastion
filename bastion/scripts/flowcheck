@@ -48,7 +48,10 @@ resolv_leak(){
 }
 
 echo "== firewall state =="
-echo "  ufw=$(systemctl is-active ufw)  nftables=$(systemctl is-active nftables)"
+# nftables.service is a oneshot — it loads the ruleset, then exits — so `is-active` reads
+# "inactive" even when the firewall IS loaded. `is-enabled` is the truthful signal here:
+# enabled means the bastion ruleset is (re)loaded on every boot.
+echo "  ufw=$(systemctl is-active ufw)  nftables=$(systemctl is-enabled nftables 2>/dev/null || echo unknown)"
 
 echo "== flows =="
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$EGRESS_PROBE" 2>/dev/null)

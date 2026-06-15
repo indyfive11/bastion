@@ -11,7 +11,7 @@ Prerequisites: L0 (base table holds the ai_* sets), L1 (the reconciler that appl
 """
 from __future__ import annotations
 
-from .base import Layer, Context, LayerStatus, HealthCheck
+from .base import Layer, Context, LayerStatus, HealthCheck, nft_set_health
 
 AI_USER = "edge-ai"
 TIMER = "edge-ai.timer"
@@ -110,7 +110,7 @@ class L3AiAnalysis(Layer):
             HealthCheck("backend.conf present", sys.exists("/etc/edge-ai/backend.conf")),
             HealthCheck("intent.schema.json present", sys.exists("/etc/edge-ai/intent.schema.json")),
             HealthCheck("edge-ai.service installed", sys.exists("/etc/systemd/system/edge-ai.service")),
-            HealthCheck("ai_block set present", sys.nft_set_exists(family, table, "ai_block")),
+            nft_set_health(sys, "ai_block set present", family, table, "ai_block"),
         ]
 
     # --- helpers ----------------------------------------------------------

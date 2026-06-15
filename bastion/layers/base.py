@@ -73,6 +73,22 @@ class HealthCheck:
     name: str
     ok: bool
     detail: str = ""
+    unknown: bool = False   # could not be determined (e.g. nft query needs root) — not a failure
+
+
+def nft_table_health(sys: System, name: str, family: str, table: str) -> HealthCheck:
+    """Health check for a loaded nft table, honest about non-root: on a live host without
+    root, `nft list` is denied and would read as a false FAIL — report it as unknown instead."""
+    if sys.is_live and not sys.is_root:
+        return HealthCheck(name, False, "needs root to verify", unknown=True)
+    return HealthCheck(name, sys.nft_table_exists(family, table))
+
+
+def nft_set_health(sys: System, name: str, family: str, table: str, set_name: str) -> HealthCheck:
+    """Like nft_table_health for an nft set within a table (see its note on non-root)."""
+    if sys.is_live and not sys.is_root:
+        return HealthCheck(name, False, "needs root to verify", unknown=True)
+    return HealthCheck(name, sys.nft_set_exists(family, table, set_name))
 
 
 @dataclass

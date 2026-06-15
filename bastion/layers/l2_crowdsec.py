@@ -11,7 +11,7 @@ Prerequisites: L0 (base table holds `cs_block`), L1 (the reconciler that populat
 """
 from __future__ import annotations
 
-from .base import Layer, Context, LayerStatus, HealthCheck
+from .base import Layer, Context, LayerStatus, HealthCheck, nft_set_health
 
 UNIT = "crowdsec.service"
 
@@ -84,7 +84,7 @@ class L2Crowdsec(Layer):
             HealthCheck("crowdsec.service enabled", sys.unit_enabled(UNIT)),
             HealthCheck("edge-reconciler present (bouncer)",
                         sys.exists(f"{ctx.sbin_dir}/edge-reconciler")),
-            HealthCheck("cs_block set present", sys.nft_set_exists(family, table, "cs_block")),
+            nft_set_health(sys, "cs_block set present", family, table, "cs_block"),
         ]
 
     # --- helpers ----------------------------------------------------------
