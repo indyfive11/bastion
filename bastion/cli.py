@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import templates, state
 from . import layers as layermod
-from .layers.base import Context
+from .layers.base import Context, FirewallConflict
 from .system import System
 
 # Templates that are pure examples / have no managed destination — skipped by generate's
@@ -236,7 +236,11 @@ def cmd_layer(args: argparse.Namespace) -> int:
             return 1
         if args.action == "install":
             _install_layer_packages(ctx, layer)
-        getattr(layer, args.action)(ctx)
+        try:
+            getattr(layer, args.action)(ctx)
+        except FirewallConflict as exc:
+            print(f"{args.name}: ABORT — {exc}", file=sys.stderr)
+            return 1
         return 0
     return 2
 

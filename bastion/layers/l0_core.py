@@ -3,7 +3,8 @@ bastion-recovery service. Foundation for every profile; prerequisite of all othe
 """
 from __future__ import annotations
 
-from .base import Layer, Context, LayerStatus, HealthCheck
+from .base import (Layer, Context, LayerStatus, HealthCheck,
+                   FirewallConflict, blocking_conflicting_firewall)
 
 
 class L0Core(Layer):
@@ -34,6 +35,14 @@ class L0Core(Layer):
     # --- lifecycle --------------------------------------------------------
     def install(self, ctx: Context) -> None:
         sys = ctx.system
+
+        # SAFETY: never load our ruleset (it begins with `flush ruleset`) while another OS firewall
+        # is active — it would wipe ufw/firewalld's rules and the two would fight. Abort with an
+        # instruction; the operator disables the other firewall (or sets the override env var).
+        if sys.is_live:
+            fw = blocking_conflicting_firewall(sys)
+            if fw:
+                raise FirewallConflict(fw)
 
         # Packages are checked, not installed, until pkg.py (Phase 5). Surface what's missing.
         missing = [p for p in ("nft", "sshd") if not sys.command_exists(p)]

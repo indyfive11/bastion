@@ -545,11 +545,25 @@ class Wizard:
     def _install_step(self, config: dict, mode: str) -> tuple[list[str], list[str]]:
         """§10 step 7. Live root install → batch-install packages, then run each active layer's
         install(); dry-run / --root staging → preview the package plan only (non-mutating)."""
+        from ..layers import base as layerbase
+        fw = layerbase.blocking_conflicting_firewall(self.sys) if self.sys.is_live else None
+
         if self.dry_run or not self.sys.is_live:
-            return self._package_plan(config, mode), []
+            notes = []
+            if fw:
+                self.out(f"  NOTE: {fw} is active — bastion's ruleset would flush it. Disable it "
+                         f"(`sudo systemctl disable --now {fw}`) before a live install.")
+                notes.append(f"{fw} active — disable before a live install (its rules would be flushed).")
+            return self._package_plan(config, mode), notes
+
+        # SAFETY: refuse the live install while another OS firewall governs — bastion's L0 ruleset
+        # begins with `flush ruleset` and would wipe it. Abort step 7 with the fix; nothing live runs.
+        if fw:
+            self.out(f"  ABORT — {layerbase.firewall_conflict_message(fw)}")
+            return [], [f"install skipped: {fw} is active and would be flushed by bastion's ruleset "
+                        f"— disable it (`sudo systemctl disable --now {fw}`) and re-run `sudo bastion setup`."]
 
         from .. import cli
-        from ..layers import base as layerbase
         from .. import layers as layermod
         notes: list[str] = []
         ctx = layerbase.Context(system=self.sys, config=config,

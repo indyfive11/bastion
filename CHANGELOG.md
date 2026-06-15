@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-06-14
+
+### Fixed
+
+- **Refuse to flush an active OS firewall.** bastion's nftables ruleset begins with
+  `flush ruleset`, so installing the core firewall (via `bastion setup` or
+  `bastion layer install l0`) while **ufw** or **firewalld** was active would have wiped
+  that firewall's rules and left the two fighting. Setup and L0 install now detect an
+  active ufw/firewalld and abort with instructions to disable it first. Override with
+  `BASTION_ALLOW_FIREWALL_TAKEOVER=1` if you really want bastion to take over.
+
 ## [1.0.1] - 2026-06-14
 
 ### Fixed

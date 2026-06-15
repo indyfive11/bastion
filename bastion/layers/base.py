@@ -7,11 +7,51 @@ this interface; nothing layer-specific leaks into the CLI.
 from __future__ import annotations
 
 import abc
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..system import System
 from .. import templates as tmpl
+
+
+# Firewalls that manage the same kernel netfilter hooks bastion does. bastion's nft ruleset begins
+# with `flush ruleset`, so loading it while one of these is ACTIVE would wipe that firewall's rules
+# and the two would then fight — the live ruleset load (L0) must gate on this.
+CONFLICTING_FIREWALLS = ("ufw", "firewalld")
+FIREWALL_TAKEOVER_ENV = "BASTION_ALLOW_FIREWALL_TAKEOVER"
+
+
+def firewall_conflict_message(fw: str) -> str:
+    return (f"{fw} is active. bastion's ruleset begins with `flush ruleset`, which would wipe "
+            f"{fw}'s rules — the two firewalls would then fight. Disable it first:\n"
+            f"    sudo systemctl disable --now {fw}\n"
+            f"  then re-run. To let bastion take over anyway, set {FIREWALL_TAKEOVER_ENV}=1.")
+
+
+class FirewallConflict(Exception):
+    """A conflicting OS firewall (ufw/firewalld) is active and bastion would otherwise flush it.
+    The active firewall's name is in ``.firewall``."""
+    def __init__(self, firewall: str):
+        self.firewall = firewall
+        super().__init__(firewall_conflict_message(firewall))
+
+
+def active_conflicting_firewall(system: System) -> str | None:
+    """Name of a conflicting OS firewall (ufw/firewalld) currently active, else None. Meaningful
+    only on a live host — a staged ``--root`` install loads no ruleset."""
+    for fw in CONFLICTING_FIREWALLS:
+        if system.unit_active(fw):
+            return fw
+    return None
+
+
+def blocking_conflicting_firewall(system: System) -> str | None:
+    """The active conflicting firewall that should BLOCK a live ruleset load, or None — None when
+    none is active OR the operator set ``BASTION_ALLOW_FIREWALL_TAKEOVER=1`` to override the guard."""
+    if os.environ.get(FIREWALL_TAKEOVER_ENV):
+        return None
+    return active_conflicting_firewall(system)
 
 
 @dataclass
