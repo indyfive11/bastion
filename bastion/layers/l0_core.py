@@ -14,7 +14,11 @@ class L0Core(Layer):
     prerequisites = ()
     packages = ("nftables", "openssh")
     scripts = ("bastion-recovery",)
-    units = ("bastion-recovery.service",)
+    # bastion-recovery.service is installed but NEVER auto-enabled (console-start only).
+    # bastion-recovery-reap.service IS enabled (install() below): it runs once at boot to tear down
+    # a recovery surface orphaned by an unclean reboot — the only recovery unit that is auto-enabled.
+    units = ("bastion-recovery.service", "bastion-recovery-reap.service")
+    REAP_UNIT = "bastion-recovery-reap.service"
 
     # --- mode-dependent pieces -------------------------------------------
     def _nft_template(self, ctx: Context) -> str:
@@ -94,6 +98,12 @@ class L0Core(Layer):
 
         if sys.is_live:
             sys.run("systemctl", "daemon-reload")
+            # Enable the boot reaper so an orphaned rescue surface (rescue user + NOPASSWD sudoers
+            # left by a crash mid-recovery) is torn down on the next boot. This is the one recovery
+            # unit that is auto-enabled; bastion-recovery.service itself stays disabled.
+            if sys.run("systemctl", "enable", self.REAP_UNIT).returncode != 0:
+                print(f"l0: WARNING — could not enable {self.REAP_UNIT} (boot orphan reaper); "
+                      "an unclean reboot mid-recovery would not be auto-cleaned")
             # Validate, then load the base ruleset via nftables.service as the canonical loader (now
             # pinned to /etc/nftables.conf by the drop-in above) so the load persists across reboot
             # and `systemctl is-active nftables` truthfully reports firewall state. `restart` (not
@@ -120,6 +130,7 @@ class L0Core(Layer):
         sys = ctx.system
         if sys.is_live:
             sys.run("systemctl", "stop", "bastion-recovery")
+            sys.run("systemctl", "disable", "--now", self.REAP_UNIT)
             # Stop persisting our ruleset (install() enabled it) so the flushed table is not
             # reloaded from /etc/nftables.conf on the next boot.
             sys.run("systemctl", "disable", "nftables")
@@ -148,6 +159,7 @@ class L0Core(Layer):
             "policy.allowlist": sys.exists("/etc/edge-reconciler/policy.allowlist"),
             "bastion-recovery script": sys.exists(f"{ctx.sbin_dir}/bastion-recovery"),
             "bastion-recovery.service": sys.exists("/etc/systemd/system/bastion-recovery.service"),
+            "bastion-recovery-reap.service": sys.exists(f"/etc/systemd/system/{self.REAP_UNIT}"),
         }
         installed = all(artifacts.values())
         family, table = self._nft_table(ctx)

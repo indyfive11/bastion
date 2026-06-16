@@ -12,7 +12,7 @@
 #   edge-ctl accept <id>            # mark a proposal reviewed+accepted (you enact it manually)
 #   edge-ctl reject <id>            # dismiss a proposal from the pending queue
 #
-import hashlib, json, os, subprocess, sys, time
+import fcntl, hashlib, json, os, subprocess, sys, time
 
 # The kill switch must reach BOTH families. The v4 sets are MANDATORY (always present once L0 is
 # installed) — their flush failing is a real fault. The `…6` siblings are flushed too, but a node
@@ -49,6 +49,32 @@ PROPOSALS= "/var/lib/edge-ai/proposals.jsonl"
 RESOLVED = "/var/lib/edge-ai/proposals-resolved.jsonl"   # accept/reject decisions (sidecar)
 AUDIT    = "/var/log/edge-reconciler/audit.jsonl"
 TIMER    = "edge-ai.timer"
+
+# 0.4 — shared kill-switch lock. panic / ai-disable / rollback flush the ai_* sets and clear the
+# spool; edge-reconciler takes LOCK_EX on the SAME file around a reconcile pass, so the reconciler
+# can never re-add (from a half-read spool) the elements we just flushed. Same path + env override
+# as edge-reconciler. Best-effort: if the lock can't be taken, the kill switch STILL runs (it must
+# never be blocked by a lock problem) — it just loses the interleave guarantee for that invocation.
+LOCK_FILE = os.environ.get("BASTION_RECONCILE_LOCK", "/run/edge-reconciler.lock")
+
+class kill_switch_lock:
+    def __enter__(self):
+        self.fd = None
+        try:
+            self.fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except OSError as e:
+            print(f"warn: kill-switch lock unavailable ({e}) — proceeding unlocked", file=sys.stderr)
+            if self.fd is not None:
+                os.close(self.fd); self.fd = None
+        return self
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+        return False
 
 def ensure_root():
     if os.geteuid() != 0:
@@ -314,6 +340,10 @@ def cmd_proposal_resolve(pid, disposition):
         print("  reminder: enact the change manually — bastion never auto-applies base/access changes.")
     return 0
 
+def _locked(fn, *args):
+    with kill_switch_lock():
+        return fn(*args)
+
 def main():
     ensure_root()
     args = sys.argv[1:]
@@ -321,12 +351,14 @@ def main():
         print(__doc__); return 0
     c = args[0]
     if c == "status":    return cmd_status()
-    if c == "panic":     return cmd_panic()
-    if c == "ai-disable":return cmd_ai_disable()
+    # The set-mutating verbs run under the shared lock so a concurrent reconcile pass can't
+    # re-add what they flush (0.4). ai-enable only arms the timer (no set writes) — no lock.
+    if c == "panic":     return _locked(cmd_panic)
+    if c == "ai-disable":return _locked(cmd_ai_disable)
     if c == "ai-enable": return cmd_ai_enable()
     if c == "rollback":
         if len(args) < 2: print("usage: edge-ctl rollback <id>"); return 1
-        return cmd_rollback(args[1])
+        return _locked(cmd_rollback, args[1])
     if c == "proposals": return cmd_proposals()
     if c in ("accept", "reject"):
         if len(args) < 2: print(f"usage: edge-ctl {c} <id>"); return 1

@@ -1,0 +1,17 @@
+[Unit]
+Description=bastion recovery boot reaper (removes an orphaned rescue surface after an unclean reboot)
+Documentation=file:/usr/local/sbin/bastion-recovery
+# The runtime dir /run/bastion-recovery is on tmpfs (cleared every boot); the rescue user +
+# NOPASSWD sudoers drop-in are on disk. If recovery did not stop cleanly (crash/power-loss while a
+# window was open), only the on-disk surface survives the reboot — an orphaned root backdoor. This
+# reaps it early in boot. Needs /etc + /home mounted; no other ordering required.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bastion-recovery reap
+
+[Install]
+# Unlike bastion-recovery.service (deliberately never enabled), the reaper MUST run on every boot —
+# L0 enables it. Its job only ever matters after an unclean shutdown; otherwise it is a no-op.
+WantedBy=multi-user.target

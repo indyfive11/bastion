@@ -1086,6 +1086,7 @@ class Wizard:
         if mgr is None:
             self.out("  " + self._no_manager_msg(pkgs))
             return pkgs
+        mgr.refresh(self.sys)        # sync the package DB once before the batch (fresh apt cache)
         res = mgr.install(self.sys, pkgs)
         if not res.command and not res.unavailable:
             self.out(f"  packages already present ({len(pkgs)}).")

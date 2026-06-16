@@ -84,6 +84,12 @@ do_start() {
       || { log "FATAL: could not create recovery user"; exit 1; }
   fi
   printf '%s:%s\n' "$RECOVERY_USER" "$otp" | chpasswd
+  # Defense-in-depth backstop (0.1): the self-destruct timer + the boot reaper are the primary
+  # teardown paths, but if BOTH somehow fail to run, a date-based account expiry still caps how
+  # long an orphaned rescue account can be used. The window is seconds (chage granularity is days),
+  # so expire at tomorrow — coarse, but it guarantees the account can't be logged into indefinitely.
+  # do_stop/destruct removes the user outright; this only matters if neither ever runs.
+  chage -E "$(date -d 'tomorrow' +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)" "$RECOVERY_USER" 2>/dev/null || true
   printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$RECOVERY_USER" > /etc/sudoers.d/bastion-recovery
   chmod 440 /etc/sudoers.d/bastion-recovery
 
@@ -145,6 +151,22 @@ do_stop() {
   [ "${1:-}" = quiet ] || log "recovery stopped: override table removed, recovery sshd down, OTP user revoked. Main firewall unaffected."
 }
 
+# ---- reap (boot-time orphan cleanup) --------------------------------------
+# Run once at boot by bastion-recovery-reap.service. $RUN lives on tmpfs and is GONE after any
+# reboot, but the privileged surface recovery creates — the bastion-rescue user and
+# /etc/sudoers.d/bastion-recovery (NOPASSWD: ALL) — persists on disk. So "$RUN absent but that
+# on-disk surface present" means recovery did NOT stop cleanly: a crash/power-loss mid-window left
+# an orphaned root backdoor. Tear it down. A clean boot (recovery was never active, or it stopped
+# normally) leaves nothing matching, so this is a safe no-op.
+do_reap() {
+  [ "$(id -u)" -eq 0 ] || { log "reap: must run as root"; exit 1; }
+  if [ ! -d "$RUN" ] && { [ -f /etc/sudoers.d/bastion-recovery ] || id "$RECOVERY_USER" >/dev/null 2>&1; }; then
+    log "boot reaper: orphaned recovery surface found (no $RUN after reboot) — tearing it down"
+    do_stop quiet
+    log "boot reaper: orphaned recovery surface removed (sudoers drop-in + ephemeral user revoked)"
+  fi
+}
+
 # ---- extend / status ------------------------------------------------------
 do_extend() {
   [ -d "$RUN" ] || { log "recovery is not active"; exit 1; }
@@ -164,5 +186,6 @@ case "${1:-start}" in
   stop)   do_stop ;;
   extend) do_extend ;;
   status) do_status ;;
-  *) echo "usage: bastion-recovery {start|stop|extend|status}" >&2; exit 2 ;;
+  reap)   do_reap ;;
+  *) echo "usage: bastion-recovery {start|stop|extend|status|reap}" >&2; exit 2 ;;
 esac

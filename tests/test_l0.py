@@ -122,6 +122,27 @@ def test_l0_install_enables_nftables_for_persistence(tmp_path):
     assert ("systemctl", "restart", "nftables") in sysobj.calls
 
 
+def test_l0_install_enables_boot_reaper(tmp_path):
+    # 0.1: the boot reaper must be enabled so an orphaned rescue surface (rescue user + NOPASSWD
+    # sudoers left by a crash mid-recovery) is torn down on the next boot.
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    assert ("systemctl", "enable", "bastion-recovery-reap.service") in sysobj.calls
+    assert (tmp_path / "etc/systemd/system/bastion-recovery-reap.service").is_file()
+
+
+def test_l0_uninstall_disables_boot_reaper(tmp_path):
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    layers.get("l0").uninstall(ctx)
+    assert ("systemctl", "disable", "--now", "bastion-recovery-reap.service") in sysobj.calls
+    assert not (tmp_path / "etc/systemd/system/bastion-recovery-reap.service").exists()
+
+
 def test_l0_install_pins_nftables_loader_path(tmp_path):
     # Cross-distro fix: a systemd drop-in pins nftables.service to load /etc/nftables.conf, so the
     # ruleset loads on Fedora/RHEL too (their stock unit reads /etc/sysconfig/nftables.conf).

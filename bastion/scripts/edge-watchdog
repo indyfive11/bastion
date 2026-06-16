@@ -26,6 +26,8 @@ set -u
 RUN=/run/edge-watchdog
 CONF=/etc/edge-watchdog
 SNAP=/var/lib/net-safe/snapshot
+NFT_CONF=${NFT_CONF:-/etc/nftables.conf}          # static ruleset reloaded by heal_light (test seam)
+RECOVERY_RUN=${RECOVERY_RUN:-/run/bastion-recovery} # bastion-recovery's runtime dir (test seam)
 mkdir -p "$RUN"
 
 POLL=${POLL:-30}
@@ -197,7 +199,25 @@ dns_leak_watch(){
 # ---------- heals (graduated) ----------
 heal_light(){   # cheapest: atomic reload of the governing firewall's config (re-adds relay rules)
   if nft list table inet edge >/dev/null 2>&1 || [ -f "$SNAP/fw-nftables-active" ]; then
-    nft -f /etc/nftables.conf 2>/dev/null && log "heal: reloaded edge nft config" || log "heal: nft reload FAILED"
+    # $NFT_CONF begins with `flush ruleset`. A plain `nft -f $NFT_CONF` would therefore ALSO wipe
+    # two things the static file does not own: the live `inet bastion_recovery` table (severing
+    # emergency SSH at the worst possible moment — mid-recovery) and the managed blocklist sets
+    # (cs_block/blk_feed/ai_*), leaving the node unprotected until the next reconcile (≤ a full
+    # interval). Avoid both: if recovery is active, fold its current table definition into the SAME
+    # atomic transaction so it survives the flush; then immediately kick the reconciler to refill
+    # the managed sets rather than waiting for the timer.
+    local script rec
+    script=$(cat "$NFT_CONF" 2>/dev/null) || { log "heal: cannot read $NFT_CONF — reload skipped"; return; }
+    if [ -e "$RECOVERY_RUN" ] && rec=$(nft -s list table inet bastion_recovery 2>/dev/null) && [ -n "$rec" ]; then
+      script="$script"$'\n'"$rec"
+    fi
+    if printf '%s\n' "$script" | nft -f - 2>/dev/null; then
+      log "heal: reloaded edge nft config (recovery table preserved; repopulating managed sets)"
+      systemctl start edge-reconciler.service >/dev/null 2>&1 \
+        || /usr/local/sbin/edge-reconciler >/dev/null 2>&1 || true
+    else
+      log "heal: nft reload FAILED"
+    fi
   else
     /usr/local/sbin/net-rollback edge-watchdog-light >/dev/null 2>&1 && log "heal: net-rollback (ufw relay ensure)"
   fi

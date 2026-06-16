@@ -381,6 +381,10 @@ class _FakeMgr:
 
     def __init__(self):
         self.installed = None
+        self.refreshed = False
+
+    def refresh(self, sysd, *, force=False):
+        self.refreshed = True
 
     def install(self, sysd, pkgs):
         from bastion.setup.pkg import InstallResult

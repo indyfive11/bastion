@@ -19,7 +19,7 @@
 # Modes:  edge-reconciler            -> one reconcile pass (driven by .timer)
 #         edge-reconciler --dry-run  -> compute + audit decisions, do NOT touch nft
 #
-import ipaddress, json, subprocess, sys, time, os
+import fcntl, ipaddress, json, subprocess, sys, time, os
 
 # Base table holding the managed sets. Edge mode -> `inet edge`; endpoint mode -> `inet bastion`.
 # Sourced from /etc/bastion/machine.env (NFT_TABLE) via the unit's EnvironmentFile; the generic
@@ -52,8 +52,38 @@ AI_MIN_PREFIX = {4: 24, 6: 64}     # shared by the single-pass AI source (feeds 
 
 DRYRUN = "--dry-run" in sys.argv[1:]
 
+# 0.4 — a shared advisory lock serializes a reconcile pass against the operator kill switch
+# (edge-ctl panic / ai-disable / rollback). Without it, this 60s-timer pass can re-add to the ai_*
+# sets the very elements panic just flushed: it reads the spool, panic then clears the spool AND
+# flushes the sets, and this pass writes the now-stale desired-state back. edge-ctl takes LOCK_EX
+# on the SAME path, so a flush and a reconcile can never interleave. The path is overridable for
+# tests; kept under /run (tmpfs, root-only) in production.
+LOCK_FILE = os.environ.get("BASTION_RECONCILE_LOCK", "/run/edge-reconciler.lock")
+
 def log(msg):
     sys.stderr.write(f"edge-reconciler: {msg}\n")
+
+class reconcile_lock:
+    """Best-effort exclusive lock. If it can't be taken (no /run, unprivileged test run), proceed
+    UNLOCKED rather than fail — the lock hardens a race against the kill switch; it is not required
+    for the correctness of a single pass in isolation."""
+    def __enter__(self):
+        self.fd = None
+        try:
+            self.fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except OSError as e:
+            log(f"WARNING: reconcile lock unavailable ({e}) -- proceeding unlocked")
+            if self.fd is not None:
+                os.close(self.fd); self.fd = None
+        return self
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+        return False
 
 def load_allowlist():
     nets = []
@@ -284,6 +314,14 @@ def audit(record):
         log(f"audit write failed: {e}")
 
 def main():
+    # A live pass mutates nft sets + reads the spool — serialize it against the kill switch.
+    # A dry-run writes nothing (no race), so it runs lock-free to stay quiet/unprivileged-safe.
+    if DRYRUN:
+        return _run_reconcile()
+    with reconcile_lock():
+        return _run_reconcile()
+
+def _run_reconcile():
     allow = load_allowlist()
     summary = {"dry_run": DRYRUN, "sets": {}}
     # AI source feeds 3 sets from ONE spool -> read it once, partition by action.

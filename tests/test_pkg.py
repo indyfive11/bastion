@@ -196,6 +196,36 @@ def test_apt_available_argv():
     assert pkg.Apt()._available_argv("crowdsec") == ["apt-cache", "show", "crowdsec"]
 
 
+def _refresh_calls(sys_):
+    return [c for c in sys_.calls if c[:2] in (("pacman", "-Sy"), ("apt-get", "update"))
+            or c[:2] == ("dnf", "-q")]
+
+
+def test_refresh_syncs_db_once_per_process():
+    # 0.5: a fresh Debian apt cache is empty → install fails outright unless we sync first.
+    pkg._REFRESHED.clear()
+    m, sys_ = pkg.Apt(), FakeSystem(set(), live=True)
+    m.refresh(sys_)
+    assert ("apt-get", "update") in sys_.calls
+    # idempotent within a run: a second refresh (e.g. next layer in the loop) is a no-op.
+    before = len(sys_.calls)
+    m.refresh(sys_)
+    assert len(sys_.calls) == before
+
+
+def test_refresh_noop_when_not_live():
+    pkg._REFRESHED.clear()
+    m, sys_ = pkg.Pacman(), FakeSystem(set(), live=False)
+    m.refresh(sys_)
+    assert _refresh_calls(sys_) == []
+
+
+def test_refresh_argv_per_manager():
+    assert pkg.Pacman()._refresh_argv()[:2] == ["pacman", "-Sy"]
+    assert pkg.Apt()._refresh_argv() == ["apt-get", "update"]
+    assert pkg.Dnf()._refresh_argv()[:2] == ["dnf", "-q"]
+
+
 def test_pacman_declares_crowdsec_repo_unavailable():
     # C5: pacman statically flags crowdsec as not-in-repos (AUR-only) so the wizard can warn at
     # layer-selection time. apt makes no such claim (crowdsec IS packaged on Debian/Ubuntu).

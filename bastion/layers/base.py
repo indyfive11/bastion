@@ -11,6 +11,25 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+def atomic_write_text(out: Path, text: str) -> None:
+    """Write ``text`` to ``out`` atomically: render to a temp file in the same directory,
+    fsync it, then ``os.replace`` into place. A crash or power-loss mid-write can then never
+    leave a truncated file on disk — the destination is either the old contents or the complete
+    new contents. Critical for /etc/nftables.conf, which the pinned nftables.service loads
+    verbatim at boot: a half-written ruleset is a fail-open firewall. Mirrors state.write_conf."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.tmp")
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
 from ..system import System
 from .. import templates as tmpl
 
@@ -129,8 +148,7 @@ class Layer(abc.ABC):
         """Render a template against machine.conf and write it under the system root."""
         src = ctx.templates_dir / template_rel
         out = ctx.system.path(dest)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(tmpl.render_file(src, ctx.config))
+        atomic_write_text(out, tmpl.render_file(src, ctx.config))
 
     def install_script(self, ctx: Context, name: str) -> None:
         src = ctx.scripts_dir / name

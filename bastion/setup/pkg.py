@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 
 from ..system import System
 
+# Managers whose package DB has already been refreshed this process (by name), so a multi-layer
+# install loop (setup l0..l6, or repeated `layer install`) syncs once, not per layer.
+_REFRESHED: set[str] = set()
+
 
 @dataclass
 class InstallResult:
@@ -47,6 +51,11 @@ class PackageManager:
         return self._NAME_MAP.get(pkg, pkg)
 
     # --- to be overridden ---
+    def _refresh_argv(self) -> list[str] | None:
+        """argv that re-syncs this manager's package DB, or None if it self-refreshes.
+        Overridden per distro."""
+        return None
+
     def _query_argv(self, pkg: str) -> list[str]:
         raise NotImplementedError
 
@@ -69,6 +78,25 @@ class PackageManager:
     def is_available(self, sys: System, pkg: str) -> bool:
         """True if the manager can install `pkg` from its repos right now (db assumed synced)."""
         return sys.run(*self._available_argv(self.translate(pkg))).returncode == 0
+
+    def refresh(self, sys: System, *, force: bool = False) -> None:
+        """Re-sync the package DB once per process before installing. On a fresh Debian/Ubuntu the
+        apt cache is empty, so `apt-get install nftables` fails outright and `is_available()` also
+        misreports off the stale/empty cache. One idempotent sync up front fixes both. No-op when
+        not live (staged/dry-run), when already done this run, or when the manager self-refreshes.
+        A sync failure (e.g. no network) is non-fatal — the existing cache may still satisfy the
+        install — so it warns rather than raising."""
+        if not sys.is_live or force is False and self.name in _REFRESHED:
+            return
+        argv = self._refresh_argv()
+        if argv is None:
+            _REFRESHED.add(self.name)
+            return
+        rc = sys.run(*argv, capture=False).returncode
+        if rc != 0:
+            print(f"  warning: `{' '.join(argv)}` failed (rc={rc}) — proceeding with the existing "
+                  "package cache; install may fail if it is empty/stale")
+        _REFRESHED.add(self.name)
 
     def missing(self, sys: System, pkgs) -> list[str]:
         """Subset of pkgs not already installed (preserves order, de-duplicates)."""
@@ -108,6 +136,9 @@ class Pacman(PackageManager):
     name = "pacman"
     repo_unavailable = ("crowdsec",)   # AUR-only on Arch — never in a sync repo
 
+    def _refresh_argv(self) -> list[str]:
+        return ["pacman", "-Sy", "--noconfirm"]
+
     def _query_argv(self, pkg: str) -> list[str]:
         return ["pacman", "-Q", pkg]
 
@@ -134,6 +165,9 @@ class Apt(PackageManager):
         "conntrack-tools": "conntrack", # the `conntrack` CLI ships in Debian's `conntrack` package
     }
 
+    def _refresh_argv(self) -> list[str]:
+        return ["apt-get", "update"]
+
     def _query_argv(self, pkg: str) -> list[str]:
         return ["dpkg", "-s", pkg]
 
@@ -159,6 +193,9 @@ class Dnf(PackageManager):
         "python": "python3",            # Fedora ships the interpreter as python3
         "openssh": "openssh-server",    # Fedora splits client (openssh-clients) / server
     }
+
+    def _refresh_argv(self) -> list[str]:
+        return ["dnf", "-q", "makecache"]
 
     def _query_argv(self, pkg: str) -> list[str]:
         return ["rpm", "-q", pkg]              # 0 iff installed (rpm ships on every dnf system)

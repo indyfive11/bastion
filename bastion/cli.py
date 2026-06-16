@@ -216,6 +216,7 @@ def _install_layer_packages(ctx: Context, layer) -> None:
             print(f"  {layer.name}: no supported package manager detected — ensure installed: "
                   f"{', '.join(pkgs)}")
         return
+    mgr.refresh(ctx.system)        # sync the package DB once per run (no-op if already synced)
     res = mgr.install(ctx.system, pkgs)
     if not res.command and not res.unavailable:
         print(f"  {layer.name}: packages already present ({', '.join(pkgs)})")
