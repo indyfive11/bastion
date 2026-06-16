@@ -10,6 +10,18 @@ DNS_UPSTREAM=${DNS_UPSTREAM:-}         # local stub resolver, host#port (e.g. 12
 EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
 MODE=${MODE:-edge}                     # edge | endpoint — endpoint skips edge-only flows (relay/WG/local-DNS)
 
+# need <bin>... — B4 preflight: exit early with a clear message naming any missing required
+# command, instead of failing obscurely mid-run. Reports to stderr + journal.
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  printf 'bastion %s: missing required command(s):%s — install them and re-run\n' "${0##*/}" "$miss" >&2
+  command -v logger >/dev/null 2>&1 && logger -t bastion "${0##*/}: missing required command(s):$miss"
+  exit 1
+}
+# curl drives every egress/flow probe; without it the checks below would all FAIL misleadingly.
+need curl
+
 pass=0; fail=0
 ck(){ if eval "$2" >/dev/null 2>&1; then echo "  PASS  $1"; pass=$((pass+1)); else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
 

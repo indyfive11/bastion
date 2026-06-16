@@ -99,13 +99,16 @@ Notes:
 
 - Linux with **nftables**
 - **Python ≥ 3.11**
-- **`pacman` or `apt`** (used to install layer packages during setup)
+- **`pacman`, `apt`, or `dnf`** (used to install layer packages during setup)
 - **root** for any live install (loading nft rules, installing systemd units, installing packages)
 
 > **Distro support.** Arch (and Arch-based) is the **primary, regularly-tested** target.
-> Debian/Ubuntu (`apt`) is supported but less exercised — report issues. **Fedora/RHEL-family
-> (`dnf`) is detected but not yet driven**: setup will tell you so and list the packages to
-> install by hand. systemd is assumed throughout.
+> Debian/Ubuntu (`apt`) and Fedora/RHEL-family (`dnf`) are supported but less exercised — report
+> issues. Package-name differences across distros are handled automatically (e.g. `python` →
+> `python3`, `openssh` → `openssh-server`). A package only in a third-party repo (e.g. CrowdSec on
+> Debian/Fedora, or AUR on Arch) is reported with an install hint rather than installed for you.
+> Another manager (e.g. openSUSE's `zypper`) is detected and named, but setup will list its
+> packages to install by hand. systemd is assumed throughout.
 
 ## Install
 

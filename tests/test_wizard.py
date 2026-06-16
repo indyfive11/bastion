@@ -71,6 +71,25 @@ def test_profile_layers_table():
     assert wizard.profile_mode("custom") is None
 
 
+def test_prereq_warn_flags_crowdsec_on_arch_when_l2_selected():
+    # C5: a profile that includes L2 on a pacman host warns up front that crowdsec is AUR-only.
+    lines = []
+    wiz = wizard.Wizard(edge_system(), dry_run=True, out=lines.append, assume_defaults=True)
+    d = detect.detect(edge_system())
+    wiz._prereq_warn("full-edge", d)         # full-edge => layers include l2 (crowdsec)
+    joined = "\n".join(lines)
+    assert "crowdsec" in joined and "AUR" in joined
+
+
+def test_prereq_warn_silent_when_l2_not_selected():
+    # No L2 in the profile => nothing to warn about (minimal-endpoint = l0,l1,l6).
+    lines = []
+    wiz = wizard.Wizard(edge_system(), dry_run=True, out=lines.append, assume_defaults=True)
+    d = detect.detect(edge_system())
+    wiz._prereq_warn("minimal-endpoint", d)
+    assert not any("crowdsec" in l for l in lines)
+
+
 def test_build_machine_conf_edge_overlays_detection():
     base = state.load_conf(EXAMPLE)
     d = detect.detect(edge_system())

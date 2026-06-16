@@ -32,6 +32,30 @@ class L0Core(Layer):
         # edge template defines `table inet edge`; endpoint defines `table inet bastion`.
         return ("inet", "bastion") if ctx.mode == "endpoint" else ("inet", "edge")
 
+    # nftables.service ExecStart override — pins the canonical loader to /etc/nftables.conf so the
+    # bastion ruleset loads on every distro (Fedora/RHEL otherwise read /etc/sysconfig/nftables.conf).
+    NFT_DROPIN = "/etc/systemd/system/nftables.service.d/10-bastion-load.conf"
+
+    @staticmethod
+    def _nft_path(sys) -> str:
+        """Absolute path to the nft binary for a systemd ExecStart (which can't use PATH)."""
+        for cand in ("/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"):
+            if sys.exists(cand):
+                return cand
+        return "/usr/sbin/nft"            # sane default (staging trees have no nft)
+
+    def _write_nft_loader_dropin(self, ctx: Context) -> None:
+        nft = self._nft_path(ctx.system)
+        out = ctx.system.path(self.NFT_DROPIN)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "# bastion (L0): load the ruleset bastion renders, independent of the distro's default\n"
+            "# nftables.conf path (Arch/Debian: /etc/nftables.conf; Fedora/RHEL: /etc/sysconfig/...).\n"
+            "[Service]\n"
+            "ExecStart=\n"
+            f"ExecStart={nft} -f /etc/nftables.conf\n"
+        )
+
     # --- lifecycle --------------------------------------------------------
     def install(self, ctx: Context) -> None:
         sys = ctx.system
@@ -60,18 +84,28 @@ class L0Core(Layer):
         for unit in self.units:
             self.install_unit(ctx, unit)
 
+        # Pin nftables.service to load the file we just wrote. Its default ExecStart path is
+        # distro-specific — Arch/Debian load /etc/nftables.conf, but Fedora/RHEL load
+        # /etc/sysconfig/nftables.conf — so enabling the stock service on Fedora "succeeds" yet
+        # never loads our ruleset. The drop-in makes the canonical loader read /etc/nftables.conf
+        # everywhere (and persist it across reboot). Written even when staged so a later live
+        # `systemctl enable` honours it.
+        self._write_nft_loader_dropin(ctx)
+
         if sys.is_live:
             sys.run("systemctl", "daemon-reload")
-            # Validate, then load the base ruleset by enabling nftables.service as the canonical
-            # loader. Its ExecStart is `nft -f /etc/nftables.conf` — the exact file we just wrote —
-            # so `enable --now` both loads it now AND persists it across reboot (without this the
-            # ruleset is lost on the next boot and nothing reloads it), and makes
-            # `systemctl is-active nftables` a truthful report of firewall state. Fall back to a
-            # direct (non-persistent) load only if the service is unavailable.
+            # Validate, then load the base ruleset via nftables.service as the canonical loader (now
+            # pinned to /etc/nftables.conf by the drop-in above) so the load persists across reboot
+            # and `systemctl is-active nftables` truthfully reports firewall state. `restart` (not
+            # just `enable --now`) because a reinstall finds the oneshot already active and `start`
+            # would NOT re-run ExecStart — restart guarantees the pinned loader runs now. Fall back
+            # to a direct (non-persistent) load only if the service can't be driven.
             conf = str(sys.path("/etc/nftables.conf"))
             if sys.run("nft", "-c", "-f", conf).returncode == 0:
-                if sys.run("systemctl", "enable", "--now", "nftables").returncode != 0:
-                    print("l0: WARNING — could not enable nftables.service; loading the ruleset "
+                enabled = sys.run("systemctl", "enable", "nftables").returncode == 0
+                loaded = sys.run("systemctl", "restart", "nftables").returncode == 0
+                if not (enabled and loaded):
+                    print("l0: WARNING — could not drive nftables.service; loading the ruleset "
                           "directly (it will NOT persist across reboot)")
                     sys.run("nft", "-f", conf)
             else:
@@ -91,6 +125,15 @@ class L0Core(Layer):
             sys.run("systemctl", "disable", "nftables")
             family, table = self._nft_table(ctx)
             sys.run("nft", "delete", "table", family, table)
+        # Remove the nftables.service loader drop-in (restores the distro's default ExecStart).
+        drop = sys.path(self.NFT_DROPIN)
+        drop.unlink(missing_ok=True)
+        try:
+            drop.parent.rmdir()              # only succeeds if we left it empty
+        except OSError:
+            pass
+        if sys.is_live:
+            sys.run("systemctl", "daemon-reload")
         for unit in self.units:
             p = sys.path(f"/etc/systemd/system/{unit}")
             p.unlink(missing_ok=True)

@@ -210,8 +210,8 @@ def _install_layer_packages(ctx: Context, layer) -> None:
         unsupported = pkgmod.unsupported_present(ctx.system)
         if unsupported:
             print(f"  {layer.name}: {unsupported} is detected but not yet supported by bastion "
-                  "(supported: Arch/pacman, Debian-Ubuntu/apt) — install these manually, then "
-                  f"re-run: {', '.join(pkgs)}")
+                  "(supported: Arch/pacman, Debian-Ubuntu/apt, Fedora-RHEL/dnf) — install these "
+                  f"manually, then re-run: {', '.join(pkgs)}")
         else:
             print(f"  {layer.name}: no supported package manager detected — ensure installed: "
                   f"{', '.join(pkgs)}")

@@ -29,12 +29,17 @@ class FakeSystem(System):
 
     def run(self, *args, capture=True):
         self.calls.append(args)
-        # query forms: ("pacman","-Q",pkg) / ("dpkg","-s",pkg)
-        if args[:2] in (("pacman", "-Q"), ("dpkg", "-s")):
+        # query forms: ("pacman","-Q",pkg) / ("dpkg","-s",pkg) / ("rpm","-q",pkg)
+        if args[:2] in (("pacman", "-Q"), ("dpkg", "-s"), ("rpm", "-q")):
             return subprocess.CompletedProcess(args, 0 if args[2] in self._installed else 1, "", "")
-        # availability forms: ("pacman","-Si",pkg) / ("apt-cache","show",pkg)
+        # availability forms: ("pacman","-Si",pkg) / ("apt-cache","show",pkg) / ("dnf","-q","info",pkg)
+        avail_pkg = None
         if args[:2] in (("pacman", "-Si"), ("apt-cache", "show")):
-            ok = self._available is None or args[2] in self._available
+            avail_pkg = args[2]
+        elif args[:3] == ("dnf", "-q", "info"):
+            avail_pkg = args[3]
+        if avail_pkg is not None:
+            ok = self._available is None or avail_pkg in self._available
             return subprocess.CompletedProcess(args, 0 if ok else 1, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -42,22 +47,25 @@ class FakeSystem(System):
 def test_detect_manager_by_binary():
     assert pkg.detect_manager(FakeSystem(set(), have=("pacman",))).name == "pacman"
     assert pkg.detect_manager(FakeSystem(set(), have=("apt-get",))).name == "apt"
+    assert pkg.detect_manager(FakeSystem(set(), have=("dnf",))).name == "dnf"
     assert pkg.detect_manager(FakeSystem(set(), have=())) is None
 
 
 def test_detect_manager_explicit_name_wins():
     # apt named explicitly even though only pacman binary is present.
     assert pkg.detect_manager(FakeSystem(set(), have=("pacman",)), "apt").name == "apt"
+    assert pkg.detect_manager(FakeSystem(set(), have=("pacman",)), "dnf").name == "dnf"
 
 
-def test_unsupported_present_names_dnf():
-    # Fedora-style box: dnf is the only manager → no supported manager, but it's recognized
+def test_unsupported_present_names_recognized_but_unimplemented():
+    # openSUSE-style box: zypper is the only manager → no supported manager, but it's recognized
     # as detected-but-unimplemented (clean message), not "no package manager at all".
-    fedora = FakeSystem(set(), have=("dnf",))
-    assert pkg.detect_manager(fedora) is None
-    assert pkg.unsupported_present(fedora) == "Fedora/RHEL-family (dnf)"
-    # A supported box returns None (nothing unsupported to flag).
+    suse = FakeSystem(set(), have=("zypper",))
+    assert pkg.detect_manager(suse) is None
+    assert pkg.unsupported_present(suse) == "openSUSE (zypper)"
+    # A supported box (incl. the now-driven dnf) returns None — nothing unsupported to flag.
     assert pkg.unsupported_present(FakeSystem(set(), have=("pacman",))) is None
+    assert pkg.unsupported_present(FakeSystem(set(), have=("dnf",))) is None
 
 
 def test_get_manager_unknown_raises():
@@ -79,7 +87,47 @@ def test_pacman_install_argv_and_missing():
 def test_apt_query_and_install_argv():
     m = pkg.Apt()
     assert m._query_argv("curl") == ["dpkg", "-s", "curl"]
-    assert m._install_argv(["curl", "unbound"]) == ["apt-get", "install", "-y", "curl", "unbound"]
+    argv = m._install_argv(["curl", "unbound"])
+    # Non-interactive + keep-existing-conffile (so a pre-written /etc/nftables.conf doesn't trigger
+    # a dpkg conffile prompt that fails the unattended install).
+    assert argv[:3] == ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get"]
+    assert "--force-confold" in " ".join(argv) and "--force-confdef" in " ".join(argv)
+    assert argv[-2:] == ["curl", "unbound"]
+
+
+def test_dnf_query_available_and_install_argv():
+    m = pkg.Dnf()
+    assert m._query_argv("curl") == ["rpm", "-q", "curl"]
+    assert m._available_argv("curl") == ["dnf", "-q", "info", "curl"]
+    assert m._install_argv(["curl", "unbound"]) == ["dnf", "install", "-y", "curl", "unbound"]
+
+
+def test_dnf_install_translates_names_and_skips_present():
+    # python (already present as python3) is filtered; openssh translates to openssh-server.
+    m = pkg.Dnf()
+    sys = FakeSystem({"python3"}, live=True)            # rpm -q python3 -> installed
+    res = m.install(sys, ["python", "openssh"])
+    assert res.missing == ["openssh"]                   # python(->python3) already present
+    assert ("dnf", "install", "-y", "openssh-server") in sys.calls
+
+
+def test_translate_maps_are_per_manager():
+    # Arch is identity; apt/dnf remap the names the layers can't share verbatim.
+    assert pkg.Pacman().translate("python") == "python"
+    assert pkg.Pacman().translate("conntrack-tools") == "conntrack-tools"
+    assert pkg.Apt().translate("python") == "python3"
+    assert pkg.Apt().translate("openssh") == "openssh-server"
+    assert pkg.Apt().translate("conntrack-tools") == "conntrack"
+    assert pkg.Apt().translate("nftables") == "nftables"          # unmapped -> identity
+    assert pkg.Dnf().translate("python") == "python3"
+    assert pkg.Dnf().translate("openssh") == "openssh-server"
+    assert pkg.Dnf().translate("conntrack-tools") == "conntrack-tools"  # Fedora keeps this name
+
+
+def test_install_command_applies_translation():
+    # install_command must emit the TRANSLATED names (what the package db actually knows).
+    assert pkg.Apt().install_command(["openssh", "python", "conntrack-tools"])[-3:] == \
+        ["openssh-server", "python3", "conntrack"]
 
 
 def test_install_only_missing_when_live():
@@ -146,3 +194,10 @@ def test_pacman_unavailable_hint_points_at_aur():
 
 def test_apt_available_argv():
     assert pkg.Apt()._available_argv("crowdsec") == ["apt-cache", "show", "crowdsec"]
+
+
+def test_pacman_declares_crowdsec_repo_unavailable():
+    # C5: pacman statically flags crowdsec as not-in-repos (AUR-only) so the wizard can warn at
+    # layer-selection time. apt makes no such claim (crowdsec IS packaged on Debian/Ubuntu).
+    assert "crowdsec" in pkg.Pacman().repo_unavailable
+    assert pkg.Apt().repo_unavailable == ()

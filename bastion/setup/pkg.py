@@ -1,13 +1,13 @@
 """Package-manager abstraction for the installer (§10 step 7, §14 Phase 5).
 
-Phase 5 targets pacman + apt (the founding document's stated scope); the base class makes a
-third manager (dnf) a trivial add later. Every install is idempotent — the underlying commands
-(`pacman -S --needed`, `apt-get install`) are safe to re-run, satisfying Commandment #4.
+Drives pacman (Arch), apt (Debian/Ubuntu) and dnf (Fedora/RHEL-family). Every install is
+idempotent — the underlying commands (`pacman -S --needed`, `apt-get install`, `dnf install`)
+are safe to re-run, satisfying Commandment #4.
 
 Nothing here runs during a dry-run: `install()` returns the command it WOULD run and executes
-only when `dry_run=False` and the system is live. Package-name differences across distros are a
-known follow-up (the gate is a clean Arch VM); `translate()` is the per-manager hook for it and
-defaults to identity today.
+only when `dry_run=False` and the system is live. Package names differ across distros (the layers
+declare the Arch-canonical name); `translate()` is the per-manager remap hook — each manager
+carries a `_NAME_MAP` for the few that differ and is identity for the rest.
 """
 from __future__ import annotations
 
@@ -30,9 +30,21 @@ class PackageManager:
     """Base class. Subclasses set `name` and the query/install argv builders."""
     name = "auto"
 
+    # Packages known NOT to live in this manager's standard repositories, so `install()` can never
+    # resolve them (e.g. crowdsec is AUR-only on Arch). Declared statically so the wizard can warn
+    # at LAYER-SELECTION time — before a live probe — that the operator must install them out of
+    # band; bastion never builds them itself (Commandment #5). A live `is_available()` probe stays
+    # the authority at install time; this is the up-front, db-sync-independent heads-up.
+    repo_unavailable: tuple[str, ...] = ()
+
+    # Per-distro package-name overrides: generic (Arch-canonical) name -> this distro's name. The
+    # layer declarations use Arch names, so non-pacman managers remap the few that differ (e.g.
+    # `python` -> `python3`). Identity for anything not listed.
+    _NAME_MAP: dict[str, str] = {}
+
     def translate(self, pkg: str) -> str:
-        """Map a generic package name to this distro's name. Identity by default."""
-        return pkg
+        """Map a generic (Arch-canonical) package name to this distro's name. Identity by default."""
+        return self._NAME_MAP.get(pkg, pkg)
 
     # --- to be overridden ---
     def _query_argv(self, pkg: str) -> list[str]:
@@ -94,6 +106,7 @@ class PackageManager:
 
 class Pacman(PackageManager):
     name = "pacman"
+    repo_unavailable = ("crowdsec",)   # AUR-only on Arch — never in a sync repo
 
     def _query_argv(self, pkg: str) -> list[str]:
         return ["pacman", "-Q", pkg]
@@ -114,6 +127,12 @@ class Pacman(PackageManager):
 
 class Apt(PackageManager):
     name = "apt"
+    # Debian/Ubuntu names that differ from the Arch-canonical ones the layers declare.
+    _NAME_MAP = {
+        "python": "python3",            # Arch `python` is py3; Debian splits it as python3
+        "openssh": "openssh-server",    # Arch `openssh` bundles client+server; Debian splits them
+        "conntrack-tools": "conntrack", # the `conntrack` CLI ships in Debian's `conntrack` package
+    }
 
     def _query_argv(self, pkg: str) -> list[str]:
         return ["dpkg", "-s", pkg]
@@ -122,18 +141,44 @@ class Apt(PackageManager):
         return ["apt-cache", "show", pkg]      # 0 iff pkg is a known apt target
 
     def _install_argv(self, pkgs: list[str]) -> list[str]:
-        return ["apt-get", "install", "-y", *pkgs]
+        # Non-interactive AND keep any conffile bastion already wrote. l0 renders /etc/nftables.conf
+        # (step 6) BEFORE the nftables package installs (step 7); its postinst would otherwise raise
+        # a conffile prompt ("nftables.conf [Y/I/N/...]?") that an unattended `apt-get -y` cannot
+        # answer — it fails the whole run (rc 100) and leaves the package half-configured (iU).
+        # --force-confold keeps the existing (bastion's) file; --force-confdef suppresses the prompt.
+        return ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                "-o", "Dpkg::Options::=--force-confold", "-o", "Dpkg::Options::=--force-confdef",
+                *pkgs]
 
 
-_MANAGERS: dict[str, type[PackageManager]] = {"pacman": Pacman, "apt": Apt}
+class Dnf(PackageManager):
+    name = "dnf"
+    # Fedora/RHEL-family names that differ from the Arch-canonical ones (conntrack-tools,
+    # wireguard-tools, dnsmasq, unbound, nftables, curl all keep their names on Fedora).
+    _NAME_MAP = {
+        "python": "python3",            # Fedora ships the interpreter as python3
+        "openssh": "openssh-server",    # Fedora splits client (openssh-clients) / server
+    }
+
+    def _query_argv(self, pkg: str) -> list[str]:
+        return ["rpm", "-q", pkg]              # 0 iff installed (rpm ships on every dnf system)
+
+    def _available_argv(self, pkg: str) -> list[str]:
+        return ["dnf", "-q", "info", pkg]      # 0 iff dnf can resolve pkg from an enabled repo
+
+    def _install_argv(self, pkgs: list[str]) -> list[str]:
+        return ["dnf", "install", "-y", *pkgs]
+
+
+_MANAGERS: dict[str, type[PackageManager]] = {"pacman": Pacman, "apt": Apt, "dnf": Dnf}
 
 # Package managers bastion can DETECT but does not yet drive. When one of these is the only
-# manager present (e.g. Fedora/RHEL-family ships dnf), the installer surfaces a clear
-# "not yet supported" message instead of a generic "no package manager found" — so the
-# operator knows their distro is recognized, just unimplemented. Adding a manager = move it
-# into _MANAGERS with a PackageManager subclass.
+# manager present, the installer surfaces a clear "not yet supported" message instead of a
+# generic "no package manager found" — so the operator knows their distro is recognized, just
+# unimplemented. Adding a manager = move it into _MANAGERS with a PackageManager subclass.
 UNSUPPORTED_BINARIES: tuple[tuple[str, str], ...] = (
-    ("dnf", "Fedora/RHEL-family (dnf)"),
+    ("zypper", "openSUSE (zypper)"),
+    ("apk", "Alpine (apk)"),
 )
 
 
@@ -162,7 +207,7 @@ def detect_manager(sys: System, name: str | None = None) -> PackageManager | Non
     Returns None if nothing is recognized (caller decides how to warn)."""
     if name and name in _MANAGERS:
         return _MANAGERS[name]()
-    for binary, mgr in (("pacman", "pacman"), ("apt-get", "apt")):
+    for binary, mgr in (("pacman", "pacman"), ("apt-get", "apt"), ("dnf", "dnf")):
         if sys.command_exists(binary):
             return _MANAGERS[mgr]()
     return None

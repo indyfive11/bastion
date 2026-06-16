@@ -6,6 +6,18 @@
 # Override the feed list by setting DNSBLOCK_SOURCES (space-separated URLs) in machine.env.
 set -u
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+
+# need <bin>... — B4 preflight: exit early with a clear message naming any missing required
+# command, instead of failing obscurely mid-run. Reports to stderr + journal.
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  printf 'bastion %s: missing required command(s):%s — install them and re-run\n' "${0##*/}" "$miss" >&2
+  command -v logger >/dev/null 2>&1 && logger -t bastion "${0##*/}: missing required command(s):$miss"
+  exit 1
+}
+# curl fetches the feeds; unbound-checkconf validates before reload (this is an L4/unbound tool).
+need curl unbound-checkconf
 OUT=/etc/unbound/blocklist.conf
 DEFAULT_SOURCES="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 read -r -a SOURCES <<< "${DNSBLOCK_SOURCES:-$DEFAULT_SOURCES}"

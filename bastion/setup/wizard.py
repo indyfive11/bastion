@@ -424,6 +424,7 @@ class Wizard:
         # 3. PROFILE
         out("\n[3/8] Profile")
         profile = self.overrides.get("profile") or self._select_profile(mode)
+        self._prereq_warn(profile, d)
 
         # 4. LAYER CONFIGURATION (essential machine.conf values; user confirms detected ones)
         out("\n[4/8] Layer configuration")
@@ -521,6 +522,25 @@ class Wizard:
         chosen = default if self.assume_defaults else self._choose("Select profile", opts, default)
         self.out(f"  layers: {PROFILE_LAYERS.get(chosen, '(custom — select in machine.conf)')}")
         return chosen
+
+    def _prereq_warn(self, profile: str, d: detectmod.Detection) -> None:
+        """C5: surface packages the host's package manager cannot resolve from its repos (e.g.
+        crowdsec is AUR-only on Arch, pulled in by L2) at PROFILE-selection time — before the
+        operator invests the rest of the wizard — rather than only as an `unavailable` package
+        at the install step. bastion never builds such packages itself (Commandment #5)."""
+        layers_str = PROFILE_LAYERS.get(profile)
+        if not layers_str:
+            return   # custom: active layers aren't known yet; the install step still surfaces this
+        layer_ids = [l.strip() for l in layers_str.split(",") if l.strip()]
+        mgr = pkgmod.detect_manager(self.sys, d.pkg_manager)
+        if mgr is None:
+            return
+        blocked = [p for p in self._packages_for_layers(layer_ids)
+                   if p in getattr(mgr, "repo_unavailable", ())]
+        if blocked:
+            self.out(f"  NOTE: {mgr.unavailable_hint(blocked)}")
+            self.out("  The rest of the firewall installs and runs without them; install the "
+                     "above, then enable the affected layer.")
 
     def _load_existing_conf(self) -> dict | None:
         """The machine.conf already on the box (root-prefixed for --root staging), or None. Used by
@@ -841,9 +861,14 @@ class Wizard:
 
     def _active_packages(self, config: dict) -> list[str]:
         """De-duplicated package set required by the active layers, in layer order."""
+        return self._packages_for_layers(self._active_layer_ids(config))
+
+    @staticmethod
+    def _packages_for_layers(layer_ids) -> list[str]:
+        """De-duplicated package set declared by the given layer ids, in the given order."""
         from .. import layers as layermod
         wanted: list[str] = []
-        for lid in self._active_layer_ids(config):
+        for lid in layer_ids:
             layer = layermod.get(lid)
             if layer:
                 wanted += list(getattr(layer, "packages", ()))
@@ -1043,13 +1068,13 @@ class Wizard:
 
     def _no_manager_msg(self, pkgs: list[str]) -> str:
         """Message when no supported package manager resolved. Names a detected-but-unsupported
-        manager (e.g. Fedora's dnf) explicitly so the operator knows it's unimplemented, not absent.
-        Supported managers today: pacman (Arch) and apt (Debian/Ubuntu)."""
+        manager (e.g. openSUSE's zypper) explicitly so the operator knows it's unimplemented, not
+        absent. Supported managers today: pacman (Arch), apt (Debian/Ubuntu), dnf (Fedora/RHEL)."""
         unsupported = pkgmod.unsupported_present(self.sys)
         if unsupported:
             return (f"{unsupported} is detected but not yet supported by bastion "
-                    "(supported: Arch/pacman, Debian-Ubuntu/apt) — install these manually, "
-                    f"then re-run: {', '.join(pkgs)}")
+                    "(supported: Arch/pacman, Debian-Ubuntu/apt, Fedora-RHEL/dnf) — install these "
+                    f"manually, then re-run: {', '.join(pkgs)}")
         return f"no supported package manager — ensure installed: {', '.join(pkgs)}"
 
     def _batch_install_packages(self, config: dict) -> list[str]:

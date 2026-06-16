@@ -111,13 +111,40 @@ def test_l0_install_no_conflict_proceeds(tmp_path):
 
 
 def test_l0_install_enables_nftables_for_persistence(tmp_path):
-    # The ruleset must survive a reboot: L0 enables nftables.service (whose ExecStart reloads
-    # /etc/nftables.conf) rather than only loading it once with `nft -f`.
+    # The ruleset must survive a reboot: L0 enables nftables.service (persist) and restarts it so
+    # the pinned ExecStart loads /etc/nftables.conf NOW, even on a reinstall where the oneshot is
+    # already active (`start` would not re-run ExecStart).
     sysobj = _FwSys(tmp_path, active_fw=None)
     ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
                   templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
     layers.get("l0").install(ctx)
-    assert ("systemctl", "enable", "--now", "nftables") in sysobj.calls
+    assert ("systemctl", "enable", "nftables") in sysobj.calls
+    assert ("systemctl", "restart", "nftables") in sysobj.calls
+
+
+def test_l0_install_pins_nftables_loader_path(tmp_path):
+    # Cross-distro fix: a systemd drop-in pins nftables.service to load /etc/nftables.conf, so the
+    # ruleset loads on Fedora/RHEL too (their stock unit reads /etc/sysconfig/nftables.conf).
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    drop = tmp_path / "etc/systemd/system/nftables.service.d/10-bastion-load.conf"
+    assert drop.is_file()
+    body = drop.read_text()
+    assert "ExecStart=\n" in body                       # reset before re-setting (systemd idiom)
+    assert "-f /etc/nftables.conf" in body
+
+
+def test_l0_uninstall_removes_loader_dropin(tmp_path):
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    drop = tmp_path / "etc/systemd/system/nftables.service.d/10-bastion-load.conf"
+    assert drop.is_file()
+    layers.get("l0").uninstall(ctx)
+    assert not drop.exists()
 
 
 def test_l0_uninstall_disables_nftables(tmp_path):

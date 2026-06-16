@@ -21,6 +21,15 @@ RECOVERY_USER=bastion-rescue
 DESTRUCT_UNIT=bastion-recovery-destruct
 log(){ logger -t bastion-recovery "$*" 2>/dev/null; printf 'bastion-recovery: %s\n' "$*" >&2; }
 
+# need <bin>... — B4 preflight: exit early with a clear message naming any missing required
+# command, instead of failing obscurely mid-run. Reports via log() (journal + stderr).
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  log "missing required command(s):$miss — install them and re-run"
+  exit 1
+}
+
 # ---- detection helpers ----------------------------------------------------
 detect_ssh_ports() {
   local ports
@@ -43,6 +52,9 @@ arm_destruct() {
 # ---- start ----------------------------------------------------------------
 do_start() {
   [ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
+  # Preflight the tools the recovery surface is built from, BEFORE we create any of it — a missing
+  # one mid-flow would leave a half-built privileged surface for the cleanup trap to tear down.
+  need sshd useradd chpasswd nft ss
   mkdir -p "$RUN"; chmod 700 "$RUN"
 
   # CLEANUP TRAP: from here on we create a privileged surface (OTP user + NOPASSWD-ALL sudoers +

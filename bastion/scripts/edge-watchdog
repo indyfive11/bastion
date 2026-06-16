@@ -49,6 +49,19 @@ EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints
 EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
 MODE=${MODE:-edge}                            # edge | endpoint — endpoint never rolls back (no edge config to repair)
 
+# need <bin>... — B4 preflight: exit early with a clear message naming any missing required
+# command, instead of failing obscurely mid-run. Reports to stderr + journal.
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  printf 'bastion %s: missing required command(s):%s — install them and re-run\n' "${0##*/}" "$miss" >&2
+  command -v logger >/dev/null 2>&1 && logger -t bastion "${0##*/}: missing required command(s):$miss"
+  exit 1
+}
+# The self-heal loop is inert without these: nft (firewall reload), ip (carrier/route), curl
+# (egress probe), ping (gateway/external reachability). Fail fast so the journal names the gap.
+need nft ip curl ping
+
 log(){ logger -t edge-watchdog "$*"; }
 # alert(): FULL detail to local journal; external push (only if configured) is GENERIC.
 alert(){

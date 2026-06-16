@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-06-15
+
+Multi-distro support: Fedora/RHEL (`dnf`) is now driven, and the Debian/Ubuntu
+(`apt`) path is validated on real hardware alongside Arch. Two cross-distro
+firewall/install defects found during live validation are fixed, plus operational
+robustness in the shell scripts and the setup wizard. Validated live on Arch,
+Debian 12, and Fedora 42.
+
+### Added
+
+- **Fedora/RHEL-family (`dnf`) is now a driven package manager**, joining `pacman`
+  and `apt`. Package-name differences across distros are handled automatically
+  (e.g. `python` → `python3`, `openssh` → `openssh-server`, and on Debian
+  `conntrack-tools` → `conntrack`) via a per-manager translation map. A package
+  that lives only in a third-party repository (CrowdSec on Debian/Fedora, AUR on
+  Arch) is reported with an install hint instead of being installed for you.
+- **Up-front missing-dependency preflight in the operational scripts.** The
+  `edge-*`/`net-*`/`flowcheck`/`bastion-recovery` scripts now name any required
+  command that is missing and exit cleanly, instead of failing obscurely partway
+  through.
+- **Earlier CrowdSec prerequisite notice.** When a profile includes the CrowdSec
+  layer on a distro where it is not in the standard repositories, setup says so at
+  profile selection rather than at install time.
+
+### Fixed
+
+- **The firewall ruleset now loads on Fedora/RHEL.** Their `nftables.service`
+  loads `/etc/sysconfig/nftables.conf`, not `/etc/nftables.conf`, so enabling the
+  stock service silently failed to load bastion's ruleset. A systemd drop-in now
+  pins the loader to the file bastion writes, on every distro and across reboots.
+- **Package installation no longer fails on Debian/Ubuntu.** Because bastion writes
+  `/etc/nftables.conf` before the `nftables` package installs, the package's
+  post-install step raised a configuration-file prompt that an unattended `apt`
+  run could not answer, aborting the install. The install now runs non-interactively
+  and keeps bastion's configuration file.
+
 ## [1.1.0] - 2026-06-15
 
 A large feature release: full IPv6 parity for the threat-intel layer, a terminal

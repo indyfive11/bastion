@@ -9,6 +9,18 @@ set -u
 OUT="${STATE_DIRECTORY:-/var/lib/edge-feed}/blk_feed.list"
 TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
 
+# need <bin>... — B4 preflight: exit early with a clear message naming any missing required
+# command, instead of failing obscurely mid-run. Reports to stderr + journal.
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  printf 'bastion %s: missing required command(s):%s — install them and re-run\n' "${0##*/}" "$miss" >&2
+  command -v logger >/dev/null 2>&1 && logger -t bastion "${0##*/}: missing required command(s):$miss"
+  exit 1
+}
+# Without curl every feed fetch fails — surface the real cause, not "all feeds failed".
+need curl
+
 FEEDS=(
   "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
   "https://www.spamhaus.org/drop/drop.txt"
