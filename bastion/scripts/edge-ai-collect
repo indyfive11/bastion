@@ -195,11 +195,18 @@ def main():
     with open(tmp, "w") as f:
         json.dump(doc, f, separators=(",", ":"))
     os.replace(tmp, OUT)
-    # make readable by the edge-ai user (root writes it; analyzer reads it)
+    # D5: restrict to root + the edge-ai group (the analyzer runs as edge-ai) instead of
+    # world-readable 0644. signals.json is sanitized, but it still need not be readable by every
+    # local account. Fall back to 0644 only if the edge-ai group is absent (analyzer must still read).
     try:
-        os.chmod(OUT, 0o644)
-    except OSError:
-        pass
+        import grp
+        os.chown(OUT, -1, grp.getgrnam("edge-ai").gr_gid)
+        os.chmod(OUT, 0o640)
+    except (OSError, KeyError):
+        try:
+            os.chmod(OUT, 0o644)
+        except OSError:
+            pass
     log(f"wrote {len(observations)} observations -> {OUT}")
     print(json.dumps({"observations": len(observations),
                       "already_acted": {k: len(v) for k, v in doc["already_acted"].items()}}))

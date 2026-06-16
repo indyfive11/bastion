@@ -215,6 +215,9 @@ heal_light(){   # cheapest: atomic reload of the governing firewall's config (re
       log "heal: reloaded edge nft config (recovery table preserved; repopulating managed sets)"
       systemctl start edge-reconciler.service >/dev/null 2>&1 \
         || /usr/local/sbin/edge-reconciler >/dev/null 2>&1 || true
+      # C1: the reload recreated the main table fresh, dropping recovery's main-table reachability
+      # accept. If a recovery window is open, re-punch it (the override table was folded back above).
+      [ -e "$RECOVERY_RUN" ] && /usr/local/sbin/bastion-recovery reassert >/dev/null 2>&1 || true
     else
       log "heal: nft reload FAILED"
     fi

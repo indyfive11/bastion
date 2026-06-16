@@ -23,7 +23,20 @@ need(){ local b miss=''
 need curl
 
 pass=0; fail=0
-ck(){ if eval "$2" >/dev/null 2>&1; then echo "  PASS  $1"; pass=$((pass+1)); else echo "  FAIL  $1"; fail=$((fail+1)); fi; }
+# ck <desc> <cmd> [args...] — run the check command DIRECTLY (C5). The old form `eval "$2"`
+# interpolated machine.env values (DNS_UPSTREAM/RELAY_IF/LAN_IP) into a shell string it then
+# eval'd, so a stray metachar in any of those root-written values was a root command-injection.
+# Each check is now a function that reads those values as plain variables (passed as data to
+# wg/grep/ss, never re-parsed by the shell).
+ck(){ local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then echo "  PASS  $desc"; pass=$((pass+1)); else echo "  FAIL  $desc"; fail=$((fail+1)); fi
+}
+_ck_cloudflare(){ curl -s -o /dev/null --max-time 8 https://www.cloudflare.com; }
+_ck_getent(){ getent hosts github.com; }
+_ck_dns_stub(){ dns_q "$stub_host" "$stub_port" cloudflare.com | grep -E '^[0-9]+\.'; }
+_ck_relay_fresh(){ local a n; a=$(sudo -n wg show "$RELAY_IF" latest-handshakes 2>/dev/null | awk '{print $2}'); n=$(date +%s 2>/dev/null || echo 0); [ -n "$a" ] && [ "$a" -gt 0 ] && [ $((n-a)) -lt 180 ]; }
+_ck_wg_present(){ sudo -n wg show "$WG_SERVER_IF"; }
+_ck_lan_dns(){ ss -uln | grep -q "${LAN_IP}:53"; }
 
 # DNS query helper — prints A records, rc 0 on an answer. Uses whichever resolver tool is present:
 # dig (bind-tools), drill (ldns — shipped as an unbound dependency on Arch, so reliably there where
@@ -93,8 +106,8 @@ echo "  ufw=$(systemctl is-active ufw)  nftables=$(systemctl is-enabled nftables
 echo "== flows =="
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$EGRESS_PROBE" 2>/dev/null)
 [ "$code" = "404" -o "$code" = "200" ] && { echo "  PASS  egress->$EGRESS_PROBE (HTTP $code)"; pass=$((pass+1)); } || { echo "  FAIL  egress->$EGRESS_PROBE (HTTP ${code:-none})"; fail=$((fail+1)); }
-ck "egress->Cloudflare (independent path check)" 'curl -s -o /dev/null --max-time 8 https://www.cloudflare.com'
-ck "DNS resolves (getent)" 'getent hosts github.com'
+ck "egress->Cloudflare (independent path check)" _ck_cloudflare
+ck "DNS resolves (getent)" _ck_getent
 # Local stub resolver: dnsmasq forwards to a loopback stub (unbound on 127.0.0.1#5335 in the
 # reference edge profile). Probe the CONFIGURED host#port — querying 127.0.0.1:53 finds nothing
 # (dnsmasq listens on LAN_IP:53, unbound on :5335). Only when the upstream is a loopback stub;
@@ -110,8 +123,7 @@ stub_port=${DNS_UPSTREAM##*#}; [ "$stub_port" = "$DNS_UPSTREAM" ] && stub_port=5
 case "$stub_host" in
   127.*|::1)
     [ -n "$DNS_TOOL" ] && \
-      ck "DNS via local stub (${DNS_TOOL##*/} -p ${stub_port} @${stub_host})" \
-         'dns_q '"$stub_host"' '"$stub_port"' cloudflare.com | grep -E "^[0-9]+\."'
+      ck "DNS via local stub (${DNS_TOOL##*/} -p ${stub_port} @${stub_host})" _ck_dns_stub
     # host's own resolver must not bypass the local chain (ISP-DNS leak guard)
     if leak=$(resolv_leak); then
       echo "  FAIL  host resolver leak — /etc/resolv.conf points at$leak (bypasses local chain)"; fail=$((fail+1))
@@ -120,9 +132,9 @@ case "$stub_host" in
     fi
     ;;
 esac
-[ -n "$RELAY_IF" ] && ck "relay handshake fresh (<180s)" 'a=$(sudo -n wg show '"$RELAY_IF"' latest-handshakes 2>/dev/null | awk "{print \$2}"); n=$(date +%s 2>/dev/null || echo 0); [ -n "$a" ] && [ "$a" -gt 0 ] && [ $((n-a)) -lt 180 ]'
-[ -n "$WG_SERVER_IF" ] && ck "WireGuard server iface present" 'sudo -n wg show '"$WG_SERVER_IF"
-[ -n "$LAN_IP" ] && ck "local DNS listening ${LAN_IP}:53" 'ss -uln | grep -q "'"$LAN_IP"':53"'
+[ -n "$RELAY_IF" ] && ck "relay handshake fresh (<180s)" _ck_relay_fresh
+[ -n "$WG_SERVER_IF" ] && ck "WireGuard server iface present" _ck_wg_present
+[ -n "$LAN_IP" ] && ck "local DNS listening ${LAN_IP}:53" _ck_lan_dns
 fi
 
 echo "== summary: $pass pass / $fail fail =="

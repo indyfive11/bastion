@@ -60,4 +60,4 @@ def test_noop_while_recovery_active(tmp_path):
 def test_script_dispatches_reap_subcommand():
     body = SCRIPT.read_text()
     assert "reap)   do_reap ;;" in body
-    assert "{start|stop|extend|status|reap}" in body
+    assert "{start|stop|extend|status|reap|reassert}" in body   # +reassert (C1)

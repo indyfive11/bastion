@@ -10,7 +10,9 @@ Key invariants (founding document §3 #8, §8):
 from __future__ import annotations
 
 import configparser
+import ipaddress
 import os
+import re
 from pathlib import Path
 
 # Standard search order for a real machine.conf (system install, then user install).
@@ -134,6 +136,66 @@ ENV_MAP: tuple[tuple[str, str, str], ...] = (
     ("RECOVERY_WINDOW_SECONDS", "recovery", "window_seconds"),
     ("RECOVERY_TRY_PORT_22", "recovery", "try_port_22"),
 )
+
+
+_IFACE_RE = re.compile(r"[A-Za-z0-9._@:-]+")
+
+
+def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[str]]:
+    """Type-check the machine.conf values that get spliced into the nft ruleset / machine.env (A1).
+
+    Returns ``(errors, warnings)``. Errors are malformed values that would produce a broken or
+    invalid ruleset (a bad CIDR, a non-numeric port, an over-long interface name) and should block
+    ``generate``. Warnings are valid-but-dangerous values (a default-route LAN that opens the
+    SSH/service accepts to the whole internet) — surfaced, not blocked. Empty/absent fields are
+    fine (the templates and scripts fall back); only present values are checked."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    def _get(section: str, key: str) -> str:
+        return (config.get(section, {}).get(key) or "").strip()
+
+    mode = config.get("machine", {}).get("mode", "edge")
+    if mode not in ("edge", "endpoint"):
+        errors.append(f"[machine] mode={mode!r} — must be 'edge' or 'endpoint'")
+
+    ssh = _get("ports", "ssh")
+    if ssh and not (ssh.isdigit() and 1 <= int(ssh) <= 65535):
+        errors.append(f"[ports] ssh={ssh!r} — must be an integer 1–65535")
+
+    for key in ("lan_cidr", "zt_cidr", "wg_server_cidr"):
+        val = _get("network", key)
+        if not val:
+            continue
+        try:
+            net = ipaddress.ip_network(val, strict=False)
+        except ValueError:
+            errors.append(f"[network] {key}={val!r} — not a valid CIDR")
+            continue
+        if net.prefixlen == 0:
+            warnings.append(f"[network] {key}={val} is a default route — the rules keyed on it "
+                            "accept from the ENTIRE internet (e.g. SSH exposed world-wide)")
+
+    for key in ("lan_ip", "gateway"):
+        val = _get("network", key)
+        if val:
+            try:
+                ipaddress.ip_address(val)
+            except ValueError:
+                errors.append(f"[network] {key}={val!r} — not a valid IP address")
+
+    for part in (p.strip() for p in _get("network", "trusted_hosts").split(",") if p.strip()):
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            errors.append(f"[network] trusted_hosts entry {part!r} — not a valid IP/CIDR")
+
+    for key in ("lan", "wan", "zt_iface", "wg_vps_iface", "wg_server_iface"):
+        val = _get("interfaces", key)
+        if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):
+            errors.append(f"[interfaces] {key}={val!r} — not a valid interface name (<=15 chars)")
+
+    return errors, warnings
 
 
 def _shell_quote(value: str) -> str:

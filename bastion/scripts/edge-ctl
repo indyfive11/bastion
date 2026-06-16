@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # edge-ctl — operator control + human kill switch for the AI firewall layer.
-# Fixed-purpose ROOT tool (granted via /etc/sudoers.d/edge-ctl). Self-re-execs under sudo.
+# Fixed-purpose ROOT tool. Run it as root, or as a sudo-capable operator (it re-execs under sudo:
+# interactively when it has a TTY, `sudo -n` when it does not, so it never hangs on a prompt in a
+# UI/automation context). There is NO dedicated sudoers grant — it relies on your own sudo rights.
 # It ONLY touches the ai_* sets / the edge-ai timer / the spool — never the base firewall.
 #
 #   edge-ctl status                 # timer state, ai_* set counts, last analysis, recent audit
@@ -12,7 +14,7 @@
 #   edge-ctl accept <id>            # mark a proposal reviewed+accepted (you enact it manually)
 #   edge-ctl reject <id>            # dismiss a proposal from the pending queue
 #
-import fcntl, hashlib, json, os, subprocess, sys, time
+import fcntl, hashlib, ipaddress, json, os, subprocess, sys, time
 
 # The kill switch must reach BOTH families. The v4 sets are MANDATORY (always present once L0 is
 # installed) — their flush failing is a real fault. The `…6` siblings are flushed too, but a node
@@ -76,9 +78,29 @@ class kill_switch_lock:
                 os.close(self.fd)
         return False
 
+def _norm_net(cidr):
+    """Canonical `ip_network` form of an address/CIDR ("1.2.3.4" -> "1.2.3.4/32",
+    "2001:db8::1" -> "2001:db8::1/128", "1.2.3.4/32" unchanged), or None if unparseable. Lets the
+    rollback spool-prune compare audit elements and intent cidrs across families/forms (A7)."""
+    try:
+        return ipaddress.ip_network(str(cidr).strip(), strict=False).with_prefixlen
+    except (ValueError, TypeError):
+        return None
+
+
 def ensure_root():
-    if os.geteuid() != 0:
-        os.execvp("sudo", ["sudo", "-n", "/usr/local/sbin/edge-ctl"] + sys.argv[1:])
+    if os.geteuid() == 0:
+        return
+    # Re-exec under sudo so `edge-ctl <cmd>` works for a sudo-capable operator. (C4) There is NO
+    # /etc/sudoers.d/edge-ctl grant — the old `sudo -n` unconditionally failed for anyone without a
+    # NOPASSWD rule, which is nobody. Prompt interactively when we have a TTY (the normal admin
+    # model); use `-n` only without a TTY so a UI/automation caller fails fast instead of hanging.
+    sudo = ["sudo"] if sys.stdin.isatty() else ["sudo", "-n"]
+    try:
+        os.execvp("sudo", sudo + ["/usr/local/sbin/edge-ctl"] + sys.argv[1:])
+    except OSError:
+        sys.stderr.write("edge-ctl must run as root (sudo unavailable)\n")
+        sys.exit(1)
 
 def nft(*args):
     return subprocess.run(["nft", *args], capture_output=True, text=True)
@@ -249,18 +271,18 @@ def cmd_rollback(rid):
     for c in elems:
         p = nft("delete", "element", FAM, TBL, s, "{ " + c + " }")
         removed.append((c, "ok" if p.returncode == 0 else p.stderr.strip()[:60]))
-    # remove from spool so the reconciler won't re-add. Match the intent cidr against the audit
-    # element in its bare and /32 forms. NOTE: use suffix slicing, NOT str.rstrip — rstrip with a
-    # "/32" argument strips any trailing run of the chars '/', '3', '2', so "1.2.3.23/32" becomes
-    # "1.2.3." and the prune would miss the intent, letting the reconciler RE-ADD the rolled-back block.
+    # remove from spool so the reconciler won't re-add. Match by NORMALIZED network on BOTH sides
+    # (A7): the audit element and the intent cidr canonicalize to the same `ip_network` form, so a
+    # bare host, an explicit /32, AND an IPv6 /128 all compare equal. The old code special-cased
+    # only "/32" (string suffix), so an IPv6 block like "2001:db8::1/128" never matched the bare
+    # intent "2001:db8::1" and the reconciler RE-ADDED the rolled-back block on the next tick.
     try:
-        bare = {e[:-3] if e.endswith("/32") else e for e in elems}   # "x/32" -> "x", others as-is
+        elem_norms = {n for n in (_norm_net(c) for c in elems) if n}
         doc = json.load(open(INTENTS))
         before = len(doc.get("intents", []))
         doc["intents"] = [i for i in doc.get("intents", [])
-                          if str(i.get("cidr")) not in elems
-                          and f"{i.get('cidr')}/32" not in elems
-                          and str(i.get("cidr")) not in bare]
+                          if _norm_net(i.get("cidr")) not in elem_norms
+                          and str(i.get("cidr")) not in elems]
         tmp = INTENTS + ".tmp"
         json.dump(doc, open(tmp, "w")); os.replace(tmp, INTENTS)
         pruned = before - len(doc["intents"])
@@ -272,6 +294,13 @@ def cmd_rollback(rid):
     for c, st in removed:
         print(f"  {c}: {st}")
     return 0
+
+_CTRL_TBL = {c: None for c in range(0x20)}; _CTRL_TBL[0x7f] = None
+def _safe(s, n=160):
+    """Strip control chars (ANSI/escape injection, D6) before printing model-origin text to the
+    terminal. edge-ai-analyze already cleans at the source; this guards an older/hand-edited file."""
+    return str(s).translate(_CTRL_TBL)[:n]
+
 
 def _proposal_id(rec):
     """Stable content-derived id (proposals.jsonl carries no id of its own). Survives the
@@ -316,7 +345,7 @@ def cmd_proposals():
         print("(no pending proposals)"); return 0
     print(f"== pending AI proposals ({len(pend)}) — review, then `edge-ctl accept|reject <id>` ==")
     for pid, r in pend[-50:]:
-        print(f"  {pid}  [{r.get('ts','?')}]  {r.get('description','')[:160]}")
+        print(f"  {pid}  [{r.get('ts','?')}]  {_safe(r.get('description',''))}")
     print("NOTE: advisory base/access suggestions — NOTHING is auto-applied. 'accept' only records")
     print("your decision; enact the change yourself (e.g. edit machine.conf + `bastion generate`).")
     return 0

@@ -104,8 +104,10 @@ def test_ai_enable_applies_regenerated_timer_interval():
 def test_rollback_spool_prune_does_not_use_rstrip():
     # `str.rstrip("/32")` strips a CHARACTER CLASS ({/,3,2}), not the literal "/32": e.g.
     # "1.2.3.23/32".rstrip("/32") -> "1.2.3.". That would make the spool-prune miss the intent
-    # and let the reconciler RE-ADD a rolled-back block. The fix must use suffix slicing instead.
+    # and let the reconciler RE-ADD a rolled-back block.
     assert "1.2.3.23/32".rstrip("/32") == "1.2.3."        # the documented footgun, pinned
     body = (SCRIPTS / "edge-ctl").read_text()
     assert '.rstrip("/32")' not in body
-    assert 'e[:-3] if e.endswith("/32") else e' in body
+    # A7: the prune now normalizes BOTH sides via ip_network (handles v4 /32 AND v6 /128), which
+    # superseded the old string-suffix slicing. test_sprint1_hardening pins the v4+v6 behavior.
+    assert '_norm_net' in body

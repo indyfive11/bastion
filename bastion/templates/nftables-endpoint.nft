@@ -53,7 +53,14 @@ table inet bastion {
 
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
         ip protocol icmp icmp type echo-request limit rate 10/second accept
-        ip6 nexthdr ipv6-icmp accept
+        # ICMPv6 (A3): essential errors + PMTUD from any source; ND/RA scoped by hop-limit 255
+        # (RFC 4861 — only on-link senders reach 255); MLD from link-local; echo rate-limited like
+        # IPv4. Replaces a blanket `ip6 nexthdr ipv6-icmp accept`.
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+        ip6 hoplimit 255 icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } accept
+        ip6 saddr fe80::/10 icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-reduction, mld2-listener-report } accept
+        icmpv6 type echo-request limit rate 10/second accept
+        icmpv6 type echo-reply accept
 
         # Management access from the local subnet + explicitly trusted hosts only.
         ip saddr {{ network.lan_cidr }} tcp dport {{ ports.ssh }} accept

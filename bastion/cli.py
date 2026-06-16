@@ -8,7 +8,9 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from . import templates, state
@@ -87,12 +89,53 @@ def active_template_rels(config: dict, mode: str) -> set[str]:
     return rels
 
 
+def _nft_syntax_check(text: str) -> tuple[bool, str | None]:
+    """Parse-check a rendered nft ruleset with `nft -c` (no kernel commit), returning (ok, message).
+    Prefers an unprivileged netns (`unshare -rn`) so it works without root. Only reports a FAILURE
+    when the checker actually parsed our ruleset and rejected it (its error names the temp file);
+    any environmental failure (no nft, userns disabled, no netlink) is a skip, so `generate --check`
+    still runs on a toolless CI box rather than false-failing."""
+    nft = shutil.which("nft")
+    if not nft:
+        return True, "skipped (nft not installed)"
+    fd, path = tempfile.mkstemp(suffix=".nft")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        candidates = []
+        if shutil.which("unshare"):
+            candidates.append(["unshare", "-rn", nft, "-c", "-f", path])
+        candidates.append([nft, "-c", "-f", path])
+        for argv in candidates:
+            p = subprocess.run(argv, capture_output=True, text=True)
+            if p.returncode == 0:
+                return True, None
+            err = (p.stderr or p.stdout).strip()
+            if path in err:                     # the checker parsed our ruleset and rejected it
+                return False, err
+            # else: environmental failure (userns/netlink) — fall through to the next candidate
+        return True, "skipped (no usable nft checker / insufficient privilege)"
+    finally:
+        os.unlink(path)
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     templates_dir = find_templates_dir(args.templates)
     conf_path = state.find_conf(args.conf)
     config = state.load_conf(conf_path)
     mode = config.get("machine", {}).get("mode", "edge")
     active_rels = active_template_rels(config, mode)
+
+    # A1: type-check the conf values that get spliced into the ruleset/machine.env. Errors (bad
+    # CIDR, non-numeric port, ...) block generate; warnings (a default-route LAN) are advisory.
+    errs, warns = state.validate_conf(config)
+    for w in warns:
+        print(f"generate: WARNING — {w}", file=sys.stderr)
+    if errs:
+        print(f"generate: invalid values in {conf_path}:", file=sys.stderr)
+        for e in errs:
+            print(f"  {e}", file=sys.stderr)
+        return 1
 
     # Validate machine.env renders (always should; surfaces a malformed conf early).
     env_text = state.render_machine_env(config)
@@ -113,6 +156,18 @@ def cmd_generate(args: argparse.Namespace) -> int:
         for name, missing in sorted(problems.items()):
             print(f"  {name}: {', '.join(missing)}", file=sys.stderr)
         return 1
+
+    # A1: parse-check the rendered base ruleset so a structurally invalid splice is caught HERE,
+    # before it is written and (on a live run) loaded by nftables.service.
+    nft_rel = "nftables-endpoint.nft" if mode == "endpoint" else "nftables-edge.nft"
+    for rel, abs_path in iter_templates(templates_dir):
+        if rel.as_posix() != nft_rel:
+            continue
+        ok, msg = _nft_syntax_check(templates.render_file(abs_path, config))
+        if not ok:
+            print(f"generate: rendered {nft_rel} failed `nft -c`:\n{msg}", file=sys.stderr)
+            return 1
+        break
 
     if args.check:
         layers_desc = config.get("machine", {}).get("layers", "(all)")

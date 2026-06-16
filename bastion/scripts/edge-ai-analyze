@@ -11,7 +11,15 @@
 # though intents.json persists (the reconciler applies timeout = expires - now). On ANY
 # error we leave the previous intents.json UNTOUCHED so its entries keep expiring normally.
 #
-import json, os, shlex, subprocess, sys, time
+import json, os, re, shlex, subprocess, sys, time
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")   # C0 controls + DEL (ANSI ESC \x1b, CR/LF, tab, ...)
+def _clean(s, n):
+    """Strip control chars from model-origin free text and length-cap it (D6). The reason/description
+    a backend returns reach the operator's terminal (edge-ctl) and the journal verbatim; a crafted
+    ANSI/escape sequence there could spoof output or inject log lines. One-liners only — newlines/tabs
+    go too."""
+    return _CTRL_RE.sub("", str(s))[:n]
 
 BACKENDCONF = "/etc/edge-ai/backend.conf"
 SCHEMA      = "/etc/edge-ai/intent.schema.json"
@@ -54,8 +62,18 @@ def main():
     # shlex.split so a BACKEND_CMD with quoted/spaced arguments parses correctly
     # (e.g. `/usr/bin/python3 /opt/my backend.py --flag`), not naive whitespace split.
     cmd = shlex.split(cfg["BACKEND_CMD"])
-    env = dict(os.environ)
+    # D5: hand the backend a MINIMAL environment — a safe baseline + the model + ONLY the declared
+    # secret var (KEY_ENV in backend.conf, default ANTHROPIC_API_KEY). The old `dict(os.environ)`
+    # forwarded the API key AND every other inherited variable to the BACKEND_CMD, including to a
+    # local/keyless backend with no business seeing the cloud key. (A keyless backend simply has no
+    # key in our environ to forward, so the default is safe.)
+    base_keep = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
+    env = {k: os.environ[k] for k in base_keep if k in os.environ}
+    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     env["EDGE_AI_MODEL"] = str(cfg["MODEL"])
+    key_env = str(cfg.get("KEY_ENV", "ANTHROPIC_API_KEY")).strip()
+    if key_env and key_env in os.environ:
+        env[key_env] = os.environ[key_env]
     try:
         p = subprocess.run(cmd, input=signals_raw, capture_output=True, text=True,
                            timeout=cfg["BACKEND_TIMEOUT"], env=env)
@@ -84,14 +102,14 @@ def main():
         die(f"envelope failed schema validation: {e}")
 
     now = int(time.time())
-    backend_id = str(env_doc.get("backend", cmd[0]))[:200]
+    backend_id = _clean(env_doc.get("backend", cmd[0]), 200)
     applied, proposals = [], []
     for it in env_doc.get("intents", []):
         action = it.get("action")
         if action == "propose_base_change":
             proposals.append({"ts": now, "backend": backend_id,
-                              "description": str(it.get("description", ""))[:600],
-                              "reason": str(it.get("reason", ""))[:280]})
+                              "description": _clean(it.get("description", ""), 600),
+                              "reason": _clean(it.get("reason", ""), 280)})
             continue
         if action not in APPLY_ACTIONS:
             log(f"drop unknown action {action!r}"); continue
@@ -104,7 +122,7 @@ def main():
         ttl = max(cfg["MIN_TTL"], min(cfg["MAX_TTL"], ttl))   # clamp
         applied.append({
             "action": action, "cidr": cidr, "ttl": ttl, "expires": now + ttl,
-            "reason": str(it.get("reason", ""))[:280],
+            "reason": _clean(it.get("reason", ""), 280),
             "confidence": it.get("confidence"),
         })
         if len(applied) >= cfg["MAX_INTENTS"]:

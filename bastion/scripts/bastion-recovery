@@ -17,9 +17,17 @@ WINDOW_SECONDS="${RECOVERY_WINDOW_SECONDS:-1800}"
 TRY_PORT_22="${RECOVERY_TRY_PORT_22:-yes}"
 
 RUN=/run/bastion-recovery
+LOCKFILE="${RUN}.lock"             # start-serialization lock (C2); sibling file, not the run dir
 RECOVERY_USER=bastion-rescue
 DESTRUCT_UNIT=bastion-recovery-destruct
+# Main managed nft table (edge: "inet edge", endpoint: "inet bastion") — from machine.env's
+# NFT_TABLE, else detected live at use time. The C1 reachability punch (ensure_main_accept) needs it.
+MAIN_TABLE="${NFT_TABLE:-}"
+RECOVERY_RULE_TAG="bastion-recovery"
 log(){ logger -t bastion-recovery "$*" 2>/dev/null; printf 'bastion-recovery: %s\n' "$*" >&2; }
+# console-only output — NEVER via logger, so the one-time password never persists in the system
+# journal (C3). Writes to stderr, which the console/IPMI recovery session sees.
+announce(){ printf 'bastion-recovery: %s\n' "$*" >&2; }
 
 # need <bin>... — B4 preflight: exit early with a clear message naming any missing required
 # command, instead of failing obscurely mid-run. Reports via log() (journal + stderr).
@@ -42,6 +50,37 @@ detect_ssh_ports() {
 port_free() { ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
 pick_free_port() { local p; for p in 2222 2022 22222 64022 50022; do port_free "$p" && { echo "$p"; return; }; done; echo 0; }
 
+# ---- main-table reachability punch (C1) -----------------------------------
+# The independent `inet bastion_recovery` table accepts the recovery ports, but in nftables an
+# `accept` in one base chain is NOT terminal: the main table's input chain (policy drop, evaluated
+# at a later priority) still drops a NEW connection to a recovery-only port. So on a default-drop
+# edge the override table alone does NOT guarantee reachability. We therefore ALSO insert an accept
+# for the bound ports at the TOP of the main table's input chain, tagged for clean removal on stop.
+# heal_light reloads /etc/nftables.conf (dropping this rule) so edge-watchdog re-invokes
+# `bastion-recovery reassert` after a reload while a window is open. No main table (recovery run
+# before/without L0) => the override table is the only surface and this is a no-op.
+resolve_main_table() {
+  local t
+  if [ -n "$MAIN_TABLE" ]; then printf '%s' "$MAIN_TABLE"; return; fi
+  for t in "inet edge" "inet bastion"; do
+    nft list table $t >/dev/null 2>&1 && { printf '%s' "$t"; return; }
+  done
+  printf ''
+}
+remove_main_accept() {
+  local t h; t=$(resolve_main_table); [ -n "$t" ] || return 0
+  while h=$(nft -a list chain $t input 2>/dev/null | awk -v tag="$RECOVERY_RULE_TAG" '$0 ~ tag {print $NF; exit}'); [ -n "$h" ]; do
+    nft delete rule $t input handle "$h" 2>/dev/null || break
+  done
+}
+ensure_main_accept() {   # $1 = comma-separated portset
+  local t; t=$(resolve_main_table); [ -n "$t" ] || return 0
+  nft list chain $t input >/dev/null 2>&1 || return 0
+  remove_main_accept     # idempotent: clear any prior recovery rule first
+  nft insert rule $t input tcp dport { $1 } accept comment \"$RECOVERY_RULE_TAG\" 2>/dev/null \
+    || log "WARN: could not punch recovery accept into '$t input' (override table only)"
+}
+
 arm_destruct() {
   systemctl stop "${DESTRUCT_UNIT}.timer" 2>/dev/null || true
   systemd-run --quiet --unit="$DESTRUCT_UNIT" --on-active="${WINDOW_SECONDS}s" \
@@ -54,7 +93,17 @@ do_start() {
   [ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
   # Preflight the tools the recovery surface is built from, BEFORE we create any of it — a missing
   # one mid-flow would leave a half-built privileged surface for the cleanup trap to tear down.
-  need sshd useradd chpasswd nft ss
+  need sshd useradd chpasswd nft ss flock
+  # C2: serialize starts + refuse to start over a LIVE session. Without this, a 2nd `start` races
+  # the 1st: it sees the in-use ports, its sshd bind hits EADDRINUSE, and its failure path calls
+  # do_stop — dismantling the FIRST session's live recovery. flock makes concurrent starts mutually
+  # exclusive; the active-window guard refuses (rather than tears down) an already-running session.
+  exec 9>"$LOCKFILE" || { log "FATAL: cannot open start lock $LOCKFILE"; exit 1; }
+  flock -n 9 || { log "another bastion-recovery start is in progress — refusing"; exit 1; }
+  if [ -f "$RUN/ports" ]; then
+    log "recovery is ALREADY ACTIVE on port(s) $(cat "$RUN/ports") — use 'extend' or 'stop' first (refusing to start over it)"
+    exit 1
+  fi
   mkdir -p "$RUN"; chmod 700 "$RUN"
 
   # CLEANUP TRAP: from here on we create a privileged surface (OTP user + NOPASSWD-ALL sudoers +
@@ -120,6 +169,10 @@ table inet bastion_recovery {
 }
 NFT
 
+  # C1: also punch the accept into the MAIN managed table so recovery actually wins on a
+  # default-drop edge (the override table's accept above is not terminal against the main drop).
+  ensure_main_accept "$portset"
+
   # Start the recovery sshd instance.
   local sshd; sshd=$(command -v sshd)
   "$sshd" -f "$cfg" || { log "FATAL: recovery sshd failed to start"; do_stop quiet; exit 1; }
@@ -129,14 +182,16 @@ NFT
 
   # Announce — the console is the source of truth.
   local ips; ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')
-  log "================ RECOVERY ACTIVE ================"
-  log "  bound port(s) : $bind"
-  log "  reachable IP(s): ${ips:-<none detected — check console/IPMI link>}"
-  log "  login user     : $RECOVERY_USER (sudo enabled)"
-  log "  one-time pass  : $otp"
-  log "  connect, e.g.  : ssh -p ${bind%% *} ${RECOVERY_USER}@${ips%% *}"
-  log "  auto-stop in   : ${WINDOW_SECONDS}s  (extend: bastion recovery extend | stop: systemctl stop bastion-recovery)"
-  log "================================================"
+  # Journal gets a non-secret breadcrumb; the OTP + connect details go to the CONSOLE ONLY (C3).
+  log "recovery ACTIVE: bound port(s) $bind, ${WINDOW_SECONDS}s window (login details shown on console only)"
+  announce "================ RECOVERY ACTIVE ================"
+  announce "  bound port(s) : $bind"
+  announce "  reachable IP(s): ${ips:-<none detected — check console/IPMI link>}"
+  announce "  login user     : $RECOVERY_USER (sudo enabled)"
+  announce "  one-time pass  : $otp"
+  announce "  connect, e.g.  : ssh -p ${bind%% *} ${RECOVERY_USER}@${ips%% *}"
+  announce "  auto-stop in   : ${WINDOW_SECONDS}s  (extend: bastion recovery extend | stop: systemctl stop bastion-recovery)"
+  announce "================================================"
 }
 
 # ---- stop -----------------------------------------------------------------
@@ -145,6 +200,7 @@ do_stop() {
   [ -f "$RUN/sshd.pid" ] && kill "$(cat "$RUN/sshd.pid")" 2>/dev/null || true
   pkill -f "sshd -f $RUN/sshd_config" 2>/dev/null || true
   nft delete table inet bastion_recovery 2>/dev/null || true
+  remove_main_accept                                  # C1: drop the main-table reachability punch
   rm -f /etc/sudoers.d/bastion-recovery
   if id "$RECOVERY_USER" >/dev/null 2>&1; then userdel -r "$RECOVERY_USER" 2>/dev/null || userdel "$RECOVERY_USER" 2>/dev/null || true; fi
   rm -rf "$RUN"
@@ -167,6 +223,19 @@ do_reap() {
   fi
 }
 
+# ---- reassert (re-punch the main-table accept after a ruleset reload) ------
+# edge-watchdog's heal_light reloads /etc/nftables.conf, which recreates the main table fresh and
+# so drops the C1 reachability rule. When a recovery window is open, the watchdog calls this right
+# after a reload to re-insert the accept (the override table is folded back by heal_light itself).
+do_reassert() {
+  [ "$(id -u)" -eq 0 ] || exit 0
+  [ -f "$RUN/ports" ] || exit 0           # no active window — nothing to reassert
+  local bind portset
+  bind=$(cat "$RUN/ports")
+  portset=$(printf '%s' "$bind" | tr ' ' ',' | sed 's/^,//; s/,$//')
+  ensure_main_accept "$portset"
+}
+
 # ---- extend / status ------------------------------------------------------
 do_extend() {
   [ -d "$RUN" ] || { log "recovery is not active"; exit 1; }
@@ -187,5 +256,6 @@ case "${1:-start}" in
   extend) do_extend ;;
   status) do_status ;;
   reap)   do_reap ;;
-  *) echo "usage: bastion-recovery {start|stop|extend|status|reap}" >&2; exit 2 ;;
+  reassert) do_reassert ;;
+  *) echo "usage: bastion-recovery {start|stop|extend|status|reap|reassert}" >&2; exit 2 ;;
 esac
