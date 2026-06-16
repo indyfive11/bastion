@@ -103,12 +103,13 @@ Notes:
 - **root** for any live install (loading nft rules, installing systemd units, installing packages)
 
 > **Distro support.** Arch (and Arch-based) is the **primary, regularly-tested** target.
-> Debian/Ubuntu (`apt`) and Fedora/RHEL-family (`dnf`) are supported but less exercised — report
-> issues. Package-name differences across distros are handled automatically (e.g. `python` →
-> `python3`, `openssh` → `openssh-server`). A package only in a third-party repo (e.g. CrowdSec on
-> Debian/Fedora, or AUR on Arch) is reported with an install hint rather than installed for you.
-> Another manager (e.g. openSUSE's `zypper`) is detected and named, but setup will list its
-> packages to install by hand. systemd is assumed throughout.
+> **Debian/Ubuntu (`apt`) and Fedora/RHEL-family (`dnf`) are supported and have been
+> install-validated live** (Debian 12, Fedora 42) — Arch still sees the most use, so report any
+> rough edges. Package-name differences across distros are handled automatically (e.g. `python` →
+> `python3`, `openssh` → `openssh-server`, and on Debian `conntrack-tools` → `conntrack`). A package
+> only in a third-party repo (e.g. CrowdSec on Debian/Fedora, or AUR on Arch) is reported with an
+> install hint rather than installed for you. Another manager (e.g. openSUSE's `zypper`) is detected
+> and named, but setup will list its packages to install by hand. systemd is assumed throughout.
 
 ## Install
 
@@ -118,7 +119,7 @@ Notes:
 paru -S bastionfw      # or: yay -S bastionfw
 ```
 
-**From source:**
+**From source** (the path on Debian/Ubuntu and Fedora/RHEL — there is no native package there yet):
 
 ```sh
 git clone https://github.com/indyfive11/bastion
