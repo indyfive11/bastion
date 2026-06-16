@@ -280,6 +280,9 @@ bastion never rewrites your resolver config.
 | `bastion update <feeds\|dnsblock>` | refresh threat feeds / DNS blocklist now (don't wait for the timer) |
 | `bastion check [--full\|--lan]` | read-only flow & LAN verification |
 
+Full per-command reference: **[docs/commands.md](docs/commands.md)**. When something goes wrong:
+**[docs/troubleshooting.md](docs/troubleshooting.md)**.
+
 ## Design principles
 
 - No real IPs, hostnames, MACs, or keys in the repository — templates use `{{ }}` placeholders.
