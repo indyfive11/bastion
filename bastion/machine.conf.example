@@ -18,6 +18,8 @@ layers = l0,l1,l2,l3,l4,l5,l6
 # distro: arch | debian | ubuntu | fedora | auto
 distro = arch
 secrets_file = /etc/bastion/secrets.conf
+# schema_version: machine.conf format version — `bastion migrate` carries an old conf forward.
+schema_version = 1
 
 [interfaces]
 # LAN interface — detected by wizard, confirm or override

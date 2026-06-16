@@ -104,11 +104,3 @@ def run_tui(ctx: Context) -> int:
             "missing) — reinstall bastion, or run `pip install textual`"
         ) from exc
     return _tui_app.launch(ctx)
-
-    # bind each action key to a handler
-    for a in ACTIONS:
-        setattr(BastionTUI, f"action_action_{a.key}",
-                (lambda key: lambda self: self._do(key))(a.key))
-
-    BastionTUI(ctx).run()
-    return 0

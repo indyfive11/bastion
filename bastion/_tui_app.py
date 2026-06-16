@@ -8,6 +8,7 @@ here needs a live TTY + Textual, so it is excluded from coverage.
 """
 from __future__ import annotations
 
+import asyncio  # pragma: no cover
 import os  # pragma: no cover
 
 from textual import work  # pragma: no cover
@@ -181,7 +182,10 @@ class BastionTUI(App):  # pragma: no cover
             self._refresh()
             return
         try:
-            result = actmod.run_action(self._ctx, action, values)
+            # E3: run_action shells out (blocking subprocess) — offload to a thread so the Textual
+            # event loop keeps painting (a slow `update feeds`/`layer install`/`firewall reload`
+            # otherwise freezes the whole UI for its whole duration).
+            result = await asyncio.to_thread(actmod.run_action, self._ctx, action, values)
         except actmod.ActionError as exc:
             self.notify(str(exc), severity="error")
             return

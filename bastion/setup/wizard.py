@@ -232,6 +232,7 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
     put("machine", "profile", profile)
     put("machine", "layers", layers)
     put("machine", "distro", detection.distro)
+    put("machine", "schema_version", str(state.CONF_SCHEMA_VERSION))
 
     put("interfaces", "lan", answers.get("lan_iface") or detection.lan_iface)
     if mode == "edge":

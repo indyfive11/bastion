@@ -21,6 +21,11 @@ DEFAULT_CONF_PATHS = (
     Path.home() / ".config/bastion/machine.conf",
 )
 
+# machine.conf schema version. Bump when a release renames/repurposes a conf key; add the matching
+# step to _MIGRATIONS so `bastion migrate` carries old configs forward. A conf with no
+# [machine] schema_version is version 0 (pre-versioning) and migrates up to here. (F5)
+CONF_SCHEMA_VERSION = 1
+
 
 def _parser() -> configparser.ConfigParser:
     # interpolation=None: values may contain '%' or '$' literally (paths, URLs).
@@ -196,6 +201,41 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
             errors.append(f"[interfaces] {key}={val!r} — not a valid interface name (<=15 chars)")
 
     return errors, warnings
+
+
+def conf_schema_version(config: dict[str, dict[str, str]]) -> int:
+    """The machine.conf's declared schema version. Absent / unparseable = 0 (pre-versioning)."""
+    try:
+        return int(config.get("machine", {}).get("schema_version", "0") or "0")
+    except (ValueError, TypeError):
+        return 0
+
+
+def _migrate_0_to_1(config: dict[str, dict[str, str]]) -> list[str]:
+    """v0 -> v1: introduce the schema_version stamp itself. v1 is the baseline shape, so there are
+    no key renames yet — future versions add their own _migrate_N_to_N+1 with the real rewrites."""
+    config.setdefault("machine", {})["schema_version"] = "1"
+    return ["stamped [machine] schema_version = 1"]
+
+
+# Ordered forward migrations: _MIGRATIONS[N] upgrades a vN config to v(N+1), mutating it in place.
+_MIGRATIONS = {0: _migrate_0_to_1}
+
+
+def migrate_conf(config: dict[str, dict[str, str]]) -> tuple[dict[str, dict[str, str]], list[str], int]:
+    """Carry a machine.conf forward to ``CONF_SCHEMA_VERSION``. Returns ``(new_config, changes,
+    from_version)``; ``new_config`` is a copy (the input is never mutated). A config already current
+    yields no changes. Each step runs in order so a multi-version jump applies every migration."""
+    import copy
+    out = copy.deepcopy(config)
+    start = conf_schema_version(out)
+    changes: list[str] = []
+    v = start
+    while v < CONF_SCHEMA_VERSION and v in _MIGRATIONS:
+        changes += _MIGRATIONS[v](out)
+        v += 1
+    out.setdefault("machine", {})["schema_version"] = str(CONF_SCHEMA_VERSION)
+    return out, changes, start
 
 
 def _shell_quote(value: str) -> str:

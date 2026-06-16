@@ -208,6 +208,19 @@ def find_scripts_dir(explicit: str | None = None) -> Path:
     return Path(__file__).resolve().parent / "scripts"  # best effort; only needed for install
 
 
+def _require_root(sys_, what: str, why: str = "") -> bool:
+    """Single live-root gate (E5). An operation that touches the live system needs real root, but a
+    staged ``--root`` tree never does. Returns True to proceed; else prints why and returns False.
+    Replaces the five ad-hoc ``os.geteuid()!=0 and root==Path('/')`` checks scattered across the CLI;
+    uses the System.is_live / is_root properties that already exist for exactly this."""
+    if sys_.is_live and not sys_.is_root:
+        tail = f" — {why}" if why else ""
+        print(f"{what} needs root — run with sudo (or use --root for a staged tree){tail}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def build_context(args: argparse.Namespace) -> Context:
     """Assemble the layer Context. machine.conf is optional (a fresh system has none)."""
     try:
@@ -295,8 +308,7 @@ def cmd_layer(args: argparse.Namespace) -> int:
         _print_status(layer.status(ctx), True, ctx, layer)
         return 0
     if args.action in ("install", "uninstall"):
-        if os.geteuid() != 0 and ctx.system.root == Path("/"):
-            print(f"layer {args.action} requires root (or use --root for a staged tree)", file=sys.stderr)
+        if not _require_root(ctx.system, f"layer {args.action}"):
             return 1
         if not getattr(args, "force", False):
             blocked = _prerequisite_block(ctx, layer, args.action)
@@ -389,9 +401,7 @@ def cmd_ai(args: argparse.Namespace) -> int:
         print("bastion ai: edge-ctl not installed — run `bastion layer install l3` first",
               file=sys.stderr)
         return 1
-    if os.geteuid() != 0 and sys_.root == Path("/"):
-        print("bastion ai requires root (the kill switch toggles units and flushes nft sets)",
-              file=sys.stderr)
+    if not _require_root(sys_, "bastion ai", "the kill switch toggles units and flushes nft sets"):
         return 1
     edge_ctl = str(sys_.path(f"{ctx.sbin_dir}/edge-ctl"))
     argv = [edge_ctl, _AI_ACTIONS[args.action]]
@@ -440,8 +450,7 @@ def _run_sbin(ctx: Context, name: str, *args: str, need_root: bool = True) -> in
         print(f"bastion: {name} not installed — install the layer that ships it first "
               "(e.g. L6 for the net-* tools, L0 for bastion-recovery)", file=sys.stderr)
         return 1
-    if need_root and os.geteuid() != 0 and sys_.root == Path("/"):
-        print(f"bastion {name.replace('bastion-', '')}: needs root — run with sudo", file=sys.stderr)
+    if need_root and not _require_root(sys_, f"bastion {name.replace('bastion-', '')}"):
         return 1
     return sys_.run(str(sys_.path(rel)), *args, capture=False).returncode
 
@@ -537,8 +546,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         if not _valid_snapshot_name(name):
             print(f"bastion rollback: invalid name {name!r}", file=sys.stderr)
             return 1
-        if os.geteuid() != 0 and sys_.root == Path("/"):
-            print("bastion rollback: needs root — run with sudo", file=sys.stderr)
+        if not _require_root(sys_, "bastion rollback"):
             return 1
         if not _restore_named_snapshot(sys_, name):
             print(f"bastion rollback: no named snapshot {name!r} (see `bastion snapshots`)",
@@ -570,8 +578,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     of waiting for the timer. The unit keeps the same sandboxing/StateDirectory as the scheduled run."""
     ctx = build_context(args)
     sys_ = ctx.system
-    if os.geteuid() != 0 and sys_.root == Path("/"):
-        print("bastion update: needs root — run with sudo", file=sys.stderr)
+    if not _require_root(sys_, "bastion update"):
         return 1
     unit = _UPDATE_UNITS[args.target]
     print(f"bastion update: running {unit} now...")
@@ -620,12 +627,45 @@ def _drift_report(ctx: Context, templates_dir: Path) -> tuple[list[tuple[str, st
     return drift, n_ok
 
 
+def _artifact_drift(ctx: Context) -> list[tuple[str, str]]:
+    """Installed operational scripts (/usr/local/sbin) that differ from — or are missing vs — the
+    package's shipped copy, for each INSTALLED layer (F6). This is the 'upgraded the wheel but never
+    re-ran `bastion layer install`, so the live sbin scripts/units are stale' gap: the package data
+    moved but the deployed copies didn't. Returns [(script, 'STALE'|'MISSING')]."""
+    out: list[tuple[str, str]] = []
+    try:
+        scripts_dir = find_scripts_dir(None)
+    except Exception:                                    # noqa: BLE001
+        return out
+    sys_ = ctx.system
+    for layer in layermod.all_layers():
+        try:
+            if not layer.status(ctx).installed:
+                continue
+        except Exception:                                # noqa: BLE001
+            continue
+        for script in getattr(layer, "scripts", ()):
+            src = scripts_dir / script
+            if not src.is_file():
+                continue
+            dst = sys_.path(f"{ctx.sbin_dir}/{script}")
+            if not dst.exists():
+                out.append((script, "MISSING"))
+            elif dst.read_bytes() != src.read_bytes():
+                out.append((script, "STALE"))
+    return out
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     ctx = build_context(args)
     if not ctx.config:
         print("bastion verify: no machine.conf — run `bastion setup` / `bastion generate` first",
               file=sys.stderr)
         return 1
+    sv = state.conf_schema_version(ctx.config)
+    if sv < state.CONF_SCHEMA_VERSION:
+        print(f"  NOTE: machine.conf is schema v{sv} (current v{state.CONF_SCHEMA_VERSION}) — "
+              "run `bastion migrate` to update it.")
     templates_dir = find_templates_dir(getattr(args, "templates", None))
     drift, n_ok = _drift_report(ctx, templates_dir)
     print(f"bastion verify (mode={ctx.mode}, root={ctx.system.root}): "
@@ -638,6 +678,34 @@ def cmd_verify(args: argparse.Namespace) -> int:
               "hand-edits back into machine.conf.")
         return 1
     print("  no drift — live configs match what generate would produce.")
+    return 0
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Carry an older machine.conf forward to the current schema (F5). --check reports whether a
+    migration is due (rc1 if so) without writing; otherwise it rewrites the conf in place (atomic).
+    A no-op on an already-current conf."""
+    ctx = build_context(args)
+    if not ctx.config:
+        print("bastion migrate: no machine.conf found — run `bastion setup` first", file=sys.stderr)
+        return 1
+    conf_path = state.find_conf(getattr(args, "conf", None))
+    migrated, changes, start = state.migrate_conf(ctx.config)
+    if start >= state.CONF_SCHEMA_VERSION and not changes:
+        print(f"machine.conf already current (schema v{state.CONF_SCHEMA_VERSION}) — nothing to do")
+        return 0
+    if getattr(args, "check", False):
+        print(f"machine.conf is schema v{start}; current is v{state.CONF_SCHEMA_VERSION} — "
+              f"run `bastion migrate` to apply {len(changes)} change(s)", file=sys.stderr)
+        return 1
+    # writing the live /etc conf needs root; an explicit --conf to a writable path does not.
+    if str(conf_path).startswith("/etc/") and not _require_root(ctx.system, "bastion migrate"):
+        return 1
+    state.write_conf(migrated, conf_path)
+    print(f"migrated {conf_path}: schema v{start} -> v{state.CONF_SCHEMA_VERSION}")
+    for c in changes:
+        print(f"  - {c}")
+    print("  review the result; re-run `bastion generate` if any rendered key changed.")
     return 0
 
 
@@ -675,12 +743,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             add("WARN", "base table", f"{fam} {tbl} not loaded — `bastion firewall reload`")
 
     if ctx.config:
+        sv = state.conf_schema_version(ctx.config)
+        add("OK", "config schema", f"v{sv}") if sv >= state.CONF_SCHEMA_VERSION else \
+            add("WARN", "config schema",
+                f"machine.conf is v{sv}, current v{state.CONF_SCHEMA_VERSION} — run `bastion migrate`")
+
+    if ctx.config:
         try:
             drift, _ = _drift_report(ctx, find_templates_dir(getattr(args, "templates", None)))
             add("WARN", "config drift", f"{len(drift)} file(s) differ — see `bastion verify`") \
                 if drift else add("OK", "config drift", "none")
         except Exception as exc:                                       # noqa: BLE001
             add("WARN", "config drift", f"could not check ({exc})")
+        stale = _artifact_drift(ctx)
+        if stale:
+            shown = ", ".join(f"{n} ({s})" for n, s in stale[:6])
+            add("WARN", "artifact drift", f"{len(stale)} installed script(s) differ from the package "
+                f"— re-run `bastion layer install` after an upgrade ({shown})")
+        else:
+            add("OK", "artifact drift", "installed scripts match the package")
 
     add("OK", "recovery", "bastion-recovery installed") \
         if sys_.exists(f"{ctx.sbin_dir}/bastion-recovery") else \
@@ -874,6 +955,12 @@ def build_parser() -> argparse.ArgumentParser:
     upd.add_argument("--conf", help="path to machine.conf")
     upd.add_argument("--root", help="operate under this base dir instead of /")
     upd.set_defaults(func=cmd_update)
+
+    mig = sub.add_parser("migrate", help="carry an older machine.conf forward to the current schema")
+    mig.add_argument("--check", action="store_true", help="report if a migration is due; don't write")
+    mig.add_argument("--conf", help="path to machine.conf")
+    mig.add_argument("--root", help="operate under this base dir instead of / (testing)")
+    mig.set_defaults(func=cmd_migrate)
 
     vfy = sub.add_parser("verify", help="check live configs match what `bastion generate` would produce")
     vfy.add_argument("--conf", help="path to machine.conf")
