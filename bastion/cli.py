@@ -722,6 +722,24 @@ def cmd_tui(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_state(args: argparse.Namespace) -> int:
+    """Emit the canonical world-state document (Innovation #1) — the single versioned snapshot the
+    TUI and the future GUI render from, instead of each re-probing the box. Read-only; works under
+    --root. Includes the config-drift section when a machine.conf + templates are resolvable."""
+    import json as _json
+    from . import worldstate
+    ctx = build_context(args)
+    drift = None
+    if ctx.config:
+        try:
+            drift = _drift_report(ctx, find_templates_dir(getattr(args, "templates", None)))
+        except Exception:
+            drift = None      # drift is best-effort; the rest of the document still emits
+    doc = worldstate.gather_state(ctx, drift=drift)
+    print(_json.dumps(doc, indent=(None if getattr(args, "compact", False) else 2), default=str))
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Interactive setup wizard (§10). Phase 5: rule-based; --dry-run writes nothing."""
     from .setup.wizard import Wizard, parse_overrides
@@ -784,6 +802,14 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--conf", help="path to machine.conf")
     tui.add_argument("--root", help="inspect under this base dir instead of / (testing)")
     tui.set_defaults(func=cmd_tui)
+
+    sta = sub.add_parser("state", help="emit the canonical world-state JSON document (the TUI/GUI contract)")
+    sta.add_argument("--json", action="store_true", help="(default) machine-readable JSON document")
+    sta.add_argument("--compact", action="store_true", help="single-line JSON instead of indented")
+    sta.add_argument("--conf", help="path to machine.conf")
+    sta.add_argument("--templates", help="templates dir (for the drift section)")
+    sta.add_argument("--root", help="inspect under this base dir instead of / (testing)")
+    sta.set_defaults(func=cmd_state)
 
     lay = sub.add_parser("layer", help="manage an individual layer")
     lay.add_argument("action", choices=["status", "install", "uninstall"])

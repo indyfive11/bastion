@@ -10,139 +10,22 @@ fail soft, exactly like ``bastion ai panic`` / ``bastion snapshot``.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-
-from . import layers as layermod
 from .layers.base import Context
-
-# Managed sets shown in the firewall panel — each family (D6 added the `…6` IPv6 siblings).
-_BASE_SETS = ["blk_feed", "cs_block", "ai_block", "ai_ratelimit", "ai_tarpit", "trusted_hosts"]
-MANAGED_SETS = _BASE_SETS + [s + "6" for s in _BASE_SETS]
-AI_SETS = ["ai_block", "ai_ratelimit", "ai_tarpit", "ai_block6", "ai_ratelimit6", "ai_tarpit6"]
-
-AUDIT_LOG = "/var/log/edge-reconciler/audit.jsonl"
-INTENTS = "/var/lib/edge-ai/intents.json"
-PROPOSALS = "/var/lib/edge-ai/proposals.jsonl"
-RESOLVED = "/var/lib/edge-ai/proposals-resolved.jsonl"
-AI_TIMER = "edge-ai.timer"
-RECOVERY = "bastion-recovery"
-
-
-def _nft_table(ctx: Context) -> tuple[str, str]:
-    return ("inet", "bastion") if ctx.mode == "endpoint" else ("inet", "edge")
-
-
-def _set_count(sys_, family: str, table: str, name: str):
-    """Element count of one nft set, or None if it can't be read (absent / needs root)."""
-    p = sys_.run("nft", "-j", "list", "set", family, table, name)
-    if getattr(p, "returncode", 1) != 0:
-        return None
-    try:
-        data = json.loads(p.stdout)
-    except (ValueError, TypeError):
-        return None
-    for obj in data.get("nftables", []):
-        s = obj.get("set")
-        if s is not None and s.get("name") == name:
-            return len(s.get("elem", []) or [])
-    return None
-
-
-def _read_lines(ctx: Context, path: str) -> list[str]:
-    try:
-        return ctx.system.read(path).splitlines()
-    except OSError:
-        return []
-
-
-def _proposal_id(rec: dict) -> str:
-    raw = f"{rec.get('ts','')}\x00{rec.get('description','')}".encode()
-    return hashlib.sha1(raw).hexdigest()[:12]
-
-
-def _pending_proposals(ctx: Context) -> int:
-    """Count proposals not yet accepted/rejected — same content-hash identity edge-ctl uses."""
-    resolved = set()
-    for ln in _read_lines(ctx, RESOLVED):
-        try:
-            resolved.add(json.loads(ln).get("id"))
-        except ValueError:
-            continue
-    pending = set()
-    for ln in _read_lines(ctx, PROPOSALS):
-        if not ln.strip():
-            continue
-        try:
-            rec = json.loads(ln)
-        except ValueError:
-            continue
-        pid = _proposal_id(rec)
-        if pid not in resolved:
-            pending.add(pid)
-    return len(pending)
+from . import worldstate
+# Re-exported so existing `tui.MANAGED_SETS` / `tui.AI_SETS` imports keep working; the canonical
+# definitions and ALL the data-gathering now live in bastion.worldstate.
+from .worldstate import (MANAGED_SETS, AI_SETS, AUDIT_LOG, INTENTS, PROPOSALS,  # noqa: F401
+                         RESOLVED, AI_TIMER, RECOVERY,
+                         _proposal_id, _pending_proposals, _read_lines)  # noqa: F401
+from .worldstate import set_count as _set_count  # noqa: F401
+from .worldstate import nft_table as _nft_table  # noqa: F401
 
 
 def gather_dashboard(ctx: Context) -> dict:
-    """Collect a full read-only snapshot of node state. Every probe fails soft — a dashboard
-    must render even on a half-broken box, so nothing here raises."""
-    sys_ = ctx.system
-    family, table = _nft_table(ctx)
-
-    layers = []
-    for layer in layermod.all_layers():
-        try:
-            st = layer.status(ctx)
-            checks = [{"name": c.name, "ok": c.ok, "unknown": getattr(c, "unknown", False),
-                       "detail": c.detail} for c in layer.health_check(ctx)]
-            layers.append({"name": st.name, "title": st.title, "installed": st.installed,
-                           "active": st.active, "detail": st.detail, "checks": checks})
-        except Exception as exc:  # one sick layer must not blank the whole board
-            layers.append({"name": getattr(layer, "name", "?"), "title": getattr(layer, "title", ""),
-                           "installed": False, "active": False, "detail": f"probe error: {exc}",
-                           "checks": []})
-
-    loaded = sys_.nft_table_exists(family, table)
-    fw_sets = []
-    if loaded:
-        for name in MANAGED_SETS:
-            cnt = _set_count(sys_, family, table, name)
-            if cnt is not None:
-                fw_sets.append({"name": name, "count": cnt})
-
-    last_analysis = None
-    try:
-        doc = json.loads(sys_.read(INTENTS))
-        last_analysis = {"backend": doc.get("backend"), "intents": len(doc.get("intents", [])),
-                         "generated_epoch": doc.get("generated_epoch")}
-    except (OSError, ValueError):
-        pass
-
-    ai = {
-        "timer_enabled": sys_.unit_enabled(AI_TIMER),
-        "timer_active": sys_.unit_active(AI_TIMER),
-        "set_counts": {s: _set_count(sys_, family, table, s) for s in AI_SETS} if loaded else {},
-        "last_analysis": last_analysis,
-        "pending_proposals": _pending_proposals(ctx),
-    }
-
-    audit_tail = []
-    for ln in _read_lines(ctx, AUDIT_LOG)[-12:]:
-        try:
-            audit_tail.append(json.loads(ln))
-        except ValueError:
-            continue
-
-    return {
-        "mode": ctx.mode,
-        "root": str(sys_.root),
-        "table": f"{family} {table}",
-        "firewall": {"loaded": loaded, "sets": fw_sets},
-        "layers": layers,
-        "ai": ai,
-        "audit_tail": audit_tail,
-        "recovery_active": sys_.unit_active(RECOVERY),
-    }
+    """Read-only snapshot of node state for the dashboard. A thin wrapper over the canonical
+    ``worldstate.gather_state`` so the TUI, `bastion state --json`, and the GUI share ONE data path
+    / one nft-set parser (the document is a superset; the render reads the keys it needs)."""
+    return worldstate.gather_state(ctx)
 
 
 def _onoff(v) -> str:
