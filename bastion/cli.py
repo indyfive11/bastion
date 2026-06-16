@@ -654,6 +654,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if fails else 0
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Launch the read-only terminal dashboard (D1). Lazily imports Textual so the rest of the CLI
+    works without the optional dep; a missing dep yields a friendly hint, not a traceback."""
+    from . import tui
+    ctx = build_context(args)
+    try:
+        return tui.run_tui(ctx)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Interactive setup wizard (§10). Phase 5: rule-based; --dry-run writes nothing."""
     from .setup.wizard import Wizard, parse_overrides
@@ -711,6 +723,11 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--conf", help="path to machine.conf")
     st.add_argument("--root", help="inspect under this base dir instead of / (chroot/bootstrap/testing)")
     st.set_defaults(func=cmd_status)
+
+    tui = sub.add_parser("tui", help="read-only terminal dashboard (layers, sets, AI, audit)")
+    tui.add_argument("--conf", help="path to machine.conf")
+    tui.add_argument("--root", help="inspect under this base dir instead of / (testing)")
+    tui.set_defaults(func=cmd_tui)
 
     lay = sub.add_parser("layer", help="manage an individual layer")
     lay.add_argument("action", choices=["status", "install", "uninstall"])

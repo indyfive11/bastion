@@ -262,6 +262,7 @@ bastion never rewrites your resolver config.
 | `bastion setup` | guided install / configure / verify wizard |
 | `bastion generate` | render templates → configs + `machine.env` |
 | `bastion status [--health]` | per-layer install / active / health |
+| `bastion tui` | live dashboard (layer health, set counts, AI state, audit tail) + a command palette for every operation, with confirmation gating — a single confirm for state changes and a typed confirmation for destructive ones (layer teardown, firewall reload, network rollback) |
 | `bastion layer <install\|uninstall\|status> <id>` | manage a single layer |
 | `bastion firewall <reload\|status>` | reconcile / inspect the nft ruleset |
 | `bastion ai <enable\|disable\|panic\|status>` | control the optional AI layer (kill switch) |
