@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-06-15
+
+A large feature release: full IPv6 parity for the threat-intel layer, a terminal
+dashboard, a completed operator CLI, and a round of robustness and UX work.
+
+### Added
+
+- **`bastion tui` — a live terminal dashboard and command surface.** Shows layer
+  health, nftables set counts, AI timer/proposals, the reconciler audit tail and
+  recovery state, and a command palette that can drive every operation. State
+  changes ask for a single confirmation; destructive ones (layer teardown,
+  firewall reload, network rollback) require a typed confirmation. The command
+  surface is a UI-agnostic action layer intended to also back a future GUI.
+- **Full IPv6 parity for the managed intel sets.** Every managed set
+  (threat-feed, CrowdSec, AI block/ratelimit/tarpit, and `trusted_hosts`) now has
+  an `ipv6_addr` sibling, and the whole data path — nftables rules, the feed
+  fetcher, the AI collector, and the reconciler's per-family validation/routing —
+  handles both families, so a host attacking over IPv6 is filtered like IPv4.
+- **The operator CLI is now complete.** New: `verify` (config-drift detection),
+  `doctor` (one-shot triage), `snapshot [--name]` / `snapshots` / `rollback [name]`
+  (first-class named snapshots over the known-good blob), `confirm`,
+  `recovery <start|stop|extend|status>`, `update <feeds|dnsblock>`, and
+  `ai <proposals|accept|reject|rollback>` — a real human-review loop for AI
+  proposals (nothing auto-applies).
+- **Real `bastion setup --bootstrap`** soft-recovery: re-detects from scratch and
+  shows where the current config disagrees with the live system.
+- Log rotation for the reconciler audit log and the AI proposals queue.
+
+### Changed
+
+- The setup wizard now honours an existing `machine.conf` on re-run (operator
+  hand-edits survive), shows a final review/confirm screen before writing, treats
+  the install as a transaction (auto-rollback if the core layer fails), and
+  validates inputs at the prompt boundary.
+
+### Fixed
+
+- Atomic config writes (temp file + `os.replace`, secrets created `0600`).
+- Reconciler audit ids are now collision-proof within a single second.
+- `BACKEND_CMD` is parsed with `shlex` so quoted/spaced arguments work.
+- A staged `--root` preview now reports an active host firewall (ufw/firewalld)
+  instead of only failing at the real apply.
+- Plain-language pass over the wizard prompts; clearer cross-distro messaging.
+
 ## [1.0.8] - 2026-06-15
 
 ### Added
