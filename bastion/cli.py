@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -316,11 +318,12 @@ def cmd_firewall(args: argparse.Namespace) -> int:
 # `bastion ai <action>` maps to edge-ctl, the L3 operator kill switch (Commandment #6). edge-ctl
 # is the implementation (it enforces root and does the nft flush / spool clear / timer toggle); this
 # surfaces the human kill switch on the top-level CLI, as the docs and L3 install message promise.
-# proposals = list the human-review queue (propose_base_change); rollback <id> = undo one audit
-# record's applied elements. edge-ctl self-elevates (`sudo -n`) for every subcommand, so all of
-# these need root regardless. (D3 will add `ai proposals apply/reject`; today it is list-only.)
+# proposals = list the human-review queue (propose_base_change); accept/reject <id> resolve one;
+# rollback <id> = undo one audit record's applied elements. edge-ctl self-elevates (`sudo -n`) for
+# every subcommand, so all of these need root regardless.
 _AI_ACTIONS = {"enable": "ai-enable", "disable": "ai-disable", "panic": "panic", "status": "status",
-               "proposals": "proposals", "rollback": "rollback"}
+               "proposals": "proposals", "rollback": "rollback", "accept": "accept", "reject": "reject"}
+_AI_ID_ACTIONS = {"rollback", "accept", "reject"}   # take a trailing <id>
 
 
 def cmd_ai(args: argparse.Namespace) -> int:
@@ -336,9 +339,9 @@ def cmd_ai(args: argparse.Namespace) -> int:
         return 1
     edge_ctl = str(sys_.path(f"{ctx.sbin_dir}/edge-ctl"))
     argv = [edge_ctl, _AI_ACTIONS[args.action]]
-    if args.action == "rollback":
+    if args.action in _AI_ID_ACTIONS:
         if not getattr(args, "id", None):
-            print("bastion ai rollback needs an audit id: `bastion ai rollback <id>` "
+            print(f"bastion ai {args.action} needs an id: `bastion ai {args.action} <id>` "
                   "(see ids in `bastion ai proposals` / the reconciler audit log)", file=sys.stderr)
             return 1
         argv.append(args.id)
@@ -387,14 +390,107 @@ def _run_sbin(ctx: Context, name: str, *args: str, need_root: bool = True) -> in
     return sys_.run(str(sys_.path(rel)), *args, capture=False).returncode
 
 
+# --- D4: first-class named snapshots. net-snapshot/net-rollback operate on a single canonical
+#     blob (/var/lib/net-safe/snapshot — the watchdog's auto slot); naming is a save/restore layer
+#     on top so an operator can keep several known-good points and roll back to one by name. ---
+_NET_SAFE = "/var/lib/net-safe"
+_SNAP_CANON = f"{_NET_SAFE}/snapshot"        # the canonical/auto slot net-snapshot+watchdog use
+_SNAP_NAMED = f"{_NET_SAFE}/snapshots"       # /<name> — named copies
+_SNAP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _valid_snapshot_name(name: str) -> bool:
+    return bool(_SNAP_NAME_RE.fullmatch(name))
+
+
+def _save_named_snapshot(sys_: System, name: str) -> bool:
+    """Copy the canonical slot to snapshots/<name>. False if there's nothing to copy."""
+    canon = sys_.path(_SNAP_CANON)
+    if not canon.exists():
+        return False
+    dest = sys_.path(f"{_SNAP_NAMED}/{name}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(canon, dest)
+    return True
+
+
+def _restore_named_snapshot(sys_: System, name: str) -> bool:
+    """Copy snapshots/<name> over the canonical slot so net-rollback restores from it. False if
+    the named snapshot doesn't exist."""
+    src = sys_.path(f"{_SNAP_NAMED}/{name}")
+    if not src.exists():
+        return False
+    canon = sys_.path(_SNAP_CANON)
+    if canon.exists():
+        shutil.rmtree(canon)
+    canon.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, canon)
+    return True
+
+
+def _snapshot_taken_at(d: Path) -> str:
+    f = d / "taken-at"
+    return f.read_text().strip() if f.exists() else "?"
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    """Capture the current known-good network/firewall state (net-snapshot) for later rollback."""
-    return _run_sbin(build_context(args), "net-snapshot")
+    """Capture known-good network/firewall state (net-snapshot). With --name, also save it as a
+    named snapshot you can roll back to later."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    name = getattr(args, "name", None)
+    if name and not _valid_snapshot_name(name):
+        print(f"bastion snapshot: invalid name {name!r} (letters/digits/._- , up to 64 chars)",
+              file=sys.stderr)
+        return 1
+    rc = _run_sbin(ctx, "net-snapshot")          # refresh the canonical slot (root-enforced)
+    if rc != 0 or not name:
+        return rc
+    if not _save_named_snapshot(sys_, name):
+        print(f"bastion snapshot: net-snapshot produced no {_SNAP_CANON} to name", file=sys.stderr)
+        return 1
+    print(f"bastion snapshot: saved named snapshot '{name}' -> {_SNAP_NAMED}/{name}")
+    return 0
+
+
+def cmd_snapshots(args: argparse.Namespace) -> int:
+    """List the canonical (auto) snapshot and any named snapshots with their capture time."""
+    sys_ = build_context(args).system
+    canon = sys_.path(_SNAP_CANON)
+    print("bastion snapshots:")
+    print(f"  {'current (auto)':<18} {_snapshot_taken_at(canon) if canon.exists() else '(none — run `bastion snapshot`)'}")
+    base = sys_.path(_SNAP_NAMED)
+    named = sorted(d for d in base.iterdir() if d.is_dir()) if base.exists() else []
+    for d in named:
+        print(f"  {d.name:<18} {_snapshot_taken_at(d)}")
+    if not named:
+        print("  (no named snapshots — `bastion snapshot --name <name>`)")
+    return 0
 
 
 def cmd_rollback(args: argparse.Namespace) -> int:
-    """Restore the last snapshot (net-rollback) — idempotent, gentle; safe when state matches."""
-    return _run_sbin(build_context(args), "net-rollback", getattr(args, "reason", None) or "manual")
+    """Restore a snapshot (net-rollback) — idempotent, gentle; safe when state matches. With a
+    NAME, restore that named snapshot into the active slot first, then roll back to it."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    name = getattr(args, "name", None)
+    reason = getattr(args, "reason", None) or (f"rollback:{name}" if name else "manual")
+    if name:
+        if not _valid_snapshot_name(name):
+            print(f"bastion rollback: invalid name {name!r}", file=sys.stderr)
+            return 1
+        if os.geteuid() != 0 and sys_.root == Path("/"):
+            print("bastion rollback: needs root — run with sudo", file=sys.stderr)
+            return 1
+        if not _restore_named_snapshot(sys_, name):
+            print(f"bastion rollback: no named snapshot {name!r} (see `bastion snapshots`)",
+                  file=sys.stderr)
+            return 1
+        print(f"bastion rollback: restored named snapshot '{name}' to the active slot; "
+              "running net-rollback...")
+    return _run_sbin(ctx, "net-rollback", reason)
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -572,7 +668,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"bastion setup: {e}", file=sys.stderr)
         return 1
     wiz = Wizard(System(root=root), dry_run=args.dry_run, profile=args.profile, no_ai=args.no_ai,
-                 overrides=overrides)
+                 overrides=overrides, bootstrap=getattr(args, "bootstrap", False))
     result = wiz.run()
     if result.notes:
         print("\nnotes:")
@@ -592,6 +688,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "minimal-endpoint|custom)")
     setup.add_argument("--no-ai", action="store_true",
                        help="skip AI-assisted setup (Phase 5 is always rule-based; flag reserved)")
+    setup.add_argument("--bootstrap", action="store_true",
+                       help="soft recovery: re-detect from scratch, do NOT trust the existing "
+                            "machine.conf for detected values, and show where it disagrees with the "
+                            "live system (e.g. a wrong SSH port that locked you out)")
     setup.add_argument("--set", action="append", metavar="KEY=VALUE", dest="set",
                        help="set a config answer non-interactively (overrides detection + prompts); "
                             "repeatable, e.g. --set trusted_hosts=10.0.0.2 --set ssh_port=1111")
@@ -631,21 +731,30 @@ def build_parser() -> argparse.ArgumentParser:
     fw.set_defaults(func=cmd_firewall)
 
     ai = sub.add_parser("ai", help="control the L3 AI analysis layer (operator kill switch)")
-    ai.add_argument("action", choices=["enable", "disable", "panic", "status", "proposals", "rollback"],
+    ai.add_argument("action", choices=["enable", "disable", "panic", "status", "proposals",
+                                       "accept", "reject", "rollback"],
                     help="enable/disable arm the AI timer; panic flushes ai_* now; status shows state; "
-                         "proposals lists the human-review queue; rollback <id> undoes one audit record")
-    ai.add_argument("id", nargs="?", help="audit id for `rollback`")
+                         "proposals lists the review queue; accept/reject <id> resolve a proposal; "
+                         "rollback <id> undoes one audit record")
+    ai.add_argument("id", nargs="?", help="id for accept/reject/rollback")
     ai.add_argument("--conf", help="path to machine.conf")
     ai.add_argument("--root", help="operate under this base dir instead of /")
     ai.set_defaults(func=cmd_ai)
 
     snap = sub.add_parser("snapshot", help="capture known-good network/firewall state (net-snapshot)")
+    snap.add_argument("--name", help="also save this capture as a named snapshot")
     snap.add_argument("--conf", help="path to machine.conf")
     snap.add_argument("--root", help="operate under this base dir instead of /")
     snap.set_defaults(func=cmd_snapshot)
 
-    rb = sub.add_parser("rollback", help="restore the last snapshot (net-rollback)")
-    rb.add_argument("reason", nargs="?", help="optional reason string recorded in the log")
+    snaps = sub.add_parser("snapshots", help="list the auto snapshot + any named snapshots")
+    snaps.add_argument("--conf", help="path to machine.conf")
+    snaps.add_argument("--root", help="operate under this base dir instead of /")
+    snaps.set_defaults(func=cmd_snapshots)
+
+    rb = sub.add_parser("rollback", help="restore a snapshot (net-rollback); pass a name for a named one")
+    rb.add_argument("name", nargs="?", help="named snapshot to restore (omit = the auto slot)")
+    rb.add_argument("--reason", help="reason string recorded in the log (default: manual)")
     rb.add_argument("--conf", help="path to machine.conf")
     rb.add_argument("--root", help="operate under this base dir instead of /")
     rb.set_defaults(func=cmd_rollback)

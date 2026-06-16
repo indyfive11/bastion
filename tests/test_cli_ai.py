@@ -92,5 +92,25 @@ def test_ai_rollback_without_id_errors(monkeypatch, capsys):
     _patch_ctx(monkeypatch, fake)
     args = cli.build_parser().parse_args(["ai", "rollback", "--root", "/staged"])
     assert cli.cmd_ai(args) == 1
-    assert "audit id" in capsys.readouterr().err
+    assert "needs an id" in capsys.readouterr().err
     assert fake.calls == []   # never shelled out
+
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_ai_accept_reject_pass_id(monkeypatch, action):
+    fake = FakeSystem(Path("/staged"))
+    _patch_ctx(monkeypatch, fake)
+    args = cli.build_parser().parse_args(["ai", action, "abc123", "--root", "/staged"])
+    assert cli.cmd_ai(args) == 0
+    call = next(c for c in fake.calls if c[1] == action)
+    assert call[2] == "abc123"
+
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_ai_accept_reject_without_id_errors(monkeypatch, action, capsys):
+    fake = FakeSystem(Path("/staged"))
+    _patch_ctx(monkeypatch, fake)
+    args = cli.build_parser().parse_args(["ai", action, "--root", "/staged"])
+    assert cli.cmd_ai(args) == 1
+    assert "needs an id" in capsys.readouterr().err
+    assert fake.calls == []

@@ -310,11 +310,14 @@ class Wizard:
     def __init__(self, sys: System, *, dry_run: bool = False, profile: str | None = None,
                  no_ai: bool = True, inp=input, out=print, assume_defaults: bool | None = None,
                  example_conf: str | None = None, secret_inp=getpass.getpass,
-                 overrides: dict[str, str] | None = None):
+                 overrides: dict[str, str] | None = None, bootstrap: bool = False):
         self.sys = sys
         self.dry_run = dry_run
         self.profile_arg = profile
         self.no_ai = no_ai
+        # D5: soft-recovery. Distrust the existing machine.conf (don't overlay it as the base) and
+        # surface where detection disagrees with it — the "changed SSH port, locked myself out" fix.
+        self.bootstrap = bootstrap
         self.inp = inp
         self.out = out
         self.secret_inp = secret_inp   # hidden input for secrets (getpass); injectable for tests
@@ -447,7 +450,14 @@ class Wizard:
         # still take precedence (they flow in as the high-priority layer of build_machine_conf).
         base = state.load_conf(self.example_path)
         existing = self._load_existing_conf()
-        if existing:
+        if self.bootstrap:
+            # D5: re-detect from zero; do NOT overlay the (possibly broken) conf, and show the diff
+            # so the operator sees what the current conf got wrong before the fresh one is written.
+            self.out("  soft-recovery (--bootstrap): re-detecting from scratch; the existing "
+                     "machine.conf is NOT trusted for detected values.")
+            if existing:
+                self._show_bootstrap_diff(d, existing)
+        elif existing:
             base = self._merge_conf(base, existing)
             self.out("  found an existing machine.conf — preserving settings you didn't change "
                      "(your answers + detection still take precedence).")
@@ -533,6 +543,28 @@ class Wizard:
             for k, v in items.items():
                 dst[k] = v
         return out
+
+    def _show_bootstrap_diff(self, d: detectmod.Detection, existing: dict) -> None:
+        """D5: print the fields where the current machine.conf disagrees with fresh detection —
+        the lockout culprit (often ssh port) shows up here. Only flags fields where BOTH a detected
+        and a current value exist and they differ (a blank either side isn't a 'wrong' value)."""
+        rows = [
+            ("ssh port", str(d.ssh_port), existing.get("ports", {}).get("ssh", "")),
+            ("lan iface", d.lan_iface or "", existing.get("interfaces", {}).get("lan", "")),
+            ("wan iface", d.wan_iface or "", existing.get("interfaces", {}).get("wan", "")),
+            ("lan cidr", d.lan_cidr or "", existing.get("network", {}).get("lan_cidr", "")),
+            ("lan ip", d.lan_ip or "", existing.get("network", {}).get("lan_ip", "")),
+            ("gateway", d.gateway or "", existing.get("network", {}).get("gateway", "")),
+        ]
+        mismatch = [(lbl, det, cur) for lbl, det, cur in rows if cur and det and cur != det]
+        if not mismatch:
+            self.out("  bootstrap diff: detection agrees with the current machine.conf on key fields.")
+            return
+        self.out("  bootstrap diff — current machine.conf DISAGREES with the live system:")
+        for lbl, det, cur in mismatch:
+            self.out(f"    {lbl}: conf={cur}  detected={det}")
+        self.out("  (a wrong ssh port is the usual lockout cause; the wizard will write the "
+                 "detected values.)")
 
     def _confirm_step(self, config: dict, mode: str, profile: str) -> bool:
         """C1: show what will be written/installed and ask to proceed. Returns True to go ahead.
@@ -861,8 +893,12 @@ class Wizard:
         #     wg-quick@<iface> only when the conf is present). Needs `wg`, just installed in 7a.
         notes += self._wg_configure(config)
 
-        # 7c. Each active layer's install(), in order. A single layer's failure must not abort the
-        #     rest (the firewall core L0 installs first; later layers degrade independently).
+        # 7c. B1 — install as a transaction. Snapshot BEFORE touching the firewall so a failed
+        #     core (L0) install can auto-roll-back. L0 is the drop-policy ruleset — the one layer
+        #     whose half-applied state can lock the box out — so its failure ABORTS the whole
+        #     install (and rolls back if we snapped). A LATER layer's failure leaves the firewall
+        #     core up and is reported as retryable, not fatal.
+        snapped = self._pre_install_snapshot(ctx)
         for lid in self._active_layer_ids(config):
             layer = layermod.get(lid)
             if layer is None:
@@ -870,13 +906,49 @@ class Wizard:
             self.out(f"  installing {lid} ({layer.name})...")
             try:
                 layer.install(ctx)
-            except Exception as exc:                       # noqa: BLE001 — one layer must not abort
-                self.out(f"  ! {lid} install error: {exc}")
-                notes.append(f"{lid} install raised: {exc}")
+            except Exception as exc:                       # noqa: BLE001
+                if lid == "l0":
+                    self.out(f"  ! l0 (firewall core) install FAILED: {exc}")
+                    notes.append(f"l0 install failed: {exc}; aborted before later layers.")
+                    if snapped:
+                        notes += self._auto_rollback(ctx, "setup-l0-failure")
+                    else:
+                        notes.append("no pre-install snapshot was captured — restore the network "
+                                     "manually if egress is broken.")
+                    return pkgs, notes
+                self.out(f"  ! {lid} install error: {exc} — firewall core is up; retry with "
+                         f"`sudo bastion layer install {lid}`")
+                notes.append(f"{lid} install raised: {exc} (retryable — core firewall is up).")
 
         # 7d. ZeroTier join AFTER L5 started zerotier-one (the cli needs the daemon running).
         notes += self._zt_join_step(config)
         return pkgs, notes
+
+    def _pre_install_snapshot(self, ctx) -> bool:
+        """B1 rollback point: capture a pre-install network snapshot with the net-snapshot script
+        from scripts_dir (it isn't in sbin yet). Best-effort; True only if it actually ran. Needs
+        machine.env, which step 6 already wrote."""
+        script = ctx.scripts_dir / "net-snapshot"
+        if not script.exists():
+            return False
+        try:
+            if self.sys.run("bash", str(script), capture=False).returncode == 0:
+                self.out("  captured a pre-install snapshot (rollback point).")
+                return True
+        except Exception as exc:                           # noqa: BLE001
+            self.out(f"  pre-install snapshot skipped ({exc}).")
+        return False
+
+    def _auto_rollback(self, ctx, reason: str) -> list[str]:
+        """Restore the pre-install snapshot via the net-rollback script (also from scripts_dir)."""
+        script = ctx.scripts_dir / "net-rollback"
+        if not script.exists():
+            return ["auto-rollback unavailable (net-rollback script missing) — restore manually."]
+        self.out("  auto-rolling back to the pre-install snapshot...")
+        rc = self.sys.run("bash", str(script), reason, capture=False).returncode
+        if rc == 0:
+            return ["auto-rolled back to the pre-install network snapshot after the l0 failure."]
+        return ["auto-rollback reported errors — verify network state manually."]
 
     def _wg_configure(self, config: dict) -> list[str]:
         """Generate WireGuard keypairs + write complete /etc/wireguard/<iface>.conf from operator-

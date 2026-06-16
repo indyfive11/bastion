@@ -8,9 +8,11 @@
 #   edge-ctl ai-disable             # stop+disable edge-ai.timer, then panic (full stop)
 #   edge-ctl ai-enable              # enable+start edge-ai.timer (arm)
 #   edge-ctl rollback <id>          # remove the elements applied by one audit record id
-#   edge-ctl proposals              # show pending propose_base_change suggestions
+#   edge-ctl proposals              # list PENDING propose_base_change suggestions (with ids)
+#   edge-ctl accept <id>            # mark a proposal reviewed+accepted (you enact it manually)
+#   edge-ctl reject <id>            # dismiss a proposal from the pending queue
 #
-import json, os, subprocess, sys, time
+import hashlib, json, os, subprocess, sys, time
 
 AI_SETS  = ["ai_block", "ai_ratelimit", "ai_tarpit"]
 
@@ -38,6 +40,7 @@ FAM, TBL = _nft_table()
 INTENTS  = "/var/lib/edge-ai/intents.json"
 SIGNALS  = "/var/lib/edge-ai/signals.json"
 PROPOSALS= "/var/lib/edge-ai/proposals.jsonl"
+RESOLVED = "/var/lib/edge-ai/proposals-resolved.jsonl"   # accept/reject decisions (sidecar)
 AUDIT    = "/var/log/edge-reconciler/audit.jsonl"
 TIMER    = "edge-ai.timer"
 
@@ -216,13 +219,71 @@ def cmd_rollback(rid):
         print(f"  {c}: {st}")
     return 0
 
-def cmd_proposals():
+def _proposal_id(rec):
+    """Stable content-derived id (proposals.jsonl carries no id of its own). Survives the
+    append-only file being logrotated; duplicate-content proposals collapse to one id (harmless)."""
+    raw = f"{rec.get('ts','')}\x00{rec.get('description','')}".encode()
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def _load_proposals():
     try:
-        rows = [json.loads(l) for l in open(PROPOSALS)][-20:]
+        return [json.loads(l) for l in open(PROPOSALS) if l.strip()]
     except FileNotFoundError:
-        print("(no proposals)"); return 0
-    for r in rows:
-        print(f"  [{r.get('ts', r.get('backend'))}] {r.get('description','')[:160]}")
+        return []
+
+
+def _resolved_ids():
+    ids = set()
+    try:
+        for l in open(RESOLVED):
+            if l.strip():
+                ids.add(json.loads(l).get("id"))
+    except FileNotFoundError:
+        pass
+    return ids
+
+
+def _pending_proposals():
+    """(id, record) for proposals not yet accepted/rejected; dedup by id."""
+    resolved = _resolved_ids()
+    seen, out = set(), []
+    for r in _load_proposals():
+        pid = _proposal_id(r)
+        if pid in resolved or pid in seen:
+            continue
+        seen.add(pid); out.append((pid, r))
+    return out
+
+
+def cmd_proposals():
+    pend = _pending_proposals()
+    if not pend:
+        print("(no pending proposals)"); return 0
+    print(f"== pending AI proposals ({len(pend)}) — review, then `edge-ctl accept|reject <id>` ==")
+    for pid, r in pend[-50:]:
+        print(f"  {pid}  [{r.get('ts','?')}]  {r.get('description','')[:160]}")
+    print("NOTE: advisory base/access suggestions — NOTHING is auto-applied. 'accept' only records")
+    print("your decision; enact the change yourself (e.g. edit machine.conf + `bastion generate`).")
+    return 0
+
+
+def cmd_proposal_resolve(pid, disposition):
+    match = next((r for i, r in _pending_proposals() if i == pid), None)
+    if match is None:
+        print(f"no pending proposal with id {pid} (see `edge-ctl proposals`)"); return 1
+    rec = {"id": pid, "disposition": disposition,
+           "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+           "description": match.get("description", "")[:160]}
+    try:
+        with open(RESOLVED, "a") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception as e:
+        print(f"error: could not record decision: {e}", file=sys.stderr); return 1
+    audit({"event": "edge-ctl", "action": f"proposal-{disposition}", "id": pid})
+    print(f"proposal {pid} {disposition}.")
+    if disposition == "accept":
+        print("  reminder: enact the change manually — bastion never auto-applies base/access changes.")
     return 0
 
 def main():
@@ -239,6 +300,9 @@ def main():
         if len(args) < 2: print("usage: edge-ctl rollback <id>"); return 1
         return cmd_rollback(args[1])
     if c == "proposals": return cmd_proposals()
+    if c in ("accept", "reject"):
+        if len(args) < 2: print(f"usage: edge-ctl {c} <id>"); return 1
+        return cmd_proposal_resolve(args[1], c)
     print(f"unknown command: {c}\n{__doc__}"); return 1
 
 if __name__ == "__main__":

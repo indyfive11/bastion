@@ -572,3 +572,80 @@ def test_install_step_reports_host_firewall_in_dry_run():
     _plan, notes = w._install_step(cfg, "edge")
     assert any("ufw" in n for n in notes)
     assert any("ufw is active" in line for line in lines)
+
+
+# --- D5: --bootstrap soft-recovery ----------------------------------------
+def test_bootstrap_shows_diff_and_distrusts_conf(tmp_path):
+    # Current conf claims ssh 9999 (the lockout) and ai.depth=expert; detection says ssh 1122.
+    p = tmp_path / "etc" / "bastion" / "machine.conf"
+    p.parent.mkdir(parents=True)
+    p.write_text("[machine]\nmode = edge\n[ports]\nssh = 9999\n[ai]\ndepth = expert\n")
+    s = edge_system()
+    s.root = tmp_path
+    lines: list[str] = []
+    w = wizard.Wizard(s, dry_run=True, profile="full-edge", assume_defaults=True, bootstrap=True,
+                      example_conf=str(EXAMPLE), out=lambda *a: lines.append(" ".join(str(x) for x in a)))
+    res = w.run()
+    # the diff surfaces the stale ssh port (the lockout culprit)
+    assert any("conf=9999" in l and "detected=1122" in l for l in lines)
+    # bootstrap does NOT overlay the old conf, so a non-prompted hand-edit reverts to the skeleton
+    assert res.config["ai"]["depth"] == "regular"
+    # and the fresh conf carries the detected ssh port, not the stale one
+    assert res.config["ports"]["ssh"] == "1122"
+
+
+def test_non_bootstrap_preserves_conf_default(tmp_path):
+    # Contrast: WITHOUT --bootstrap, A4 overlay keeps the hand-edited ai.depth.
+    p = tmp_path / "etc" / "bastion" / "machine.conf"
+    p.parent.mkdir(parents=True)
+    p.write_text("[machine]\nmode = edge\n[ai]\ndepth = expert\n")
+    s = edge_system()
+    s.root = tmp_path
+    w = wizard.Wizard(s, dry_run=True, profile="full-edge", assume_defaults=True,
+                      example_conf=str(EXAMPLE), out=lambda *a: None)
+    assert w.run().config["ai"]["depth"] == "expert"
+
+
+# --- B1: install transaction with auto-rollback on L0 failure -------------
+class _FailLayer(_StubLayer):
+    def install(self, ctx):
+        raise RuntimeError("boom")
+
+
+def _patch_fail_l0(monkeypatch):
+    import bastion.layers as layermod
+    from bastion.setup import pkg as pkgmod
+    real = dict(layermod.REGISTRY)
+    calls: list[str] = []
+    monkeypatch.setattr(pkgmod, "detect_manager", lambda sysd, distro=None: _FakeMgr())
+    monkeypatch.setattr(layermod, "get",
+                        lambda lid: (_FailLayer(lid, calls, real.get(lid)) if lid == "l0"
+                                     else _StubLayer(lid, calls, real.get(lid))))
+    return calls
+
+
+class _SnapFake(_LiveFake):
+    """Records bash net-snapshot/net-rollback invocations and returns rc 0 for them."""
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        self.ran: list[tuple] = []
+
+    def run(self, *args, capture=True):
+        self.ran.append(args)
+        if len(args) >= 2 and str(args[1]).endswith(("net-snapshot", "net-rollback")):
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return super().run(*args, capture=capture)
+
+
+def test_l0_failure_aborts_and_auto_rolls_back(tmp_path, monkeypatch):
+    calls = _patch_fail_l0(monkeypatch)
+    sysd = _SnapFake(tmp_path)
+    wiz = wizard.Wizard(sysd, dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE), out=lambda *a: None)
+    res = wiz.run()
+    # snapshot taken pre-install, l0 raised → rollback ran, later layers never attempted.
+    assert any("net-snapshot" in " ".join(str(x) for x in a) for a in sysd.ran)
+    assert any("net-rollback" in " ".join(str(x) for x in a) for a in sysd.ran)
+    assert calls == []                                   # no layer install recorded (l0 raised first)
+    assert any("l0 install failed" in n for n in res.notes)
+    assert any("auto-rolled back" in n for n in res.notes)

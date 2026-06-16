@@ -57,7 +57,7 @@ def test_confirm_runs_net_confirm(monkeypatch):
 def test_rollback_passes_reason(monkeypatch):
     fake = FakeSystem(Path("/staged"))
     _ctx(monkeypatch, fake)
-    args = cli.build_parser().parse_args(["rollback", "egress-blip", "--root", "/staged"])
+    args = cli.build_parser().parse_args(["rollback", "--reason", "egress-blip", "--root", "/staged"])
     assert cli.cmd_rollback(args) == 0
     assert _ran(fake, "/usr/local/sbin/net-rollback")[1] == "egress-blip"
 
