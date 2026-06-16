@@ -20,6 +20,10 @@
 192.168.0.0/16
 # --- CGNAT (possible ISP gateway space once this node is the WAN edge) ---
 100.64.0.0/10
+# --- IPv6 loopback + link-local + unique-local (the v6 analogue of loopback + RFC1918) ---
+::1/128
+fe80::/10
+fc00::/7
 
 # --- installation-specific entries are added below by the installer, e.g.: ---
 #   <relay/tunnel far-end public IP>/32        (anti-stranding for your upstream relay)

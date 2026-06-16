@@ -15,9 +15,21 @@ table inet bastion {
     set ai_ratelimit { type ipv4_addr; flags interval, timeout; }
     set ai_tarpit { type ipv4_addr; flags interval, timeout; }
 
+    # IPv6 siblings — edge-reconciler routes each validated candidate to the family-matched set.
+    set blk_feed6 { type ipv6_addr; flags interval, timeout; }
+    set cs_block6 { type ipv6_addr; flags interval, timeout; }
+    set ai_block6 { type ipv6_addr; flags interval, timeout; }
+    set ai_ratelimit6 { type ipv6_addr; flags interval, timeout; }
+    set ai_tarpit6 { type ipv6_addr; flags interval, timeout; }
+
     set trusted_hosts {
         type ipv4_addr
         {{ network.trusted_hosts_elements }}
+    }
+
+    set trusted_hosts6 {
+        type ipv6_addr
+        {{ network.trusted_hosts6_elements }}
     }
 
     chain input {
@@ -33,6 +45,12 @@ table inet bastion {
         ip saddr @ai_ratelimit ct state new limit rate over 10/second burst 20 packets drop
         ip saddr @ai_tarpit ct state new limit rate over 2/minute burst 5 packets drop
 
+        ip6 saddr @cs_block6 drop
+        ip6 saddr @blk_feed6 drop
+        ip6 saddr @ai_block6 drop
+        ip6 saddr @ai_ratelimit6 ct state new limit rate over 10/second burst 20 packets drop
+        ip6 saddr @ai_tarpit6 ct state new limit rate over 2/minute burst 5 packets drop
+
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
         ip protocol icmp icmp type echo-request limit rate 10/second accept
         ip6 nexthdr ipv6-icmp accept
@@ -40,6 +58,7 @@ table inet bastion {
         # Management access from the local subnet + explicitly trusted hosts only.
         ip saddr {{ network.lan_cidr }} tcp dport {{ ports.ssh }} accept
         ip saddr @trusted_hosts accept
+        ip6 saddr @trusted_hosts6 accept
     }
 
     # No forward chain and no NAT table: an endpoint never routes for other hosts.

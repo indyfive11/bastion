@@ -35,15 +35,20 @@ AI_MAX_ADDS_PER_RUN = 64        # invariant #4: blast-radius cap across all ai_*
 # typed AI verb -> managed set. Verbs NOT here (e.g. propose_base_change) can never apply.
 ACTION_SET = {"block_src": "ai_block", "ratelimit_src": "ai_ratelimit", "tarpit_src": "ai_tarpit"}
 
-# Per managed set: which source feeds it + the smallest prefixlen allowed (width floor).
-# CrowdSec bans are ~/32; feeds may carry curated broader blocks. AI (Stage 6) = /24 strict.
+# Per managed set: which source feeds it + the smallest prefixlen allowed (width floor),
+# per address family. A candidate broader than its family's floor is rejected. CrowdSec bans
+# are ~/32 (v4) ~/128 (v6); feeds may carry curated broader blocks; AI (Stage 6) is single-LAN
+# strict (/24 v4, /64 v6). The v6 floors are scaled to the v4 ones (a /8 v4 ~= a /19 v6 chunk of
+# the address space; a single LAN is /24 v4 and /64 v6). Each set has an IPv6 sibling `<name>6`
+# (an nft `ipv6_addr` set) — v6 candidates are routed there, v4 to `<name>`.
 SETS = {
-    "cs_block":     {"source": "cscli", "min_prefix": 16},
-    "blk_feed":     {"source": "feed",  "min_prefix": 8},
-    "ai_block":     {"source": "ai",    "min_prefix": 24},
-    "ai_ratelimit": {"source": "ai",    "min_prefix": 24},
-    "ai_tarpit":    {"source": "ai",    "min_prefix": 24},
+    "cs_block":     {"source": "cscli", "min_prefix": {4: 16, 6: 32}},
+    "blk_feed":     {"source": "feed",  "min_prefix": {4: 8,  6: 19}},
+    "ai_block":     {"source": "ai",    "min_prefix": {4: 24, 6: 64}},
+    "ai_ratelimit": {"source": "ai",    "min_prefix": {4: 24, 6: 64}},
+    "ai_tarpit":    {"source": "ai",    "min_prefix": {4: 24, 6: 64}},
 }
+AI_MIN_PREFIX = {4: 24, 6: 64}     # shared by the single-pass AI source (feeds all three ai_* sets)
 
 DRYRUN = "--dry-run" in sys.argv[1:]
 
@@ -80,21 +85,33 @@ def parse_duration(s):
     return int(-total if neg else total)
 
 def validate(value, allow, min_prefix):
-    # returns (ok, reason, normalized_str). IPv4 only for now.
+    # returns (ok, reason, normalized_str). Handles BOTH IPv4 and IPv6; the caller routes the
+    # normalized result to the family-matched set. min_prefix is a {4: floor, 6: floor} dict.
     try:
         net = ipaddress.ip_network(value, strict=False)
     except ValueError as e:
         return False, f"unparseable({e})", None
-    if net.version != 4:
-        return False, "not-ipv4", None
+    if net.version not in (4, 6):
+        return False, "bad-family", None
     if allow is None:
         return False, "allowlist-missing-failclosed", None
-    if net.prefixlen < min_prefix:
-        return False, f"cidr-too-broad(/{net.prefixlen}<{min_prefix})", None
+    floor = min_prefix[net.version]
+    if net.prefixlen < floor:
+        return False, f"cidr-too-broad(/{net.prefixlen}<{floor})", None
     for a in allow:
-        if a.version == 4 and net.overlaps(a):
+        if a.version == net.version and net.overlaps(a):
             return False, f"allowlisted({a})", None
     return True, "", str(net)
+
+
+def split_by_family(desired):
+    """Partition a {cidr: ttl} dict into ({v4 cidr: ttl}, {v6 cidr: ttl}). The reconciler keeps
+    one logical desired-state per source but writes two nft sets (the v4 set and its `…6` sibling),
+    because an nft set is single-family."""
+    v4, v6 = {}, {}
+    for cidr, ttl in desired.items():
+        (v6 if ipaddress.ip_network(cidr).version == 6 else v4)[cidr] = ttl
+    return v4, v6
 
 # ---------- sources (return dict {normalized_cidr: ttl_seconds} or None on hard error) ----
 def desired_cscli(allow, min_prefix):
@@ -270,7 +287,7 @@ def main():
     allow = load_allowlist()
     summary = {"dry_run": DRYRUN, "sets": {}}
     # AI source feeds 3 sets from ONE spool -> read it once, partition by action.
-    ai_desired, ai_rejected = desired_ai_all(allow, 24)
+    ai_desired, ai_rejected = desired_ai_all(allow, AI_MIN_PREFIX)
     for setname, cfg in SETS.items():
         if cfg["source"] == "cscli":
             desired, rejected = desired_cscli(allow, cfg["min_prefix"])
@@ -282,36 +299,41 @@ def main():
         else:
             continue
         if desired is None:
-            summary["sets"][setname] = {"skipped": "source-error-left-untouched",
-                                        "rejected": rejected}
-            audit({"event": "reconcile", "set": setname, "result": "skipped-source-error",
-                   "rejected": rejected})
+            # Source hard-error: leave BOTH the v4 set and its v6 sibling untouched (self-heal).
+            for nm in (setname, setname + "6"):
+                summary["sets"][nm] = {"skipped": "source-error-left-untouched", "rejected": rejected}
+                audit({"event": "reconcile", "set": nm, "result": "skipped-source-error",
+                       "rejected": rejected})
             continue
         raw_count = len(desired)
-        desired = dedupe_intervals(desired)   # collapse overlaps for nft interval sets
-        before = current_set(setname)
-        ok, detail = reconcile_set(setname, desired)
-        rec = {"event": "reconcile", "set": setname, "source": cfg["source"],
-               "candidate_count": raw_count, "desired_count": len(desired),
-               "rejected_count": len(rejected),
-               "rejected": rejected[:50], "applied": ok, "detail": detail}
-        if cfg["source"] == "ai":
-            # rollback handle for edge-ctl: id -> (set, exact elements applied).
-            # Nanosecond clock + pid (not whole seconds) so two reconcile passes landing
-            # in the same wall-clock second can't mint the same id and make `edge-ctl
-            # rollback <id>` ambiguous. edge-ctl treats the id as an opaque string.
-            rec["id"] = f"{time.time_ns()}-{os.getpid()}-{setname}"
-            rec["ai_elements"] = list(desired.keys())
-        if before is not None:
-            rec["before_count"] = len(before)
-        # noise guard: for the high-frequency ai sets, don't audit a pure no-op
-        # (empty desired, nothing rejected, set already empty).
-        noop = (cfg["source"] == "ai" and not desired and not rejected
-                and (before is None or len(before) == 0))
-        if not noop:
-            audit(rec)
-        summary["sets"][setname] = {"desired": len(desired), "rejected": len(rejected),
-                                    "applied": ok, "detail": detail}
+        # Route by family: v4 -> `<set>`, v6 -> `<set>6`. Each is an independent single-family
+        # nft set, reconciled (and audited) on its own. Rejections are reported once, on the v4
+        # record, to avoid double-counting (validate() already split nothing — it only accepts).
+        v4_des, v6_des = split_by_family(desired)
+        for fam_n, (nm, fam_des) in enumerate(((setname, v4_des), (setname + "6", v6_des))):
+            fam_des = dedupe_intervals(fam_des)   # collapse overlaps for nft interval sets
+            before = current_set(nm)
+            ok, detail = reconcile_set(nm, fam_des)
+            rec = {"event": "reconcile", "set": nm, "source": cfg["source"],
+                   "candidate_count": raw_count if fam_n == 0 else len(fam_des),
+                   "desired_count": len(fam_des),
+                   "rejected_count": len(rejected) if fam_n == 0 else 0,
+                   "rejected": rejected[:50] if fam_n == 0 else [], "applied": ok, "detail": detail}
+            if cfg["source"] == "ai":
+                # rollback handle for edge-ctl: id -> (set, exact elements applied). Nanosecond
+                # clock + pid + set name so two passes (or the v4/v6 siblings) can't collide.
+                rec["id"] = f"{time.time_ns()}-{os.getpid()}-{nm}"
+                rec["ai_elements"] = list(fam_des.keys())
+            if before is not None:
+                rec["before_count"] = len(before)
+            # noise guard: for the high-frequency ai sets, don't audit a pure no-op
+            # (empty desired, nothing rejected, set already empty).
+            noop = (cfg["source"] == "ai" and not fam_des and not rec["rejected"]
+                    and (before is None or len(before) == 0))
+            if not noop:
+                audit(rec)
+            summary["sets"][nm] = {"desired": len(fam_des), "rejected": rec["rejected_count"],
+                                   "applied": ok, "detail": detail}
     print(json.dumps(summary, indent=2))
     return 0
 

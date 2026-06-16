@@ -14,7 +14,13 @@
 #
 import hashlib, json, os, subprocess, sys, time
 
-AI_SETS  = ["ai_block", "ai_ratelimit", "ai_tarpit"]
+# The kill switch must reach BOTH families. The v4 sets are MANDATORY (always present once L0 is
+# installed) — their flush failing is a real fault. The `…6` siblings are flushed too, but a node
+# whose nft ruleset predates the IPv6 sets legitimately lacks them, so a missing v6 set is NOT a
+# kill-switch failure (see flush_ai_sets / _flush_failures).
+AI_SETS_V4 = ["ai_block", "ai_ratelimit", "ai_tarpit"]
+AI_SETS6   = [s + "6" for s in AI_SETS_V4]
+AI_SETS    = AI_SETS_V4 + AI_SETS6
 
 
 def _nft_table():
@@ -77,8 +83,21 @@ def flush_ai_sets():
     out = {}
     for s in AI_SETS:
         p = nft("flush", "set", FAM, TBL, s)
-        out[s] = "flushed" if p.returncode == 0 else f"ERR:{p.stderr.strip()[:80]}"
+        if p.returncode == 0:
+            out[s] = "flushed"
+        elif _set_absent(p.stderr):
+            # A v6 sibling can be legitimately absent on a node whose ruleset predates IPv6 sets;
+            # nothing to flush there is not a kill-switch fault. A MISSING v4 set, however, still
+            # trips _flush_failures (the managed table/sets shouldn't have vanished).
+            out[s] = "absent"
+        else:
+            out[s] = f"ERR:{p.stderr.strip()[:80]}"
     return out
+
+
+def _set_absent(stderr):
+    e = (stderr or "").lower()
+    return "does not exist" in e or "no such file" in e
 
 def clear_spool():
     try:
@@ -130,11 +149,20 @@ def cmd_status():
     return 0
 
 def _flush_failures(res):
-    """Sets whose flush returned an nft error. A kill switch MUST NOT report success while it
+    """Sets whose flush returned a real nft error. A kill switch MUST NOT report success while it
     silently did nothing (e.g. the managed table/sets are gone, or NFT_TABLE resolved wrong), so
     these propagate to a non-zero exit. `nft flush set` succeeds on an existing-but-empty set, so
-    a clean node never trips this."""
-    return [s for s, r in res.items() if isinstance(r, str) and r.startswith("ERR:")]
+    a clean node never trips this. A v6 sibling reported "absent" (pre-IPv6 ruleset) is NOT a
+    failure; a MANDATORY v4 set that is absent IS (it should always exist once L0 is installed)."""
+    failed = []
+    for s, r in res.items():
+        if not isinstance(r, str):
+            continue
+        if r.startswith("ERR:"):
+            failed.append(s)
+        elif r == "absent" and s in AI_SETS_V4:
+            failed.append(s)
+    return failed
 
 def cmd_panic():
     res = flush_ai_sets()

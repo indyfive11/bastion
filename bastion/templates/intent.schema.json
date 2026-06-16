@@ -23,8 +23,8 @@
           },
           "cidr": {
             "type": "string",
-            "maxLength": 18,
-            "description": "IPv4 host or network, prefix >= /24. Required for block/ratelimit/tarpit; ignored for propose_base_change."
+            "maxLength": 49,
+            "description": "IPv4 or IPv6 host or network (v4 prefix >= /24, v6 prefix >= /64; edge-reconciler re-validates the floor per family). Required for block/ratelimit/tarpit; ignored for propose_base_change."
           },
           "ttl": {
             "type": "integer",

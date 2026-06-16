@@ -106,6 +106,10 @@ phase "2 — L0 core (drop-policy base + kill switch + persistence)"
 $BASTION layer install l0 </dev/null; rc=$?
 [ $rc -eq 0 ] && pass "layer install l0" || fail "layer install l0 (rc=$rc)"
 check_rc "table $FAM $TABLE loaded" nft list table $FAM $TABLE
+# D6: every managed set has an IPv6 sibling loaded by the L0 template.
+for s in blk_feed6 cs_block6 ai_block6 ai_ratelimit6 ai_tarpit6 trusted_hosts6; do
+  check_rc "$s (v6) set present" nft list set $FAM $TABLE $s
+done
 # Commandment: bastion-recovery always installed in L0, and DISABLED by default (kill switch present,
 # not armed). An armed rescue path at install time would itself be the hole.
 check_rc "bastion-recovery script installed" test -x /usr/local/sbin/bastion-recovery

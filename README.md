@@ -57,6 +57,11 @@ Use the **`full-edge`** profile (or **`basic-edge`** to skip DNS/DHCP and the AI
 requires **at least two network interfaces** — one WAN, one LAN (or a single NIC split into VLANs
 on a managed switch).
 
+The threat-intel sets are **dual-stack**: every managed set (threat-feed, CrowdSec, and AI block /
+rate-limit / tarpit) has an IPv4 and an IPv6 variant, and the reconciler routes each blocked
+source to the family-matched set — so a host attacking over IPv6 is filtered the same as over IPv4.
+`trusted_hosts` may likewise contain IPv6 addresses.
+
 ### Suggested hardware
 
 bastion's data path is plain in-kernel nftables, and its threat-intel layer (CrowdSec) is

@@ -19,7 +19,8 @@ import ipaddress, json, os, re, subprocess, sys, time
 ALLOWLIST   = "/etc/edge-reconciler/policy.allowlist"
 OUT         = "/var/lib/edge-ai/signals.json"
 WINDOW_HOURS = 24
-AI_SETS     = ["ai_block", "ai_ratelimit", "ai_tarpit"]
+AI_SETS     = ["ai_block", "ai_ratelimit", "ai_tarpit",
+               "ai_block6", "ai_ratelimit6", "ai_tarpit6"]   # report what we've done in BOTH families
 
 
 def _nft_table():
@@ -61,17 +62,18 @@ def load_allowlist():
     return nets
 
 def is_emittable(ipstr, allow):
-    # external-safe gate: only PUBLIC IPs that are not ours.
+    # external-safe gate: only PUBLIC IPs that are not ours. Both families (the data plane now
+    # blocks v6 too); is_global strips ULA/link-local/loopback for v6 just as it does RFC1918 for v4.
     try:
         ip = ipaddress.ip_address(ipstr)
     except ValueError:
         return False
-    if ip.version != 4:          # IPv4 only for now (matches the data plane)
+    if ip.version not in (4, 6):
         return False
-    if not ip.is_global:         # strips RFC1918, loopback, CGNAT 100.64/10, link-local, etc.
+    if not ip.is_global:         # strips RFC1918/CGNAT/loopback (v4) and ULA fc00::/7 / fe80::/10 / ::1 (v6)
         return False
     for a in allow:
-        if a.version == 4 and ip in a:   # strips VPS / Anthropic / any allowlisted infra
+        if a.version == ip.version and ip in a:   # strips VPS / Anthropic / any allowlisted infra
             return False
     return True
 
@@ -121,6 +123,9 @@ def crowdsec_signals(obs, allow):
         o["crowdsec_active_decision"] = True
 
 IP_RE = re.compile(r'(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])')
+# IPv6 in sshd lines (e.g. "Failed password for root from 2001:db8::1 port 22"). Permissive: needs
+# >=2 colon groups; is_emittable() re-parses and is the real gate, so a loose match can't leak.
+IP6_RE = re.compile(r'(?<![0-9A-Fa-f:])((?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})(?![0-9A-Fa-f:])')
 def journal_sshd_signals(obs, allow):
     out = run(["journalctl", "-u", "sshd.service", "--since", f"-{WINDOW_HOURS}h",
                "-o", "cat", "--no-pager"], timeout=25)
@@ -134,7 +139,7 @@ def journal_sshd_signals(obs, allow):
             et = "ssh_preauth_abort"
         if not et:
             continue
-        for m in IP_RE.findall(line):
+        for m in IP_RE.findall(line) + IP6_RE.findall(line):
             if is_emittable(m, allow):
                 o = obs.setdefault(m, {"ip": m, "events": {}, "scenarios": set()})
                 o["events"][et] = o["events"].get(et, 0) + 1

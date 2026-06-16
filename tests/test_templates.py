@@ -77,3 +77,28 @@ def test_derived_keys_not_written_back():
     cfg = {"network": {"trusted_hosts": "10.0.0.9"}}
     templates.render(TMPL, cfg)
     assert "trusted_hosts_elements" not in cfg["network"]
+
+
+# --- IPv6 parity (D6): trusted_hosts splits by family into v4 + v6 element lines -------------
+
+def test_trusted_hosts_split_by_family():
+    # A v6 literal must NOT land in the ipv4_addr set (nft load error). Mixed input partitions:
+    d = templates._derived({"network": {"trusted_hosts": "203.0.113.7, 2001:db8::5, 198.51.100.9"}})
+    net = d["network"]
+    assert net["trusted_hosts_elements"] == "elements = { 203.0.113.7, 198.51.100.9 }"
+    assert net["trusted_hosts6_elements"] == "elements = { 2001:db8::5 }"
+
+
+def test_trusted_hosts6_blank_when_no_v6():
+    # v4-only trusted_hosts -> the v6 elements line vanishes (no empty `elements = { }`).
+    net = templates._derived({"network": {"trusted_hosts": "10.0.1.50"}})["network"]
+    assert net["trusted_hosts_elements"] == "elements = { 10.0.1.50 }"
+    assert net["trusted_hosts6_elements"] == ""
+
+
+def test_unparseable_host_stays_on_v4_line():
+    # Preserve pre-IPv6 behaviour: a bad token isn't silently dropped, it stays on the v4 line
+    # (surfacing as the same nft load error it always did).
+    net = templates._derived({"network": {"trusted_hosts": "not-an-ip"}})["network"]
+    assert net["trusted_hosts_elements"] == "elements = { not-an-ip }"
+    assert net["trusted_hosts6_elements"] == ""

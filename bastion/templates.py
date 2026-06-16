@@ -51,18 +51,40 @@ def _derived(config: dict) -> dict:
     These are never written back to machine.conf — they exist only at render/check time so a
     template can express something the raw config cannot. Currently:
 
-    * ``network.trusted_hosts_elements`` — the nftables ``elements = { ... }`` line for the
-      static ``trusted_hosts`` set, or ``""`` when no trusted hosts are configured. An empty
-      ``elements = { }`` is an nftables *syntax error*, so when the list is blank the whole
-      line must vanish, not render empty braces. (Blank ``trusted_hosts`` is a valid operator
-      choice — the wizard offers "blank = none".)
+    * ``network.trusted_hosts_elements`` / ``network.trusted_hosts6_elements`` — the nftables
+      ``elements = { ... }`` line for the static ``trusted_hosts`` set, split by address family
+      (the v4 set is ``ipv4_addr``, the v6 set ``ipv6_addr``; a v6 literal in an ipv4_addr set is
+      a load error). Each is ``""`` when that family has no configured hosts. An empty
+      ``elements = { }`` is an nftables *syntax error*, so when a family is blank the whole line
+      must vanish, not render empty braces. (Blank ``trusted_hosts`` is a valid operator choice —
+      the wizard offers "blank = none".)
     """
     net = config.get("network")
     if not net or "trusted_hosts" not in net:
         return config
     hosts = str(net.get("trusted_hosts") or "").strip().strip(",").strip()
-    elements = f"elements = {{ {hosts} }}" if hosts else ""
-    return {**config, "network": {**net, "trusted_hosts_elements": elements}}
+    v4, v6 = _split_hosts_by_family(hosts)
+    return {**config, "network": {**net,
+                                  "trusted_hosts_elements": f"elements = {{ {v4} }}" if v4 else "",
+                                  "trusted_hosts6_elements": f"elements = {{ {v6} }}" if v6 else ""}}
+
+
+def _split_hosts_by_family(hosts: str) -> tuple[str, str]:
+    """Partition a comma-separated trusted_hosts string into (v4_csv, v6_csv). A token that
+    parses as IPv6 goes to the v6 set; everything else (IPv4 or unparseable) stays on the v4
+    line, preserving the pre-IPv6 behaviour for v4 and surfacing a genuinely bad token the same
+    way it did before (as an nft load error) rather than silently dropping it."""
+    import ipaddress
+    v4, v6 = [], []
+    for tok in (t.strip() for t in hosts.split(",")):
+        if not tok:
+            continue
+        try:
+            net = ipaddress.ip_network(tok, strict=False)
+            (v6 if net.version == 6 else v4).append(tok)
+        except ValueError:
+            v4.append(tok)
+    return ", ".join(v4), ", ".join(v6)
 
 
 def render(text: str, config: dict) -> str:

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # edge-feed-fetch — threat-feed SOURCE for edge-reconciler (ZERO firewall privilege).
-# Pulls curated public blocklists, normalizes to one IPv4 addr/CIDR per line, dedupes,
+# Pulls curated public blocklists, normalizes to one IPv4/IPv6 addr/CIDR per line, dedupes,
 # and atomically writes the candidate list. It NEVER touches nft: every line it emits is
-# validated by edge-reconciler (allowlist + width floor) before it can enter blk_feed.
+# validated by edge-reconciler (allowlist + per-family width floor) before it can enter
+# blk_feed (v4) or blk_feed6 (v6) — so a loose v6 match here is safe, garbage is rejected there.
 # Runs as an ephemeral unprivileged user (systemd DynamicUser), network only.
 set -u
 OUT="${STATE_DIRECTORY:-/var/lib/edge-feed}/blk_feed.list"
@@ -11,14 +12,18 @@ TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
 FEEDS=(
   "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
   "https://www.spamhaus.org/drop/drop.txt"
+  "https://www.spamhaus.org/drop/dropv6.txt"
   "https://lists.blocklist.de/lists/all.txt"
 )
 
 ok=0
 for url in "${FEEDS[@]}"; do
   if data="$(curl -fsS -m 30 --retry 2 "$url" 2>/dev/null)"; then
-    printf '%s\n' "$data" | sed -E 's/[#;].*$//' \
-      | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' >> "$TMP"
+    clean="$(printf '%s\n' "$data" | sed -E 's/[#;].*$//')"
+    # IPv4 addr/CIDR
+    printf '%s\n' "$clean" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' >> "$TMP"
+    # IPv6 addr/CIDR — permissive (needs >=2 colon groups); edge-reconciler is the real validator.
+    printf '%s\n' "$clean" | grep -oiE '([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(/[0-9]{1,3})?' >> "$TMP"
     logger -t edge-feed-fetch "fetched OK: $url"
     ok=$((ok+1))
   else
