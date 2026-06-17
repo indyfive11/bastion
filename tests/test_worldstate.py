@@ -50,11 +50,29 @@ def _ctx(sys_, mode="edge"):
 
 def test_document_is_versioned_and_complete(tmp_path):
     doc = worldstate.gather_state(_ctx(FakeSystem(tmp_path, loaded=False)))
-    assert doc["schema_version"] == worldstate.STATE_SCHEMA_VERSION == 1
+    assert doc["schema_version"] == worldstate.STATE_SCHEMA_VERSION == 2
     assert isinstance(doc["generated_epoch"], int) and doc["generated_epoch"] > 0
     for key in ("mode", "root", "table", "firewall", "layers", "ai", "recovery", "drift", "audit_tail"):
         assert key in doc
     assert doc["mode"] == "edge" and doc["table"] == "inet edge"
+
+
+class LiveNonRootSystem(FakeSystem):
+    """A LIVE box (is_live True) running non-root (is_root False) where `nft list table` is denied —
+    the one case where 'absent' and 'permission denied' are indistinguishable (E6)."""
+    is_live = True       # override the property with a plain attr (root-path check would otherwise fail)
+    is_root = False
+
+
+def test_firewall_loaded_tristate(tmp_path):
+    # staged --root tree: not live, so the raw bool flows through (no ambiguity to resolve)
+    assert worldstate.firewall_loaded(FakeSystem(tmp_path, loaded=True), "inet", "edge") is True
+    assert worldstate.firewall_loaded(FakeSystem(tmp_path, loaded=False), "inet", "edge") is False
+    # live + non-root + denied probe -> unknown (None), NOT a false "not loaded"
+    live = LiveNonRootSystem(tmp_path, loaded=False)
+    assert worldstate.firewall_loaded(live, "inet", "edge") is None
+    doc = worldstate.gather_state(_ctx(live))
+    assert doc["firewall"]["loaded"] is None and doc["firewall"]["sets"] == []
 
 
 def test_endpoint_table(tmp_path):
@@ -94,7 +112,7 @@ def test_tui_dashboard_delegates_to_worldstate(tmp_path):
     # the TUI must not re-implement gathering — gather_dashboard is now a thin pass-through
     sys_ = FakeSystem(tmp_path, loaded=True, set_elems={"blk_feed": ["9.9.9.9"]})
     dash = tui.gather_dashboard(_ctx(sys_))
-    assert dash["schema_version"] == 1                       # it IS the worldstate document
+    assert dash["schema_version"] == 2                       # it IS the worldstate document
     assert {s["name"]: s["count"] for s in dash["firewall"]["sets"]}["blk_feed"] == 1
     assert tui.MANAGED_SETS == worldstate.MANAGED_SETS       # re-export still works
 
@@ -103,7 +121,7 @@ def test_cmd_state_emits_valid_json(tmp_path, capsys):
     rc = cli.main(["state", "--root", str(tmp_path)])
     assert rc == 0
     doc = json.loads(capsys.readouterr().out)               # must be parseable
-    assert doc["schema_version"] == 1 and doc["root"] == str(tmp_path)
+    assert doc["schema_version"] == 2 and doc["root"] == str(tmp_path)
     assert isinstance(doc["layers"], list) and len(doc["layers"]) == 7
 
 
@@ -111,4 +129,4 @@ def test_cmd_state_compact_is_single_line(tmp_path, capsys):
     rc = cli.main(["state", "--compact", "--root", str(tmp_path)])
     assert rc == 0
     out = capsys.readouterr().out.strip()
-    assert "\n" not in out and json.loads(out)["schema_version"] == 1
+    assert "\n" not in out and json.loads(out)["schema_version"] == 2

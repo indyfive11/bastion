@@ -8,6 +8,10 @@ document instead of each re-probing the box — one data path, one nft-set parse
 
 Everything here is READ-ONLY and fails soft: a dashboard / state query must succeed even on a
 half-broken node, so no probe raises. Bump ``STATE_SCHEMA_VERSION`` on any breaking shape change.
+
+``firewall.loaded`` is a TRI-STATE (E6): ``True``/``False`` when determinable, ``None`` when a live
+non-root probe can't tell "table absent" from "permission denied". This is the ONE base-table verdict
+the TUI, ``bastion state``, ``bastion status`` and ``bastion doctor`` all read, so they never disagree.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import time
 from . import layers as layermod
 from .layers.base import Context
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 
 # Managed sets shown in the firewall panel — each family (the `…6` IPv6 siblings).
 _BASE_SETS = ["blk_feed", "cs_block", "ai_block", "ai_ratelimit", "ai_tarpit", "trusted_hosts"]
@@ -36,6 +40,17 @@ RECOVERY = "bastion-recovery"
 def nft_table(ctx: Context) -> tuple[str, str]:
     """The managed base table for the node's mode: edge -> (inet, edge), endpoint -> (inet, bastion)."""
     return ("inet", "bastion") if ctx.mode == "endpoint" else ("inet", "edge")
+
+
+def firewall_loaded(sys_, family: str, table: str):
+    """THE canonical base-table verdict (E6 — was computed three divergent ways). Tri-state:
+    ``True``/``False`` when determinable, ``None`` when a LIVE non-root probe can't distinguish
+    "table absent" from "permission denied" (``nft list`` needs root). A staged ``--root`` tree
+    isn't live, so its raw bool is returned as-is (there's no ambiguity to resolve there)."""
+    determinable = sys_.nft_table_exists(family, table)
+    if not determinable and sys_.is_live and not sys_.is_root:
+        return None
+    return determinable
 
 
 def set_count(sys_, family: str, table: str, name: str):
@@ -89,20 +104,23 @@ def _pending_proposals(ctx: Context) -> int:
     return len(pending)
 
 
+def layer_entry(ctx: Context, layer) -> dict:
+    """One layer's world-state row (install/active + health checks). THE single layer-dict shape —
+    `bastion state`, `bastion status`, `bastion layer status`, and the TUI all render from this, so
+    no two surfaces can disagree about a layer (E6). Fails soft: a sick layer becomes an error row."""
+    try:
+        st = layer.status(ctx)
+        checks = [{"name": c.name, "ok": c.ok, "unknown": getattr(c, "unknown", False),
+                   "detail": c.detail} for c in layer.health_check(ctx)]
+        return {"name": st.name, "title": st.title, "installed": st.installed,
+                "active": st.active, "detail": st.detail, "checks": checks}
+    except Exception as exc:  # one sick layer must not blank the whole document
+        return {"name": getattr(layer, "name", "?"), "title": getattr(layer, "title", ""),
+                "installed": False, "active": False, "detail": f"probe error: {exc}", "checks": []}
+
+
 def _layers(ctx: Context) -> list[dict]:
-    out = []
-    for layer in layermod.all_layers():
-        try:
-            st = layer.status(ctx)
-            checks = [{"name": c.name, "ok": c.ok, "unknown": getattr(c, "unknown", False),
-                       "detail": c.detail} for c in layer.health_check(ctx)]
-            out.append({"name": st.name, "title": st.title, "installed": st.installed,
-                        "active": st.active, "detail": st.detail, "checks": checks})
-        except Exception as exc:  # one sick layer must not blank the whole document
-            out.append({"name": getattr(layer, "name", "?"), "title": getattr(layer, "title", ""),
-                        "installed": False, "active": False, "detail": f"probe error: {exc}",
-                        "checks": []})
-    return out
+    return [layer_entry(ctx, layer) for layer in layermod.all_layers()]
 
 
 def gather_state(ctx: Context, *, drift: tuple | None = None, audit_tail: int = 12) -> dict:
@@ -112,9 +130,9 @@ def gather_state(ctx: Context, *, drift: tuple | None = None, audit_tail: int = 
     sys_ = ctx.system
     family, table = nft_table(ctx)
 
-    loaded = sys_.nft_table_exists(family, table)
+    loaded = firewall_loaded(sys_, family, table)   # tri-state: True / False / None (unknown)
     fw_sets = []
-    if loaded:
+    if loaded is True:
         for name in MANAGED_SETS:
             cnt = set_count(sys_, family, table, name)
             if cnt is not None:

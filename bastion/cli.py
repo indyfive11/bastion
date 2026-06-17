@@ -236,26 +236,36 @@ def build_context(args: argparse.Namespace) -> Context:
     )
 
 
-def _print_status(st, show_health: bool, ctx: Context, layer) -> None:
-    inst = "yes" if st.installed else "no"
-    act = "yes" if st.active else "no"
-    print(f"  {st.name:<4} {st.title:<10} installed: {inst:<4} active: {act}")
-    if st.detail:
-        print(f"       {st.detail}")
+def _print_status_doc(ly: dict, show_health: bool) -> None:
+    """Render a layer entry from the world-state document (E6: status renders FROM `bastion state`,
+    so it can never disagree with the TUI / `state --json` about the same layer)."""
+    inst = "yes" if ly["installed"] else "no"
+    act = "yes" if ly["active"] else "no"
+    print(f"  {ly['name']:<4} {ly['title']:<10} installed: {inst:<4} active: {act}")
+    if ly["detail"]:
+        print(f"       {ly['detail']}")
     if show_health:
-        for chk in layer.health_check(ctx):
-            mark = "????" if getattr(chk, "unknown", False) else ("OK  " if chk.ok else "FAIL")
-            print(f"       [{mark}] {chk.name}" + (f" — {chk.detail}" if chk.detail else ""))
+        for chk in ly["checks"]:
+            mark = "????" if chk["unknown"] else ("OK  " if chk["ok"] else "FAIL")
+            print(f"       [{mark}] {chk['name']}" + (f" — {chk['detail']}" if chk["detail"] else ""))
+
+
+_STATUS_KEYS = ("schema_version", "mode", "root", "table", "firewall", "layers")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    from . import worldstate
     ctx = build_context(args)
-    print(f"bastion status (mode={ctx.mode}, root={ctx.system.root})")
+    doc = worldstate.gather_state(ctx)          # the one canonical probe — status renders FROM it
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({k: doc[k] for k in _STATUS_KEYS}, indent=2, default=str))
+        return 0
+    print(f"bastion status (mode={doc['mode']}, root={doc['root']})")
     any_installed = False
-    for layer in layermod.all_layers():
-        st = layer.status(ctx)
-        any_installed = any_installed or st.installed
-        _print_status(st, args.health, ctx, layer)
+    for ly in doc["layers"]:
+        any_installed = any_installed or ly["installed"]
+        _print_status_doc(ly, args.health)
     if not any_installed:
         print("  (no layers installed yet — run `bastion setup`)")
     return 0
@@ -305,7 +315,8 @@ def cmd_layer(args: argparse.Namespace) -> int:
         print(f"unknown layer: {args.name} (known: {', '.join(layermod.REGISTRY)})", file=sys.stderr)
         return 2
     if args.action == "status":
-        _print_status(layer.status(ctx), True, ctx, layer)
+        from . import worldstate
+        _print_status_doc(worldstate.layer_entry(ctx, layer), True)
         return 0
     if args.action in ("enable", "disable"):
         return _layer_scope(args, ctx, layer, enable=(args.action == "enable"))
@@ -774,17 +785,30 @@ def _artifact_drift(ctx: Context) -> list[tuple[str, str]]:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    import json as _json
     ctx = build_context(args)
+    as_json = getattr(args, "json", False)
     if not ctx.config:
-        print("bastion verify: no machine.conf — run `bastion setup` / `bastion generate` first",
-              file=sys.stderr)
+        if as_json:
+            print(_json.dumps({"error": "no machine.conf — run `bastion setup` / `bastion generate`",
+                               "mode": ctx.mode, "root": str(ctx.system.root)}, indent=2))
+        else:
+            print("bastion verify: no machine.conf — run `bastion setup` / `bastion generate` first",
+                  file=sys.stderr)
         return 1
     sv = state.conf_schema_version(ctx.config)
+    templates_dir = find_templates_dir(getattr(args, "templates", None))
+    drift, n_ok = _drift_report(ctx, templates_dir)
+    if as_json:
+        print(_json.dumps({
+            "mode": ctx.mode, "root": str(ctx.system.root), "clean": not drift,
+            "schema_current": sv >= state.CONF_SCHEMA_VERSION,
+            "drift": {"ok": n_ok, "issues": [{"dest": d, "status": s} for d, s in drift]},
+        }, indent=2))
+        return 1 if drift else 0
     if sv < state.CONF_SCHEMA_VERSION:
         print(f"  NOTE: machine.conf is schema v{sv} (current v{state.CONF_SCHEMA_VERSION}) — "
               "run `bastion migrate` to update it.")
-    templates_dir = find_templates_dir(getattr(args, "templates", None))
-    drift, n_ok = _drift_report(ctx, templates_dir)
     print(f"bastion verify (mode={ctx.mode}, root={ctx.system.root}): "
           f"{n_ok} generated file(s) match disk")
     for dest, status in drift:
@@ -854,10 +878,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         add("WARN", "firewall ruleset", "/etc/nftables.conf absent — run `bastion generate`")
 
-    if ctx.config and sys_.is_live and sys_.is_root:
-        fam, tbl = ("inet", "bastion") if ctx.mode == "endpoint" else ("inet", "edge")
-        add("OK", "base table", f"{fam} {tbl} loaded") if sys_.nft_table_exists(fam, tbl) else \
+    if ctx.config and sys_.is_live:
+        from . import worldstate
+        fam, tbl = worldstate.nft_table(ctx)
+        loaded = worldstate.firewall_loaded(sys_, fam, tbl)   # SAME tri-state as state/status/TUI (E6)
+        if loaded is True:
+            add("OK", "base table", f"{fam} {tbl} loaded")
+        elif loaded is False:
             add("WARN", "base table", f"{fam} {tbl} not loaded — `bastion firewall reload`")
+        else:                                                 # None — live non-root: explicit unknown
+            add("OK", "base table", f"{fam} {tbl} — unknown (run as root to verify)")
 
     if ctx.config:
         sv = state.conf_schema_version(ctx.config)
@@ -898,12 +928,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             except Exception:                                          # noqa: BLE001
                 add("WARN", "ai secret", f"{env} present but unreadable")
 
-    print(f"bastion doctor (mode={ctx.mode}, root={sys_.root})")
-    for level, name, detail in results:
-        print(f"  [{level:<4}] {name}" + (f" — {detail}" if detail else ""))
     fails = sum(1 for lvl, _, _ in results if lvl == "FAIL")
     warns = sum(1 for lvl, _, _ in results if lvl == "WARN")
     oks = sum(1 for lvl, _, _ in results if lvl == "OK")
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({
+            "mode": ctx.mode, "root": str(sys_.root),
+            "checks": [{"level": lvl, "name": n, "detail": d} for lvl, n, d in results],
+            "summary": {"fail": fails, "warn": warns, "ok": oks},
+        }, indent=2))
+        return 1 if fails else 0
+    print(f"bastion doctor (mode={ctx.mode}, root={sys_.root})")
+    for level, name, detail in results:
+        print(f"  [{level:<4}] {name}" + (f" — {detail}" if detail else ""))
     print(f"  {fails} fail, {warns} warn, {oks} ok")
     return 1 if fails else 0
 
@@ -1061,6 +1099,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("status", help="show layer install/active state")
     st.add_argument("--health", action="store_true", help="also run each layer's health checks")
+    st.add_argument("--json", action="store_true", help="emit the machine-readable status projection")
     st.add_argument("--conf", help="path to machine.conf")
     st.add_argument("--root", help="inspect under this base dir instead of / (chroot/bootstrap/testing)")
     st.set_defaults(func=cmd_status)
@@ -1200,12 +1239,14 @@ def build_parser() -> argparse.ArgumentParser:
     mig.set_defaults(func=cmd_migrate)
 
     vfy = sub.add_parser("verify", help="check live configs match what `bastion generate` would produce")
+    vfy.add_argument("--json", action="store_true", help="emit the machine-readable drift report")
     vfy.add_argument("--conf", help="path to machine.conf")
     vfy.add_argument("--templates", help="path to templates/ dir")
     vfy.add_argument("--root", help="inspect under this base dir instead of /")
     vfy.set_defaults(func=cmd_verify)
 
     doc = sub.add_parser("doctor", help="triage a sick box (binaries, drift, persistence, recovery, AI)")
+    doc.add_argument("--json", action="store_true", help="emit the machine-readable triage report")
     doc.add_argument("--conf", help="path to machine.conf")
     doc.add_argument("--templates", help="path to templates/ dir")
     doc.add_argument("--root", help="inspect under this base dir instead of /")

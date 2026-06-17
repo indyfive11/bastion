@@ -62,8 +62,13 @@ def render_dashboard(data: dict) -> str:
     L.append("")
 
     fw = data["firewall"]
-    L.append("[b]Firewall[/b]  " + ("[green]loaded[/green]" if fw["loaded"]
-                                     else "[red]base table not loaded (or need root)[/red]"))
+    if fw["loaded"] is True:
+        fw_state = "[green]loaded[/green]"
+    elif fw["loaded"] is False:
+        fw_state = "[red]base table not loaded[/red]"
+    else:                                            # None — live non-root: can't tell (E6 tri-state)
+        fw_state = "[yellow]unknown (need root to read live nft state)[/yellow]"
+    L.append("[b]Firewall[/b]  " + fw_state)
     for s in fw["sets"]:
         cnt = f"[b]{s['count']}[/b]" if s["count"] else "[dim]0[/dim]"
         L.append(f"  {_esc(s['name']):<16} {cnt}")
