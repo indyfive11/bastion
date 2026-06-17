@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-06-17
+
+A round of supply-chain and egress hardening, a managed control surface for the IP
+threat feeds, and machine-readable output across the read commands — so automation
+and a future GUI can consume the same world-state the CLI renders. Validated live on
+the edge VM and the endpoint laptop.
+
+### Added
+
+- **`bastion feeds <list|add|remove>` — manage the IP-blocklist feeds.** The threat-feed
+  URLs `edge-feed-fetch` pulls were hardcoded; they are now a managed `machine.conf`
+  setting (`monitoring.feed_sources`) editable at runtime through the same validated,
+  scoped-reload engine as the DNS blocklists, with the built-in defaults used when blank.
+- **`--json` on `status`, `verify`, and `doctor`.** The read commands now emit the
+  machine-readable projections a GUI or automation consumes — `status` renders from the
+  canonical world-state document, `verify` emits the structured drift report, and
+  `doctor` the structured triage report.
+
+### Changed
+
+- **One firewall verdict across every surface.** Whether the managed base table is loaded
+  is now a single tri-state (loaded / not loaded / **unknown**), with *unknown* reported
+  explicitly when a non-root probe can't tell an absent table from a permission-denied
+  query. `state`, `status`, `doctor`, and the TUI all read this one verdict and render
+  each layer from one shared world-state row, so no two surfaces can disagree.
+
+### Security
+
+- **The IP feeds can no longer lock the box out of its own management plane.** The
+  reconciler folds the operator's trusted hosts, the VPN relay, and the gateway into the
+  never-block allowlist, and `edge-feed-fetch` refuses a feed that suddenly collapses or
+  implausibly explodes in size (supply-chain sanity caps) — so a poisoned or truncated
+  feed cannot blocklist a critical host.
+- **The sole nftables writer and the standing self-heal tool are systemd-confined.** The
+  reconciler runs under strict filesystem/syscall/capability confinement (it is the only
+  process that writes the firewall sets); the watchdog takes the capability and
+  address-family ceiling appropriate to a tool that must still shell out to heal.
+- **The AI signal collector is fail-closed against architecture leaks.** End-to-end
+  scrubbing plus a serialized-output tripwire ensure only public source IPs and event
+  counts ever reach the AI backend — never an internal address or hostname.
+
 ## [1.3.0] - 2026-06-16
 
 A post-install configuration control surface — change settings from the CLI/TUI
