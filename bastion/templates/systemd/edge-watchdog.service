@@ -9,9 +9,22 @@ Type=simple
 ExecStart=/usr/local/sbin/edge-watchdog
 Restart=always
 RestartSec=10
-# Recovery tool: needs root for nft/iptables/ip/ping + conntrack read. Kept deliberately
-# UN-sandboxed (subtle confinement breakage on a self-heal tool is worse than the gain).
+# F1 — a self-heal tool, so confinement is DELIBERATELY LIGHT: no ProtectSystem=strict and no
+# SystemCallFilter (it must shell out to systemctl/ping/conntrack/net-rollback and write its own
+# /run + /var/lib/net-safe state — subtle breakage there is worse than the gain). What we DO take
+# is the cheap, can't-break-it surface: cap the ceiling to exactly what it uses (nft/ip/conntrack
+# = CAP_NET_ADMIN, ping = CAP_NET_RAW; everything else dropped) and the non-filesystem protections.
 TimeoutStopSec=15
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

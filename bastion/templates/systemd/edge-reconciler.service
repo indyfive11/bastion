@@ -10,10 +10,29 @@ Type=oneshot
 # fallbacks in the script keep edge behaviour if machine.env is absent.
 EnvironmentFile=-/etc/bastion/machine.env
 ExecStart=/usr/local/sbin/edge-reconciler
-# Root is required (nft set writes + cscli LAPI). Light sandbox; NOT strict because
-# this is part of the recovery/safety surface and must never fail on confinement.
+# F1 — confine the SOLE nft writer. It needs root + CAP_NET_ADMIN (nft via netlink) and reads
+# cscli LAPI; nothing else. ProtectSystem=strict makes the whole tree read-only, and the three
+# write targets are punched back in explicitly: the audit log, the runtime dir, and /run for the
+# shared kill-switch lock (/run/edge-reconciler.lock — losing it would silently drop the 0.4 race
+# guard). Validated live: nft writes, the flock, and the audit append all still work; an operator
+# `edge-reconciler` run by hand is unconfined (sandbox applies only to the timer-driven service).
 NoNewPrivileges=true
+ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/var/log/edge-reconciler /var/lib/edge-reconciler /run
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ProtectControlGroups=true
-ReadWritePaths=/var/log/edge-reconciler /var/lib/edge-reconciler
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
