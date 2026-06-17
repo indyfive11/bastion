@@ -25,6 +25,7 @@ class L4DnsDhcp(Layer):
     template_dests = (
         ("dnsmasq.conf", "/etc/dnsmasq.conf"),
         ("unbound.conf", "/etc/unbound/unbound.conf"),
+        ("dns-allowlist", "/etc/edge-dnsblock/allowlist"),   # F2 never-sink list for the sinkhole
     )
     units = ("edge-dnsblock.service", "edge-dnsblock.timer")
     services = ("unbound.service", "dnsmasq.service")   # package-provided daemons L4 manages

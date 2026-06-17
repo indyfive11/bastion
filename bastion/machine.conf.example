@@ -101,3 +101,6 @@ relay_dst = 10.0.0.3
 nm_conn =
 # space-separated host-list URLs; blank = built-in default (StevenBlack)
 dnsblock_sources =
+# space-separated domains the DNS sinkhole must NEVER block (covers subdomains); on top of the
+# shipped never-sink defaults + the auto-protected egress/DNS-upstream hosts
+dns_allowlist =

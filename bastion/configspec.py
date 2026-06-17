@@ -64,6 +64,12 @@ def _v_url_list(v: str) -> bool:
     return all(_v_url(p) for p in v.split())
 
 
+def _v_domains(v: str) -> bool:
+    """Space/comma-separated bare domains (the DNS never-sink allowlist)."""
+    return all(re.fullmatch(r"[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+", p)
+               for p in v.replace(",", " ").split())
+
+
 def _v_dns_upstream(v: str) -> bool:
     """`host[#port]` (e.g. 127.0.0.1#5335) or a bare IP/hostname. Typo-catching only."""
     if not v:
@@ -139,6 +145,10 @@ SETTINGS: tuple[Setting, ...] = (
        EVERYDAY, _v_url, "an http(s) URL", APPLY_GENERATE),
     _S("monitoring.dnsblock_sources", "DNS blocklist sources", "Blocklist feed URLs (space-separated).",
        EVERYDAY, _v_url_list, "space-separated http(s) URLs", APPLY_GENERATE, scope="edge",
+       layer_gate="l4", list_sep=" "),
+    _S("monitoring.dns_allowlist", "DNS never-sink allowlist",
+       "Domains the sinkhole must NEVER block (covers subdomains); on top of the shipped defaults.",
+       EVERYDAY, _v_domains, "space-separated domains", APPLY_GENERATE, scope="edge",
        layer_gate="l4", list_sep=" "),
 
     # ---- ADVANCED (gated) -----------------------------------------------------------------------

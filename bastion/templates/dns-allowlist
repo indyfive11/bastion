@@ -1,0 +1,26 @@
+# bastion DNS never-sink allowlist — the DNS-path counterpart to policy.allowlist (the IP path).
+# Domains here are NEVER sinkholed, no matter what a blocklist says. A poisoned or over-aggressive
+# list could otherwise NXDOMAIN the box's own update path, its liveness deps, or your critical
+# services box-wide. One domain per line; an entry covers that domain AND all its subdomains.
+# edge-dnsblock-update ALSO auto-protects the configured egress-probe host and DNS upstream at
+# runtime, so those survive even if this file is emptied. Operator additions come from
+# machine.conf [monitoring] dns_allowlist (rendered onto the last line). DO NOT add a real
+# installation-specific value here in the committed template.
+
+# The blocklists themselves are fetched from GitHub — sinkholing this would brick all future updates.
+github.com
+githubusercontent.com
+# AI backend API (the default egress probe) + the secondary egress canary.
+anthropic.com
+cloudflare.com
+# Distro update infrastructure — sinkholing these breaks pacman / apt / dnf.
+archlinux.org
+debian.org
+ubuntu.com
+fedoraproject.org
+# Time sync.
+ntp.org
+pool.ntp.org
+
+# Operator never-sink additions ([monitoring] dns_allowlist):
+{{ monitoring.dns_allowlist }}

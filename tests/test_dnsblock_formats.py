@@ -66,3 +66,44 @@ def test_mixed_list_round_trips():
 def test_doc_comment_lists_supported_formats():
     body = SCRIPT.read_text()
     assert "plain domain" in body and "adblock" in body and "hosts" in body
+
+
+# --------------------------------------------------------------------------- F2 never-sink allowlist
+def _allow_filter(allow: list[str], candidates: list[str], tmp_path) -> list[str]:
+    fn = subprocess.run(["sed", "-n", "/^allow_filter()/,/^}/p", str(SCRIPT)],
+                        capture_output=True, text=True, check=True).stdout
+    assert "allow_filter()" in fn
+    af = tmp_path / "allow"; af.write_text("\n".join(allow) + "\n")
+    driver = fn + f'\nallow_filter "{af}"\n'
+    out = subprocess.run(["bash", "-c", driver], input="\n".join(candidates) + "\n",
+                         capture_output=True, text=True, check=True)
+    return out.stdout.split()
+
+
+def test_allowlist_drops_domain_and_subdomains_only(tmp_path):
+    kept = _allow_filter(
+        ["github.com", "githubusercontent.com", "anthropic.com"],
+        ["ads.example.com", "github.com", "api.anthropic.com",
+         "raw.githubusercontent.com", "anthropic.com.evil.net"],
+        tmp_path)
+    # allowlisted domain + its subdomains are NOT sinkholed; everything else still is
+    assert "github.com" not in kept                       # exact match
+    assert "api.anthropic.com" not in kept                # subdomain of anthropic.com
+    assert "raw.githubusercontent.com" not in kept        # the blocklist fetch host — must survive
+    assert "ads.example.com" in kept                      # unrelated -> still blocked
+    assert "anthropic.com.evil.net" in kept               # suffix trick is NOT a bypass
+
+
+def test_allowlist_template_self_protects():
+    body = (Path(__file__).resolve().parent.parent / "bastion" / "templates" / "dns-allowlist").read_text()
+    for must in ("github.com", "githubusercontent.com", "anthropic.com",
+                 "archlinux.org", "debian.org", "{{ monitoring.dns_allowlist }}"):
+        assert must in body, must
+
+
+def test_configspec_dns_allowlist_entry():
+    from bastion import configspec as cfg
+    s = cfg.get("monitoring.dns_allowlist")
+    assert s is not None and s.tier == cfg.EVERYDAY and s.scope == "edge" and s.layer_gate == "l4"
+    assert cfg.validate_value(s, "bank.example.com internal.corp")[1] is None
+    assert cfg.validate_value(s, "not a domain !!")[1] is not None
