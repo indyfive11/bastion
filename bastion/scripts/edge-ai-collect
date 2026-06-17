@@ -77,6 +77,47 @@ def is_emittable(ipstr, allow):
             return False
     return True
 
+# ---- F4: end-to-end no-arch-leak scrub + tripwire ----------------------------------------------
+# is_emittable() gates IPs at INGEST, but that rests on CPython's is_global (version-sensitive) and
+# would silently miss a leak introduced by a new field, a scenario label, or an ai_* set member that
+# was never re-checked. So before we serialize we (1) independently re-scrub every value in the doc,
+# and (2) scan the SERIALIZED bytes for any non-public IP literal as a final tripwire — failing
+# CLOSED (emit nothing) rather than leak architecture on an external channel (the fleet HARD RULE).
+_LABEL_RE = re.compile(r'^[a-z0-9][a-z0-9_-]*$')   # crowdsec leaf labels are slugs (ssh-bf, http-probing)
+
+def _safe_label(s):
+    # a scenario label is safe only if it's a bare slug — no dots (rules out FQDNs / IP literals),
+    # no spaces, nothing that could carry topology. Anything else is dropped, not emitted.
+    return isinstance(s, str) and bool(_LABEL_RE.match(s))
+
+def scrub_doc(doc, allow):
+    """Independently re-verify every value that ended up in the document: observations keyed on a
+    non-public IP are dropped, already_acted members are filtered to emittable-only, and scenario
+    labels are reduced to safe slugs. Belt-and-suspenders over is_emittable's ingest gate."""
+    kept = []
+    for o in doc.get("observations", []):
+        if not is_emittable(o.get("ip", ""), allow):
+            log(f"SCRUB: dropped non-public observation ip={o.get('ip')!r}")
+            continue
+        o["scenarios"] = [s for s in o.get("scenarios", []) if _safe_label(s)]
+        kept.append(o)
+    doc["observations"] = kept
+    for s, members in (doc.get("already_acted") or {}).items():
+        clean = [m for m in members if is_emittable(str(m).split("/", 1)[0], allow)]
+        if len(clean) != len(members):
+            log(f"SCRUB: dropped {len(members) - len(clean)} non-public member(s) from {s}")
+        doc["already_acted"][s] = clean
+    return doc
+
+def find_ip_leaks(serialized, allow):
+    """Scan the serialized JSON for ANY IPv4/IPv6 literal that is NOT emittable — the no-arch-leak
+    tripwire. Returns the offending tokens (empty list = clean)."""
+    leaks = []
+    for tok in IP_RE.findall(serialized) + IP6_RE.findall(serialized):
+        if not is_emittable(tok, allow):
+            leaks.append(tok)
+    return leaks
+
 def run(cmd, timeout=20):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -190,10 +231,23 @@ def main():
         "observations": observations,
         "already_acted": current_ai_sets(),
     }
+    # F4 — scrub, then a final serialized-bytes tripwire. If ANY non-public IP literal survives
+    # (an is_global edge case, a new field, a poisoned label), refuse to emit it: drop to an empty
+    # observation set rather than leak topology on the external channel.
+    doc = scrub_doc(doc, allow)
+    serialized = json.dumps(doc, separators=(",", ":"))
+    leaks = find_ip_leaks(serialized, allow)
+    if leaks:
+        log(f"NO-ARCH-LEAK TRIPWIRE tripped — refusing to emit {len(leaks)} non-public token(s): "
+            f"{sorted(set(leaks))[:5]}")
+        doc["observations"] = []
+        doc["already_acted"] = {k: [] for k in (doc.get("already_acted") or {})}
+        doc["scrubbed"] = True
+        serialized = json.dumps(doc, separators=(",", ":"))
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     tmp = OUT + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(doc, f, separators=(",", ":"))
+        f.write(serialized)
     os.replace(tmp, OUT)
     # D5: restrict to root + the edge-ai group (the analyzer runs as edge-ai) instead of
     # world-readable 0644. signals.json is sanitized, but it still need not be readable by every
@@ -207,9 +261,10 @@ def main():
             os.chmod(OUT, 0o644)
         except OSError:
             pass
-    log(f"wrote {len(observations)} observations -> {OUT}")
-    print(json.dumps({"observations": len(observations),
-                      "already_acted": {k: len(v) for k, v in doc["already_acted"].items()}}))
+    log(f"wrote {len(doc['observations'])} observations -> {OUT}")
+    print(json.dumps({"observations": len(doc["observations"]),
+                      "already_acted": {k: len(v) for k, v in doc["already_acted"].items()},
+                      "scrubbed": doc.get("scrubbed", False)}))
     return 0
 
 if __name__ == "__main__":
