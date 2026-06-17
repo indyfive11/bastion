@@ -387,6 +387,29 @@ def cmd_dns(args: argparse.Namespace) -> int:
                             root=getattr(args, "root", None), assume_yes=True).rc
 
 
+def cmd_feeds(args: argparse.Namespace) -> int:
+    """`bastion feeds list|add|remove [<url>]` — manage the IP-blocklist feed URLs edge-feed-fetch
+    pulls (the IP-path twin of `bastion dnsblock`)."""
+    from . import configspec as cfg
+    setting = cfg.get("monitoring.feed_sources")
+    current = cfg.current_value(_config_load_soft(args), setting)
+    if args.op == "list":
+        print(current or "(none — using the built-in defaults)")
+        return 0
+    if not args.url:
+        print(f"usage: bastion feeds {args.op} <url>", file=sys.stderr)
+        return 1
+    new = cfg.list_add(current, args.url, " ") if args.op == "add" else cfg.list_remove(current, args.url, " ")
+    if new == current:
+        print(f"{args.url} is {'already a source' if args.op == 'add' else 'not a source'} — no change")
+        return 0
+    rc = cfg.apply_change("monitoring.feed_sources", new, conf=getattr(args, "conf", None),
+                          root=getattr(args, "root", None), assume_yes=True).rc
+    if rc == 0:
+        print("  run `bastion update feeds` to fetch the new list now")
+    return rc
+
+
 def cmd_dnsblock(args: argparse.Namespace) -> int:
     """`bastion dnsblock list|add|remove [<url>]` — manage DNS blocklist feed sources."""
     from . import configspec as cfg
@@ -1090,6 +1113,12 @@ def build_parser() -> argparse.ArgumentParser:
     dnsp.add_argument("value", nargs="?", help="new value (omit to show current)")
     dnsp.add_argument("--conf"); dnsp.add_argument("--root")
     dnsp.set_defaults(func=cmd_dns)
+
+    fdp = sub.add_parser("feeds", help="manage IP-blocklist feed sources (edge-feed-fetch)")
+    fdp.add_argument("op", choices=["list", "add", "remove"])
+    fdp.add_argument("url", nargs="?", help="feed URL for add/remove")
+    fdp.add_argument("--conf"); fdp.add_argument("--root")
+    fdp.set_defaults(func=cmd_feeds)
 
     dbp = sub.add_parser("dnsblock", help="manage DNS blocklist feed sources")
     dbp.add_argument("op", choices=["list", "add", "remove"])

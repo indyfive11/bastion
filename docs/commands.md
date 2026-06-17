@@ -73,6 +73,8 @@ goes to a human-review queue. These verbs are the controls.
 
 | Command | What it does |
 |---|---|
+| `bastion feeds <list\|add\|remove> [url]` | Manage the IP-blocklist feed URLs `edge-feed-fetch` pulls (blank = built-in defaults). |
+| `bastion dnsblock <list\|add\|remove> [url]` | Manage the DNS-sinkhole blocklist feed URLs (L4). |
 | `bastion update feeds` | Refresh the threat-intel feeds now (runs the timer's oneshot). |
 | `bastion update dnsblock` | Rebuild the DNS sinkhole now (L4). |
 

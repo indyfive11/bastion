@@ -64,6 +64,13 @@ def test_applies_to_scope_and_layer_gate():
     # applies cleanly when scope+layer match
     assert cfg.applies_to(cfg.get("network.dhcp_range_start"), edge) == (True, "")
     assert cfg.applies_to(cfg.get("ports.ssh"), endpoint)[0] is True   # both-scope, no gate
+    # feed_sources is BOTH-scope (L1 runs in every profile), gated on l1 — unlike edge-only dnsblock:
+    # it applies cleanly on an endpoint that has l1, and only warns (never refuses) when l1 is absent.
+    ep_l1 = {"machine": {"mode": "endpoint", "layers": "l0,l1"}}
+    assert cfg.applies_to(cfg.get("monitoring.feed_sources"), ep_l1) == (True, "")
+    ok, why = cfg.applies_to(cfg.get("monitoring.feed_sources"), endpoint)
+    assert ok is True and "l1" in why
+    assert cfg.applies_to(cfg.get("monitoring.dnsblock_sources"), ep_l1)[0] is False   # edge-only
 
 
 def test_apply_tag_selection():

@@ -5,9 +5,13 @@
 # validated by edge-reconciler (allowlist + per-family width floor) before it can enter
 # blk_feed (v4) or blk_feed6 (v6) — so a loose v6 match here is safe, garbage is rejected there.
 # Runs as an ephemeral unprivileged user (systemd DynamicUser), network only.
+#
+# Feed URLs come from FEED_SOURCES (space-separated, supplied via the unit's EnvironmentFile from
+# machine.env — `bastion feeds add|remove|list`); the built-in defaults below are used when it is
+# unset/blank, so a fresh install fetches sane lists with no config.
 set -u
 OUT="${STATE_DIRECTORY:-/var/lib/edge-feed}/blk_feed.list"
-TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+TMP="$(mktemp)"; trap 'rm -f "$TMP" "${OUT}.new"' EXIT   # never strand the staging file
 
 # need <bin>... — B4 preflight: exit early with a clear message naming any missing required
 # command, instead of failing obscurely mid-run. Reports to stderr + journal.
@@ -21,12 +25,14 @@ need(){ local b miss=''
 # Without curl every feed fetch fails — surface the real cause, not "all feeds failed".
 need curl
 
-FEEDS=(
-  "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
-  "https://www.spamhaus.org/drop/drop.txt"
-  "https://www.spamhaus.org/drop/dropv6.txt"
-  "https://lists.blocklist.de/lists/all.txt"
-)
+# Built-in defaults — used only when FEED_SOURCES is unset/blank (a fresh install with no operator
+# overrides). `bastion feeds add|remove` writes FEED_SOURCES into machine.env to override these.
+DEFAULT_FEEDS="\
+https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset \
+https://www.spamhaus.org/drop/drop.txt \
+https://www.spamhaus.org/drop/dropv6.txt \
+https://lists.blocklist.de/lists/all.txt"
+read -r -a FEEDS <<< "${FEED_SOURCES:-$DEFAULT_FEEDS}"
 
 ok=0
 for url in "${FEEDS[@]}"; do
@@ -46,5 +52,24 @@ done
 if [ "$ok" -eq 0 ]; then
   logger -t edge-feed-fetch "all feeds failed -- keeping previous list, exit 1"; exit 1
 fi
-sort -u "$TMP" > "${OUT}.new" && mv -f "${OUT}.new" "$OUT"
-logger -t edge-feed-fetch "wrote $(wc -l < "$OUT") unique entries -> $OUT (from $ok/${#FEEDS[@]} feeds)"
+sort -u "$TMP" > "${OUT}.new"
+
+# SUPPLY-CHAIN SANITY (F3, the IP-feed twin of edge-dnsblock-update's caps): refuse a sudden
+# COLLAPSE (a truncated/poisoned/hijacked source silently shrinking the candidate list — which
+# would unblock previously-blocked attackers) or an implausible EXPLOSION (memory exhaustion in
+# the reconciler's parse/collapse). Either keeps the CURRENT list untouched + alerts. The
+# reconciler's allowlist + width floor are the per-entry guard; this is the whole-list guard.
+newcount=$(grep -c . "${OUT}.new")
+oldcount=0; [ -f "$OUT" ] && oldcount=$(grep -c . "$OUT" 2>/dev/null)
+MINRATIO=${FEED_MIN_RATIO:-40}; MAXENTRIES=${FEED_MAX:-2000000}
+if [ "$oldcount" -ge 1000 ] && [ "$((newcount*100))" -lt "$((oldcount*MINRATIO))" ]; then
+  rm -f "${OUT}.new"
+  logger -t edge-feed-fetch "REFUSED: new=$newcount < ${MINRATIO}% of current=$oldcount (sources truncated/poisoned?) -- keeping current list, exit 1"; exit 1
+fi
+if [ "$newcount" -gt "$MAXENTRIES" ]; then
+  rm -f "${OUT}.new"
+  logger -t edge-feed-fetch "REFUSED: $newcount entries exceeds cap $MAXENTRIES (poisoned source?) -- keeping current list, exit 1"; exit 1
+fi
+
+mv -f "${OUT}.new" "$OUT"
+logger -t edge-feed-fetch "wrote $newcount unique entries -> $OUT (from $ok/${#FEEDS[@]} feeds)"

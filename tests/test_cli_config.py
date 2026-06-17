@@ -146,6 +146,21 @@ def test_dnsblock_add_list_remove(staged, capsys):
     assert "https://ex.com/h" not in (_conf_of(staged)["monitoring"].get("dnsblock_sources") or "")
 
 
+def test_feeds_add_list_remove(staged, capsys):
+    assert cli.main(["feeds", "add", "https://ex.com/ips.netset", "--root", str(staged)]) == 0
+    assert "https://ex.com/ips.netset" in _conf_of(staged)["monitoring"]["feed_sources"]
+    capsys.readouterr()
+    assert cli.main(["feeds", "list", "--root", str(staged)]) == 0
+    assert "https://ex.com/ips.netset" in capsys.readouterr().out
+    assert cli.main(["feeds", "remove", "https://ex.com/ips.netset", "--root", str(staged)]) == 0
+    assert "https://ex.com/ips.netset" not in (_conf_of(staged)["monitoring"].get("feed_sources") or "")
+
+
+def test_feeds_bad_url_rejected(staged):
+    assert cli.main(["feeds", "add", "not-a-url", "--root", str(staged)]) == 1
+    assert not (_conf_of(staged)["monitoring"].get("feed_sources") or "")   # nothing written
+
+
 def test_layer_disable_delists(staged):
     assert cli.main(["layer", "disable", "l4", "--root", str(staged)]) == 0
     assert "l4" not in _conf_of(staged)["machine"]["layers"].split(",")

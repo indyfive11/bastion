@@ -7,6 +7,10 @@ Wants=network-online.target
 Type=oneshot
 DynamicUser=yes
 StateDirectory=edge-feed
+# Optional (-): supplies FEED_SOURCES (operator-chosen feed URLs). systemd reads this as root
+# before dropping to the transient DynamicUser, so machine.env need not be world-readable.
+# Generic fallback feeds are baked into the script if FEED_SOURCES is unset/absent.
+EnvironmentFile=-/etc/bastion/machine.env
 ExecStart=/usr/local/sbin/edge-feed-fetch
 NoNewPrivileges=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

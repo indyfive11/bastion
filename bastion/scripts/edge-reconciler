@@ -96,6 +96,29 @@ def load_allowlist():
     except FileNotFoundError:
         log(f"WARNING: allowlist {ALLOWLIST} missing -- failing CLOSED (reject all)")
         return None
+    # F3 self-lockout guard — fold the box's own inbound mgmt/peer sources from machine.env into
+    # the never-block set, so a poisoned IP feed can never blackhole the operator's own management
+    # source (the IP-path twin of edge-dnsblock-update auto-protecting EGRESS_PROBE/DNS_UPSTREAM).
+    # Belt-and-suspenders: these hold even if a hand-edit empties the file's installation-specific
+    # lines. trusted_hosts may be public (remote admin / VPN endpoint) and thus NOT covered by the
+    # shipped RFC1918 floors — exactly the case the static allowlist misses.
+    nets += env_protected_nets()
+    return nets
+
+def env_protected_nets():
+    # TRUSTED_HOSTS is comma/space-separated; RELAY_DST/GATEWAY are single IPs. Bare IPs parse as
+    # /32 (v4) or /128 (v6). Garbage is ignored — this only ever ADDS protection, never rejects.
+    nets = []
+    raw = os.environ.get("TRUSTED_HOSTS", "").replace(",", " ").split()
+    for var in ("RELAY_DST", "GATEWAY"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            raw.append(v)
+    for tok in raw:
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            continue
     return nets
 
 def parse_duration(s):

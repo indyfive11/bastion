@@ -99,6 +99,8 @@ egress_probe = https://api.anthropic.com
 relay_dst = 10.0.0.3
 # NetworkManager connection to re-up on rollback; blank if not using NM
 nm_conn =
+# space-separated IP-blocklist feed URLs (edge-feed-fetch); blank = built-in defaults
+feed_sources =
 # space-separated host-list URLs; blank = built-in default (StevenBlack)
 dnsblock_sources =
 # space-separated domains the DNS sinkhole must NEVER block (covers subdomains); on top of the

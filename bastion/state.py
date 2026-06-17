@@ -133,9 +133,14 @@ ENV_MAP: tuple[tuple[str, str, str], ...] = (
     ("LAN_IP", "network", "lan_ip"),
     ("GATEWAY", "network", "gateway"),
     ("DNS_UPSTREAM", "network", "dns_upstream"),
+    # Inbound mgmt hosts — read by edge-reconciler so a poisoned IP feed can never block the
+    # operator's own management source (F3 self-lockout guard; the IP twin of the DNS never-sink).
+    ("TRUSTED_HOSTS", "network", "trusted_hosts"),
     ("RELAY_DST", "monitoring", "relay_dst"),
     ("NM_CONN", "monitoring", "nm_conn"),
     ("EGRESS_PROBE", "monitoring", "egress_probe"),
+    # IP-blocklist feed URLs (edge-feed-fetch); blank -> the script's built-in defaults.
+    ("FEED_SOURCES", "monitoring", "feed_sources"),
     ("DNSBLOCK_SOURCES", "monitoring", "dnsblock_sources"),
     ("RECOVERY_DEDICATED_PORT", "recovery", "dedicated_port"),
     ("RECOVERY_WINDOW_SECONDS", "recovery", "window_seconds"),
