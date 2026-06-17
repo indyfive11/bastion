@@ -129,6 +129,24 @@ def test_resolve_entrypoint_prefers_installed(monkeypatch):
 
 def test_by_group_preserves_and_partitions():
     groups = actions.by_group()
-    assert "Layers" in groups and "AI" in groups
+    assert "Layers" in groups and "AI" in groups and "Configure" in groups   # registry bridge
     flat = [a.id for items in groups.values() for a in items]
-    assert sorted(flat) == sorted(a.id for a in actions.ACTIONS)
+    assert sorted(flat) == sorted(a.id for a in actions.all_actions())        # fixed + config actions
+
+
+def test_config_actions_bridge_tiers_and_argv():
+    """The registry->Action bridge: one action per setting, Everyday=CAUTION, Advanced=DESTRUCTIVE
+    (typed) with --advanced baked into the argv so the shelled CLI honours the same gate."""
+    from bastion import configspec
+    ca = {a.id: a for a in actions.config_actions()}
+    assert len(ca) == len(configspec.SETTINGS)
+    assert all(a.group == "Configure" for a in ca.values())
+    ssh = ca["config.set.ports.ssh"]
+    assert ssh.risk == actions.CAUTION and not ssh.needs_typed_confirm
+    assert ssh.build_subargv({"value": "2222"}) == ["config", "set", "ports.ssh", "2222"]
+    lan = ca["config.set.network.lan_ip"]
+    assert lan.risk == actions.DESTRUCTIVE and lan.needs_typed_confirm
+    assert lan.build_subargv({"value": "10.0.0.9"}) == \
+        ["config", "set", "network.lan_ip", "--advanced", "10.0.0.9"]
+    # the Configure group is in the combined surface the palette renders
+    assert "Configure" in actions.by_group() and ssh in actions.all_actions()

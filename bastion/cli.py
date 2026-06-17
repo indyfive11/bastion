@@ -307,6 +307,8 @@ def cmd_layer(args: argparse.Namespace) -> int:
     if args.action == "status":
         _print_status(layer.status(ctx), True, ctx, layer)
         return 0
+    if args.action in ("enable", "disable"):
+        return _layer_scope(args, ctx, layer, enable=(args.action == "enable"))
     if args.action in ("install", "uninstall"):
         if not _require_root(ctx.system, f"layer {args.action}"):
             return 1
@@ -324,6 +326,87 @@ def cmd_layer(args: argparse.Namespace) -> int:
             return 1
         return 0
     return 2
+
+
+def _layer_scope(args: argparse.Namespace, ctx: Context, layer, *, enable: bool) -> int:
+    """`layer enable/disable`: install/uninstall the layer (reusing the existing prereq + reverse-dep
+    guards + root checks), THEN record it in [machine] layers so the config reflects reality. The
+    install/uninstall runs FIRST so a blocked/failed op never leaves a layers list that lies."""
+    from . import configspec
+    conf_path = configspec.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
+    # point the install/uninstall at the resolved conf so a staged --root tree renders against the
+    # staged machine.conf (cmd_layer's build_context uses find_conf, which doesn't root-prefix).
+    args.conf = str(conf_path)
+    args.action = "install" if enable else "uninstall"
+    rc = cmd_layer(args)
+    if rc != 0:
+        return rc
+    try:
+        config = state.load_conf(conf_path)
+    except FileNotFoundError:
+        print(f"layer {'enabled' if enable else 'disabled'}, but no machine.conf to record it in "
+              f"({conf_path})", file=sys.stderr)
+        return 0
+    cur = [l.strip() for l in config.get("machine", {}).get("layers", "").split(",") if l.strip()]
+    if enable and layer.name not in cur:
+        cur.append(layer.name)
+    if (not enable) and layer.name in cur:
+        cur.remove(layer.name)
+    ordered = ",".join(lid for lid in (f"l{i}" for i in range(7)) if lid in cur)
+    config.setdefault("machine", {})["layers"] = ordered
+    state.write_conf(config, conf_path)
+    print(f"machine.conf [machine] layers = {ordered}")
+    return 0
+
+
+def _trust_mutate(args: argparse.Namespace, *, add: bool) -> int:
+    """`bastion allow/deny <ip>` — add/remove a trusted host. `--list` (or no value) shows current."""
+    from . import configspec as cfg
+    setting = cfg.get("network.trusted_hosts")
+    config = _config_load_soft(args)
+    current = cfg.current_value(config, setting)
+    if getattr(args, "list", False) or not getattr(args, "value", None):
+        print(current or "(none)")
+        return 0
+    new = cfg.list_add(current, args.value, ",") if add else cfg.list_remove(current, args.value, ",")
+    if new == current:
+        print(f"{args.value} is {'already trusted' if add else 'not in trusted_hosts'} — no change")
+        return 0
+    return cfg.apply_change("network.trusted_hosts", new, conf=getattr(args, "conf", None),
+                            root=getattr(args, "root", None), assume_yes=True).rc
+
+
+def cmd_dns(args: argparse.Namespace) -> int:
+    """`bastion dns upstream [<value>]` — view/change the DNS upstream resolver."""
+    from . import configspec as cfg
+    setting = cfg.get("network.dns_upstream")
+    if not getattr(args, "value", None):
+        print(cfg.current_value(_config_load_soft(args), setting) or "(unset)")
+        return 0
+    return cfg.apply_change("network.dns_upstream", args.value, conf=getattr(args, "conf", None),
+                            root=getattr(args, "root", None), assume_yes=True).rc
+
+
+def cmd_dnsblock(args: argparse.Namespace) -> int:
+    """`bastion dnsblock list|add|remove [<url>]` — manage DNS blocklist feed sources."""
+    from . import configspec as cfg
+    setting = cfg.get("monitoring.dnsblock_sources")
+    current = cfg.current_value(_config_load_soft(args), setting)
+    if args.op == "list":
+        print(current or "(none — using the built-in default)")
+        return 0
+    if not args.url:
+        print(f"usage: bastion dnsblock {args.op} <url>", file=sys.stderr)
+        return 1
+    new = cfg.list_add(current, args.url, " ") if args.op == "add" else cfg.list_remove(current, args.url, " ")
+    if new == current:
+        print(f"{args.url} is {'already a source' if args.op == 'add' else 'not a source'} — no change")
+        return 0
+    rc = cfg.apply_change("monitoring.dnsblock_sources", new, conf=getattr(args, "conf", None),
+                          root=getattr(args, "root", None), assume_yes=True).rc
+    if rc == 0:
+        print("  run `bastion update dnsblock` to fetch the new list now")
+    return rc
 
 
 def _prerequisite_block(ctx: Context, layer, action: str) -> str | None:
@@ -395,6 +478,17 @@ _AI_ID_ACTIONS = {"rollback", "accept", "reject"}   # take a trailing <id>
 
 
 def cmd_ai(args: argparse.Namespace) -> int:
+    # Config verbs (E7) route to the config engine, not edge-ctl — they edit machine.conf + re-arm,
+    # and don't require edge-ctl to be installed.
+    if args.action in ("set-interval", "set-depth"):
+        from . import configspec as cfg
+        key = "ai.timer_interval" if args.action == "set-interval" else "ai.depth"
+        val = getattr(args, "id", None)
+        if not val:
+            print(f"usage: bastion ai {args.action} <value>", file=sys.stderr)
+            return 1
+        return cfg.apply_change(key, val, conf=getattr(args, "conf", None),
+                                root=getattr(args, "root", None), advanced=True, assume_yes=True).rc
     ctx = build_context(args)
     sys_ = ctx.system
     if not sys_.exists(f"{ctx.sbin_dir}/edge-ctl"):
@@ -821,6 +915,75 @@ def cmd_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _config_load_soft(args) -> dict:
+    """Load machine.conf for a read-only config view; {} if none (a fresh box)."""
+    from . import configspec
+    try:
+        return state.load_conf(configspec.resolve_conf_path(getattr(args, "conf", None),
+                                                            getattr(args, "root", None)))
+    except FileNotFoundError:
+        return {}
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """The configuration control room (raise machine.conf into the CLI/TUI). `config set` validates,
+    writes machine.conf atomically, and runs ONLY the regen+reload that key needs. Advanced settings
+    are gated behind --advanced."""
+    import json as _json
+    from . import configspec as cfg
+    cmd = getattr(args, "config_cmd", None)
+
+    if cmd == "set":
+        res = cfg.apply_change(args.key, args.value, conf=args.conf, root=args.root,
+                               dry_run=args.dry_run, advanced=args.advanced, assume_yes=args.yes)
+        return res.rc
+
+    if cmd == "get":
+        s = cfg.get(args.key)
+        if s is None:
+            print(f"unknown setting {args.key!r} (see `bastion config list`)", file=sys.stderr)
+            return 1
+        print(cfg.current_value(_config_load_soft(args), s))
+        return 0
+
+    if cmd == "describe":
+        s = cfg.get(args.key)
+        if s is None:
+            print(f"unknown setting {args.key!r} (see `bastion config list`)", file=sys.stderr)
+            return 1
+        print(f"{s.key}  [{s.tier}]")
+        print(f"  {s.label} — {s.help}")
+        print(f"  expects : {s.hint}")
+        print(f"  scope   : {s.scope}" + (f" (needs layer {s.layer_gate})" if s.layer_gate else ""))
+        print(f"  on change: {cfg._APPLY_DESC[s.apply]}")
+        print(f"  current : {cfg.current_value(_config_load_soft(args), s) or '(unset)'}")
+        return 0
+
+    # list (default)
+    config = _config_load_soft(args)
+    rows = []
+    for s in cfg.SETTINGS:
+        if s.tier == cfg.ADVANCED and not args.advanced:
+            continue
+        if args.group and s.section != args.group:
+            continue
+        applies = cfg.applies_to(s, config)[0] if config else True
+        rows.append((s, cfg.current_value(config, s), applies))
+    if args.json:
+        print(_json.dumps([{"key": s.key, "tier": s.tier, "scope": s.scope, "value": v,
+                            "applies": ap, "apply": s.apply} for s, v, ap in rows], indent=2))
+        return 0
+    print("bastion config — settings" + ("" if args.advanced else " (Everyday; --advanced for the rest)"))
+    w = max((len(s.key) for s, _, _ in rows), default=12)
+    for s, v, ap in rows:
+        mark = " " if ap else "·"  # · = doesn't apply to this node (wrong mode / inactive layer)
+        tier = "ADV" if s.tier == cfg.ADVANCED else "   "
+        print(f"  {mark}{tier} {s.key:<{w}}  {v or '(unset)'}")
+    if not args.advanced:
+        print("  (· = not applicable to this node)  ·  `bastion config describe <key>` for detail")
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Interactive setup wizard (§10). Phase 5: rule-based; --dry-run writes nothing."""
     from .setup.wizard import Wizard, parse_overrides
@@ -892,8 +1055,52 @@ def build_parser() -> argparse.ArgumentParser:
     sta.add_argument("--root", help="inspect under this base dir instead of / (testing)")
     sta.set_defaults(func=cmd_state)
 
+    cfgp = sub.add_parser("config", help="view/change machine.conf settings (the control room)")
+    cfgsub = cfgp.add_subparsers(dest="config_cmd", required=True)
+    _cl = cfgsub.add_parser("list", help="list settings + current values (Everyday by default)")
+    _cl.add_argument("--advanced", action="store_true", help="also show Advanced (gated) settings")
+    _cl.add_argument("--group", help="only this section (machine/network/ai/recovery/monitoring/...)")
+    _cl.add_argument("--json", action="store_true")
+    _cl.add_argument("--conf"); _cl.add_argument("--root")
+    _cg = cfgsub.add_parser("get", help="print one setting's current value")
+    _cg.add_argument("key"); _cg.add_argument("--conf"); _cg.add_argument("--root")
+    _cd = cfgsub.add_parser("describe", help="explain a setting + what changing it does")
+    _cd.add_argument("key"); _cd.add_argument("--conf"); _cd.add_argument("--root")
+    _cs = cfgsub.add_parser("set", help="change a setting (validate -> write -> scoped reload)")
+    _cs.add_argument("key"); _cs.add_argument("value")
+    _cs.add_argument("--advanced", action="store_true", help="acknowledge an ADVANCED (dangerous) change")
+    _cs.add_argument("--yes", action="store_true", help="skip the interactive confirm")
+    _cs.add_argument("--dry-run", action="store_true", help="preview only; write nothing")
+    _cs.add_argument("--conf"); _cs.add_argument("--root")
+    cfgp.set_defaults(func=cmd_config)
+
+    # Ergonomic domain verbs (thin wrappers over config set, inheriting validation/apply/gating).
+    alw = sub.add_parser("allow", help="add an IP/CIDR to trusted_hosts (full inbound access)")
+    alw.add_argument("value", nargs="?", help="IP or CIDR (omit with --list to show current)")
+    alw.add_argument("--list", action="store_true", help="list current trusted hosts")
+    alw.add_argument("--conf"); alw.add_argument("--root")
+    alw.set_defaults(func=lambda a: _trust_mutate(a, add=True))
+    dny = sub.add_parser("deny", help="remove an IP/CIDR from trusted_hosts")
+    dny.add_argument("value", nargs="?"); dny.add_argument("--list", action="store_true")
+    dny.add_argument("--conf"); dny.add_argument("--root")
+    dny.set_defaults(func=lambda a: _trust_mutate(a, add=False))
+
+    dnsp = sub.add_parser("dns", help="DNS settings (upstream resolver)")
+    dnsp.add_argument("what", choices=["upstream"], help="the DNS setting to view/change")
+    dnsp.add_argument("value", nargs="?", help="new value (omit to show current)")
+    dnsp.add_argument("--conf"); dnsp.add_argument("--root")
+    dnsp.set_defaults(func=cmd_dns)
+
+    dbp = sub.add_parser("dnsblock", help="manage DNS blocklist feed sources")
+    dbp.add_argument("op", choices=["list", "add", "remove"])
+    dbp.add_argument("url", nargs="?", help="feed URL for add/remove")
+    dbp.add_argument("--conf"); dbp.add_argument("--root")
+    dbp.set_defaults(func=cmd_dnsblock)
+
     lay = sub.add_parser("layer", help="manage an individual layer")
-    lay.add_argument("action", choices=["status", "install", "uninstall"])
+    lay.add_argument("action", choices=["status", "install", "uninstall", "enable", "disable"],
+                     help="status/install/uninstall a layer; enable/disable also add/remove it from "
+                          "[machine] layers in machine.conf")
     lay.add_argument("name", help="layer id, e.g. l0")
     lay.add_argument("--conf", help="path to machine.conf")
     lay.add_argument("--root", help="operate under this base dir instead of / (staged install/testing)")
@@ -912,11 +1119,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     ai = sub.add_parser("ai", help="control the L3 AI analysis layer (operator kill switch)")
     ai.add_argument("action", choices=["enable", "disable", "panic", "status", "proposals",
-                                       "accept", "reject", "rollback"],
+                                       "accept", "reject", "rollback", "set-interval", "set-depth"],
                     help="enable/disable arm the AI timer; panic flushes ai_* now; status shows state; "
                          "proposals lists the review queue; accept/reject <id> resolve a proposal; "
-                         "rollback <id> undoes one audit record")
-    ai.add_argument("id", nargs="?", help="id for accept/reject/rollback")
+                         "rollback <id> undoes one audit record; set-interval <dur> / set-depth <level> "
+                         "change config")
+    ai.add_argument("id", nargs="?", help="id for accept/reject/rollback, or value for set-interval/set-depth")
     ai.add_argument("--conf", help="path to machine.conf")
     ai.add_argument("--root", help="operate under this base dir instead of /")
     ai.set_defaults(func=cmd_ai)

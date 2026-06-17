@@ -157,17 +157,44 @@ ACTIONS: tuple[Action, ...] = (
            warn="Interactive install/configure wizard (runs on the terminal)."),
 )
 
-_BY_ID = {a.id: a for a in ACTIONS}
+_CONFIG_ACTIONS: tuple[Action, ...] | None = None
+
+
+def config_actions() -> tuple[Action, ...]:
+    """Bridge the configspec registry into the Action model so the TUI/GUI get a **Configure** group
+    for free (one Action per setting). Everyday settings are CAUTION (yes/no); Advanced are
+    DESTRUCTIVE (type-to-confirm) and bake ``--advanced`` into the argv so the shelled CLI honours
+    the same gate the front-end already enforced. The new value is collected as the one param."""
+    global _CONFIG_ACTIONS
+    if _CONFIG_ACTIONS is None:
+        from . import configspec
+        acts: list[Action] = []
+        for s in configspec.SETTINGS:
+            adv = s.tier == configspec.ADVANCED
+            argv = ("config", "set", s.key) + (("--advanced",) if adv else ())
+            acts.append(Action(
+                f"config.set.{s.key}", s.label, "Configure",
+                DESTRUCTIVE if adv else CAUTION, argv,
+                params=(Param("value", f"new value ({s.hint})", choices=s.choices),),
+                warn=(f"ADVANCED — {s.help} ({configspec._APPLY_DESC[s.apply]})" if adv
+                      else configspec._APPLY_DESC[s.apply])))
+        _CONFIG_ACTIONS = tuple(acts)
+    return _CONFIG_ACTIONS
+
+
+def all_actions() -> tuple[Action, ...]:
+    """The full action surface: the fixed operate/inspect actions + the generated Configure group."""
+    return ACTIONS + config_actions()
 
 
 def get(action_id: str) -> Action | None:
-    return _BY_ID.get(action_id)
+    return {a.id: a for a in all_actions()}.get(action_id)
 
 
 def by_group() -> dict[str, list[Action]]:
     """Actions grouped (preserving registry order) for a menu/palette."""
     groups: dict[str, list[Action]] = {}
-    for a in ACTIONS:
+    for a in all_actions():
         groups.setdefault(a.group, []).append(a)
     return groups
 

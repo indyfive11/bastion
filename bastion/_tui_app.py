@@ -25,17 +25,19 @@ from .tui import gather_dashboard, render_dashboard  # pragma: no cover
 
 class ParamScreen(ModalScreen):  # pragma: no cover
     """Collect one parameter value (with an optional choices hint). Returns the string, or None."""
-    def __init__(self, action, param):
+    def __init__(self, action, param, initial=""):
         super().__init__()
-        self._action, self._param = action, param
+        self._action, self._param, self._initial = action, param, initial
 
     def compose(self) -> ComposeResult:
         hint = f" ({', '.join(self._param.choices)})" if self._param.choices else ""
         opt = "" if self._param.required else "  [dim]— optional, leave blank to skip[/dim]"
+        cur = "  [dim]— current value, edit in place[/dim]" if self._initial else ""
         with Grid(id="dialog"):
             yield Label(f"[b]{self._action.label}[/b]")
-            yield Label(f"{self._param.label}{hint}{opt}")
-            yield Input(placeholder=self._param.placeholder or self._param.name, id="value")
+            yield Label(f"{self._param.label}{hint}{opt}{cur}")
+            yield Input(value=self._initial, placeholder=self._param.placeholder or self._param.name,
+                        id="value")
             yield Button("OK", variant="primary", id="ok")
             yield Button("Cancel", id="cancel")
 
@@ -160,14 +162,30 @@ class BastionTUI(App):  # pragma: no cover
     def action_actions(self) -> None:
         self._command_flow()
 
+    def _config_prefill(self, action) -> dict:  # pragma: no cover
+        """For a config.set.<key> action, the current value (so the param prefills, edit-in-place)."""
+        if not action.id.startswith("config.set."):
+            return {}
+        try:
+            from pathlib import Path as _P
+            from . import configspec, state as _state
+            key = action.id[len("config.set."):]
+            setting = configspec.get(key)
+            root = None if self._ctx.system.root == _P("/") else str(self._ctx.system.root)
+            cfg = _state.load_conf(configspec.resolve_conf_path(None, root))
+            return {"value": configspec.current_value(cfg, setting)}
+        except Exception:
+            return {}
+
     @work
     async def _command_flow(self) -> None:
         action = await self.push_screen_wait(ActionsScreen())
         if action is None:
             return
+        prefill = self._config_prefill(action)   # current value for a config.set.* action (else {})
         values: dict = {}
         for p in action.params:
-            v = await self.push_screen_wait(ParamScreen(action, p))
+            v = await self.push_screen_wait(ParamScreen(action, p, initial=prefill.get(p.name, "")))
             if v is None:                      # cancelled
                 return
             values[p.name] = v
