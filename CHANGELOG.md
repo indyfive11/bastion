@@ -4,6 +4,73 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-06-16
+
+A post-install configuration control surface — change settings from the CLI/TUI
+instead of hand-editing config files and re-running the wizard — on top of a round
+of safety hardening and a single canonical world-state document that the CLI, TUI,
+and a future GUI all read from. Validated live on the edge VM and the endpoint laptop.
+
+### Added
+
+- **A post-install configuration control surface: `bastion config`.** Settings that
+  previously could only be set by the install wizard (or by hand-editing
+  `machine.conf`) are now changeable at runtime, with validation and the right —
+  and only the right — service reload. `config list` / `get` / `set` / `describe`
+  cover the full `machine.conf` surface, each setting classified **Everyday** or
+  **Advanced**. Advanced changes (topology, interfaces, AI backend) are **gated**:
+  the CLI requires `--advanced` and the TUI requires a typed confirmation, so an
+  operator knows when they are entering dangerous waters. Every write is validated
+  (field + whole-config) before it lands, staged atomically, and followed by a
+  scoped reload — a DNS change never reloads the firewall.
+- **Ergonomic verbs over the same engine.** `bastion allow`/`deny <ip|cidr>` (trusted
+  management hosts), `bastion dns upstream`, `bastion dnsblock <list|add|remove>`,
+  `bastion ai set-interval`/`set-depth`, and `bastion layer enable`/`disable` — all
+  thin wrappers that inherit the same validation, gating, and scoped reload. A
+  **Configure** group appears in the `bastion tui` command palette automatically.
+- **`bastion state [--json]` — one canonical, versioned world-state document.** Layer
+  health, nftables set counts, AI/recovery state and config drift now come from a
+  single source the `status`/`doctor`/TUI surfaces (and a future GUI) all read from,
+  so they can never disagree.
+- **`bastion migrate` and a config schema version.** `machine.conf` now carries a
+  schema version; `migrate [--check]` reports and applies forward migrations so an
+  older config upgrades cleanly.
+- **The DNS sinkhole accepts more list formats.** `edge-dnsblock-update` now reads
+  plain-domain and adblock (`||domain^`) lists in addition to `0.0.0.0` hosts files,
+  so most public blocklists (OISD, HaGeZi, AdGuard) drop in unchanged.
+- **A never-sink allowlist for the DNS sinkhole.** A poisoned or over-aggressive
+  blocklist can no longer NXDOMAIN the box's own update path, the AI API, distro
+  mirrors, or operator-critical domains (allowlisted domains and their subdomains
+  are never sinkholed), with supply-chain sanity caps that refuse a sudden collapse
+  or implausible explosion in the domain count.
+
+### Changed
+
+- The TUI command surface now runs actions off the UI event loop so the dashboard
+  stays responsive during a long-running operation, and the root-privilege check is
+  unified across the CLI.
+
+### Fixed
+
+- **The firewall ruleset is now written atomically** (`/etc/nftables.conf` via a temp
+  file + rename), so a crash mid-write can never leave a half-written ruleset.
+- **The reconciler and `edge-ctl` now share a lock**, so a manual operation and the
+  reconciler can no longer race on the nftables sets.
+- **A watchdog light-heal preserves the recovery table** and kicks the reconciler,
+  instead of briefly dropping the rescue path during a self-heal.
+- **Orphaned recovery rescue users are reaped** (account expiry + a reaper unit), so
+  a crashed recovery session cannot leave a lingering privileged account.
+- **The hard-bootstrap recovery path is more robust:** it punches its accept rule into
+  the live main table, guards against a double-start race, and never emits the OTP to
+  the system journal (console only).
+- Scoped, rate-limited ICMPv6 in the edge/endpoint rulesets (neighbor discovery and
+  MLD from link-local only) instead of a blanket allow.
+- AI analysis runs with a minimal environment and strips control characters from
+  collected signals; the signals file is group-readable by the AI user only.
+- `bastion generate` now validates the rendered ruleset (`nft -c`) before it can be
+  loaded, and reports artifact drift (a generated file changed out from under the
+  config).
+
 ## [1.2.0] - 2026-06-15
 
 Multi-distro support: Fedora/RHEL (`dnf`) is now driven, and the Debian/Ubuntu
