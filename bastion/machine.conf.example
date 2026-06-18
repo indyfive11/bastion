@@ -51,6 +51,11 @@ zt_cidr = 10.147.17.0/24
 wg_server_cidr = 10.8.0.0/24
 # always-accept management IPs (comma-separated, user-entered)
 trusted_hosts = 10.0.1.50, 10.0.1.55
+# inbound service ports to OPEN to LAN/overlay (any source). For a box that runs bastion AND serves
+# apps (media/*arr/ZeroTier/etc.) the default-drop ruleset would block them — list them here. Tokens
+# are `port` or `port/proto` (proto tcp|udp, default tcp), comma/space-separated. Blank = a locked-down
+# client endpoint. On edge the WAN stays closed regardless (WAN drop fires first). e.g. 8096, 53/udp
+service_ports =
 # DNS upstream — see docs/options/dns-options.md (local stub shown)
 dns_upstream = 127.0.0.1#5335
 # L4 DHCP pool start

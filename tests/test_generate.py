@@ -96,6 +96,40 @@ def test_real_nft_templates_render_valid_with_blank_trusted_hosts():
         assert templates.find_placeholders(out) == set()
 
 
+def _nft_check(text: str):
+    """Run `nft -c -f -` in an unprivileged netns if available; return (ran, ok). Skips cleanly when
+    nft/unshare aren't present (CI bare runners) — the render+placeholder asserts still gate syntax."""
+    import shutil
+    import subprocess
+    if not (shutil.which("nft") and shutil.which("unshare")):
+        return False, True
+    p = subprocess.run(["unshare", "-rn", "nft", "-c", "-f", "-"],
+                       input=text, capture_output=True, text=True)
+    return True, p.returncode == 0, p.stderr
+
+
+def test_real_nft_templates_render_valid_with_service_ports():
+    # The service_ports allowlist must render into BOTH rulesets as valid `dport { } accept` lines,
+    # and a blank value must leave NO empty-brace `dport { }` (an nft syntax error).
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)
+    cfg["network"]["service_ports"] = "8096, 7878/tcp, 53/udp"
+    for tmpl in ("nftables-edge.nft", "nftables-endpoint.nft"):
+        out = templates.render_file(TEMPLATES / tmpl, cfg)
+        assert "tcp dport { 8096, 7878 } accept" in out, tmpl
+        assert "udp dport { 53 } accept" in out, tmpl
+        assert templates.find_placeholders(out) == set()
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"{tmpl} failed nft -c: {err}"
+
+    cfg["network"]["service_ports"] = ""               # blank -> both accept lines vanish
+    for tmpl in ("nftables-edge.nft", "nftables-endpoint.nft"):
+        out = templates.render_file(TEMPLATES / tmpl, cfg)
+        assert "dport {  } accept" not in out and "dport { } accept" not in out, tmpl
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"{tmpl} (blank service_ports) failed nft -c: {err}"
+
+
 def test_active_template_rels_excludes_inactive_layers():
     from bastion import state
     conf = {"machine": {"mode": "endpoint", "layers": "l0,l1,l6"}}

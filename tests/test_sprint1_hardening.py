@@ -53,6 +53,22 @@ def test_validate_conf_rejects_bad_values():
     assert len(errs) >= 5
 
 
+def test_validate_conf_accepts_good_service_ports():
+    c = _conf()
+    c["network"]["service_ports"] = "8096, 7878/tcp 53/udp"
+    errs, _ = state.validate_conf(c)
+    assert errs == []
+
+
+def test_validate_conf_rejects_bad_service_ports():
+    c = _conf()
+    c["network"]["service_ports"] = "8096 70000 53/sctp abc"
+    errs, _ = state.validate_conf(c)
+    blob = " ".join(errs)
+    assert "70000" in blob and "53/sctp" in blob and "abc" in blob
+    assert "8096" not in blob               # the valid token is not flagged
+
+
 def test_validate_conf_warns_on_default_route():
     c = _conf()
     c["network"]["lan_cidr"] = "0.0.0.0/0"

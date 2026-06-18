@@ -204,6 +204,15 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         except ValueError:
             errors.append(f"[network] trusted_hosts entry {part!r} — not a valid IP/CIDR")
 
+    # service_ports: `port` or `port/proto` (proto tcp|udp), comma/space-separated. Opens these to
+    # LAN/overlay so a server can run bastion without its services being dropped.
+    for tok in _get("network", "service_ports").replace(",", " ").split():
+        port, sep, proto = tok.partition("/")
+        if not (port.isdigit() and 1 <= int(port) <= 65535):
+            errors.append(f"[network] service_ports entry {tok!r} — port must be an integer 1–65535")
+        elif sep and proto.lower() not in ("tcp", "udp"):
+            errors.append(f"[network] service_ports entry {tok!r} — proto must be tcp or udp")
+
     for key in ("lan", "wan", "zt_iface", "wg_vps_iface", "wg_server_iface"):
         val = _get("interfaces", key)
         if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):

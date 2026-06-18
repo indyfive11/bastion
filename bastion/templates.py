@@ -62,6 +62,12 @@ def _derived(config: dict) -> dict:
       (``templates/sysctl-forward.conf``): empty when ``[network] ipv6_forward`` is off, else
       ``net.ipv6.conf.all.forwarding = 1`` plus an ``accept_ra = 2`` on the WAN (see
       :func:`_ipv6_forward_block`). Always present so the sysctl template resolves.
+    * ``network.service_ports_tcp_accept`` / ``network.service_ports_udp_accept`` — the input-chain
+      accept rule for the operator's ``[network] service_ports`` allowlist, one per transport (e.g.
+      ``tcp dport { 8096, 7878 } accept``). Each is ``""`` when that transport has no ports (an empty
+      ``dport { }`` is an nft syntax error, so the whole line must vanish). Lets a server that runs
+      bastion open its service ports without hand-editing the default-drop ruleset. See
+      :func:`_parse_service_ports`.
     """
     net = dict(config.get("network") or {})
     if "trusted_hosts" in net:
@@ -70,7 +76,35 @@ def _derived(config: dict) -> dict:
         net["trusted_hosts_elements"] = f"elements = {{ {v4} }}" if v4 else ""
         net["trusted_hosts6_elements"] = f"elements = {{ {v6} }}" if v6 else ""
     net["ipv6_forward_block"] = _ipv6_forward_block(config)
+    tcp_ports, udp_ports = _parse_service_ports(str(net.get("service_ports") or ""))
+    net["service_ports_tcp_accept"] = (
+        f"tcp dport {{ {', '.join(str(p) for p in tcp_ports)} }} accept" if tcp_ports else "")
+    net["service_ports_udp_accept"] = (
+        f"udp dport {{ {', '.join(str(p) for p in udp_ports)} }} accept" if udp_ports else "")
     return {**config, "network": net}
+
+
+def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
+    """Partition a ``[network] service_ports`` string into ``(tcp_ports, udp_ports)``.
+
+    Each token is ``port`` or ``port/proto`` (proto ``tcp``|``udp``, default ``tcp``); tokens are
+    comma- and/or whitespace-separated. Order is preserved and duplicates within a transport are
+    dropped (keeps the rendered ``dport { }`` set clean). Malformed/out-of-range tokens are skipped
+    here — :func:`bastion.state.validate_conf` surfaces them as errors and blocks ``generate`` first,
+    so a clean conf never reaches this with a bad token; the skip is just belt-and-suspenders."""
+    tcp: list[int] = []
+    udp: list[int] = []
+    for tok in raw.replace(",", " ").split():
+        port, _, proto = tok.partition("/")
+        if not port.isdigit():
+            continue
+        n = int(port)
+        if not (1 <= n <= 65535):
+            continue
+        bucket = udp if proto.lower() == "udp" else tcp
+        if n not in bucket:
+            bucket.append(n)
+    return tcp, udp
 
 
 def _ipv6_forward_block(config: dict) -> str:

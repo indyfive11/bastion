@@ -38,6 +38,7 @@ def test_every_example_value_validates():
     ("recovery.window_seconds", "900", "-5"),
     ("monitoring.egress_probe", "https://example.com", "ftp:bad"),
     ("monitoring.dnsblock_sources", "https://a/x https://b/y", "noturl"),
+    ("network.service_ports", "8096 53/udp 7878/tcp", "8096 99999"),
     ("interfaces.lan", "eth0", "this-iface-name-is-too-long-x"),
 ])
 def test_validators_accept_good_reject_bad(key, good, bad):

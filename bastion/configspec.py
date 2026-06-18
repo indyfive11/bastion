@@ -83,6 +83,17 @@ def _v_dns_upstream(v: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9.-]+", host))
 
 
+def _v_service_ports(v: str) -> bool:
+    """Space/comma-separated `port` or `port/proto` (proto tcp|udp). Blank = none (a locked endpoint)."""
+    for tok in v.replace(",", " ").split():
+        port, sep, proto = tok.partition("/")
+        if not (port.isdigit() and 1 <= int(port) <= 65535):
+            return False
+        if sep and proto.lower() not in ("tcp", "udp"):
+            return False
+    return True
+
+
 def _v_choice(*choices):
     return lambda v: (not v) or v in choices
 
@@ -122,6 +133,10 @@ SETTINGS: tuple[Setting, ...] = (
        "a port 1–65535", APPLY_GENERATE_FIREWALL),
     _S("network.trusted_hosts", "Trusted hosts", "IPs/CIDRs always allowed full inbound access.",
        EVERYDAY, _v_hosts, "comma-separated IPs/CIDRs", APPLY_GENERATE_FIREWALL, list_sep=","),
+    _S("network.service_ports", "Service ports",
+       "Inbound ports to open to LAN/overlay so a server can run bastion (blank = locked endpoint).",
+       EVERYDAY, _v_service_ports, "ports like 8096, 53/udp (port or port/proto)",
+       APPLY_GENERATE_FIREWALL, list_sep=" "),
     _S("network.dns_upstream", "DNS upstream", "Upstream resolver dnsmasq forwards to (host#port).",
        EVERYDAY, _v_dns_upstream, "host#port (e.g. 127.0.0.1#5335) or an IP/hostname",
        APPLY_GENERATE_DNSMASQ, scope="edge", layer_gate="l4"),

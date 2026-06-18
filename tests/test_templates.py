@@ -102,3 +102,32 @@ def test_unparseable_host_stays_on_v4_line():
     net = templates._derived({"network": {"trusted_hosts": "not-an-ip"}})["network"]
     assert net["trusted_hosts_elements"] == "elements = { not-an-ip }"
     assert net["trusted_hosts6_elements"] == ""
+
+
+# --- service_ports inbound allowlist (a server can run bastion without its services dropped) ----
+
+def test_service_ports_splits_tcp_udp_and_dedupes_order():
+    tcp, udp = templates._parse_service_ports("8096, 7878/tcp 53/udp 8096 122/udp")
+    assert tcp == [8096, 7878]          # order preserved, dup 8096 dropped, default proto = tcp
+    assert udp == [53, 122]
+
+
+def test_service_ports_skips_out_of_range_and_nonnumeric():
+    # validate_conf blocks these first; the parser is belt-and-suspenders and just skips them.
+    tcp, udp = templates._parse_service_ports("99999 0 abc 8096")
+    assert tcp == [8096]
+    assert udp == []
+
+
+def test_service_ports_derived_renders_accept_lines():
+    net = templates._derived({"network": {"service_ports": "8096, 53/udp"}})["network"]
+    assert net["service_ports_tcp_accept"] == "tcp dport { 8096 } accept"
+    assert net["service_ports_udp_accept"] == "udp dport { 53 } accept"
+
+
+def test_service_ports_blank_omits_both_lines():
+    # Blank (or absent) -> both lines vanish; an empty `dport { }` is an nft syntax error.
+    for cfg in ({"network": {"service_ports": ""}}, {"network": {}}):
+        net = templates._derived(cfg)["network"]
+        assert net["service_ports_tcp_accept"] == ""
+        assert net["service_ports_udp_accept"] == ""

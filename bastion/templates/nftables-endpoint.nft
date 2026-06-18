@@ -66,6 +66,11 @@ table inet bastion {
         ip saddr {{ network.lan_cidr }} tcp dport {{ ports.ssh }} accept
         ip saddr @trusted_hosts accept
         ip6 saddr @trusted_hosts6 accept
+
+        # Operator service ports ([network] service_ports): any-source accept so a server that runs
+        # bastion can serve its apps. Blank by default — a client endpoint stays fully locked down.
+        {{ network.service_ports_tcp_accept }}
+        {{ network.service_ports_udp_accept }}
     }
 
     # No forward chain and no NAT table: an endpoint never routes for other hosts.

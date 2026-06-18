@@ -79,6 +79,12 @@ table inet edge {
         ip saddr {{ network.lan_cidr }} tcp dport 53 accept
         ip saddr @trusted_hosts accept
         ip6 saddr @trusted_hosts6 accept
+
+        # Operator service ports ([network] service_ports): any-source accept for apps this box
+        # serves. The WAN jump+drop above already fires first, so WAN-sourced traffic never reaches
+        # here — these open the ports to LAN/overlay only. Blank by default.
+        {{ network.service_ports_tcp_accept }}
+        {{ network.service_ports_udp_accept }}
     }
 
     chain forward {
