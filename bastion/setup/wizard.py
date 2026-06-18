@@ -288,7 +288,8 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
             ("network", "wg_server_cidr"), ("network", "dns_upstream"),
             ("network", "dhcp_range_start"), ("network", "dhcp_range_end"),
             ("network", "dhcp_lease"),
-            ("monitoring", "relay_dst"), ("monitoring", "dnsblock_sources"),
+            ("monitoring", "relay_dst"), ("monitoring", "relay_endpoint"),
+            ("monitoring", "dnsblock_sources"),
         ):
             conf.setdefault(sec, {})[key] = ""
     return conf

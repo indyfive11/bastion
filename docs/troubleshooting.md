@@ -64,6 +64,30 @@ nft list tables                                   # -> table inet bastion (or in
 **Fix.** `bastion layer install l0` enables it. Check with `systemctl is-enabled nftables` (should be
 `enabled`) and `bastion doctor` (reports persistence).
 
+### LAN clients get an address but can't reach the internet (edge)
+**Cause.** A router passes traffic between networks only when the kernel's IP-forwarding switch is on.
+bastion enables it for edge mode via `/etc/sysctl.d/99-bastion-forward.conf` (rendered by `generate`,
+applied on `layer install l0`). If that file is missing or wasn't applied, the forward chain is inert
+and forwarded packets are dropped before the rules run.
+**Fix.** Reinstall L0 (re-applies the sysctl), then confirm:
+```sh
+sudo bastion layer install l0
+sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding   # edge: 1 / 1 (or 1 / 0 if ipv6_forward=no)
+```
+IPv6 routing is controlled by `[network] ipv6_forward` in `machine.conf` (default `yes`; set `no` for a
+v4-only edge — the v6 firewall rules stay loaded but inert). Endpoints never forward.
+
+### DHCP clients need fixed addresses (reservations)
+**Cause.** Reservations pin a host's MAC to a stable IP. MACs are installation-specific, so bastion does
+**not** ship them in the managed `dnsmasq.conf`.
+**Fix.** `dnsmasq.conf` reads `/etc/dnsmasq.d/*.conf`; add reservations in a local drop-in that never
+enters the repo:
+```sh
+# one line per host: dhcp-host=<MAC>,<IP>,<name>
+sudoedit /etc/dnsmasq.d/reservations.conf
+sudo systemctl reload dnsmasq
+```
+
 ### `bastion check` shows failures on a healthy box
 **Cause.** Several `flowcheck` lines are **edge-only** (local DNS stub, the `LAN_IP:53` dnsmasq
 listener, the relay handshake, the WireGuard server iface). On an **endpoint**, or on an edge box

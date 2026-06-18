@@ -133,6 +133,68 @@ def test_l0_install_enables_boot_reaper(tmp_path):
     assert (tmp_path / "etc/systemd/system/bastion-recovery-reap.service").is_file()
 
 
+# --- G4: edge IP-forwarding sysctl ---------------------------------------------------------------
+FORWARD = "etc/sysctl.d/99-bastion-forward.conf"
+
+
+def test_l0_edge_renders_forward_sysctl(tmp_path):
+    # Edge mode must enable kernel forwarding or the forward chain is inert. Default ipv6_forward=yes
+    # → v4 + v6 forwarding, and accept_ra=2 pinned on the WAN so v6 forwarding can't strip the box's
+    # own uplink address.
+    config = state.load_conf(EXAMPLE)
+    layers.get("l0").install(_ctx(tmp_path, config))
+    body = (tmp_path / FORWARD).read_text()
+    assert "net.ipv4.ip_forward = 1" in body
+    assert "net.ipv6.conf.all.forwarding = 1" in body
+    assert f"net.ipv6.conf.{config['interfaces']['wan']}.accept_ra = 2" in body
+
+
+def test_l0_ipv6_forward_no_omits_v6(tmp_path):
+    config = state.load_conf(EXAMPLE)
+    config["network"]["ipv6_forward"] = "no"
+    layers.get("l0").install(_ctx(tmp_path, config))
+    body = (tmp_path / FORWARD).read_text()
+    assert "net.ipv4.ip_forward = 1" in body
+    assert "forwarding = 1" not in body.replace("ip_forward = 1", "")   # no v6 forwarding line
+    assert "accept_ra" not in body
+
+
+def test_l0_endpoint_writes_no_forward_sysctl(tmp_path):
+    # An endpoint never routes (defense-in-depth) — it must NOT enable forwarding.
+    config = state.load_conf(EXAMPLE)
+    config["machine"]["mode"] = "endpoint"
+    layers.get("l0").install(_ctx(tmp_path, config))
+    assert not (tmp_path / FORWARD).exists()
+
+
+def test_l0_endpoint_removes_stale_forward_sysctl(tmp_path):
+    # Converting an edge node to an endpoint must tear down the forwarding drop-in left behind.
+    stale = tmp_path / FORWARD
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("net.ipv4.ip_forward = 1\n")
+    config = state.load_conf(EXAMPLE)
+    config["machine"]["mode"] = "endpoint"
+    layers.get("l0").install(_ctx(tmp_path, config))
+    assert not stale.exists()
+
+
+def test_l0_live_applies_forward_sysctl(tmp_path):
+    # A live edge install must re-apply sysctls so forwarding takes effect without a reboot.
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)
+    assert ("sysctl", "--system") in sysobj.calls
+
+
+def test_l0_uninstall_removes_forward_sysctl(tmp_path):
+    config = state.load_conf(EXAMPLE)
+    layers.get("l0").install(_ctx(tmp_path, config))
+    assert (tmp_path / FORWARD).exists()
+    layers.get("l0").uninstall(_ctx(tmp_path, config))
+    assert not (tmp_path / FORWARD).exists()
+
+
 def test_l0_uninstall_disables_boot_reaper(tmp_path):
     sysobj = _FwSys(tmp_path, active_fw=None)
     ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),

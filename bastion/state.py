@@ -137,6 +137,10 @@ ENV_MAP: tuple[tuple[str, str, str], ...] = (
     # operator's own management source (F3 self-lockout guard; the IP twin of the DNS never-sink).
     ("TRUSTED_HOSTS", "network", "trusted_hosts"),
     ("RELAY_DST", "monitoring", "relay_dst"),
+    # Public endpoint of the upstream relay/tunnel — folded into the reconciler's never-block
+    # allowlist (the public twin of RELAY_DST, which is the tunnel's inner IP) so a poisoned feed
+    # can't blackhole the uplink's far end.
+    ("RELAY_ENDPOINT", "monitoring", "relay_endpoint"),
     ("NM_CONN", "monitoring", "nm_conn"),
     ("EGRESS_PROBE", "monitoring", "egress_probe"),
     # IP-blocklist feed URLs (edge-feed-fetch); blank -> the script's built-in defaults.
@@ -204,6 +208,17 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         val = _get("interfaces", key)
         if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):
             errors.append(f"[interfaces] {key}={val!r} — not a valid interface name (<=15 chars)")
+
+    ipv6_fwd = _get("network", "ipv6_forward")
+    if ipv6_fwd and ipv6_fwd.lower() not in ("yes", "no"):
+        errors.append(f"[network] ipv6_forward={ipv6_fwd!r} — must be 'yes' or 'no'")
+
+    relay_ep = _get("monitoring", "relay_endpoint")
+    if relay_ep:
+        try:
+            ipaddress.ip_address(relay_ep)
+        except ValueError:
+            errors.append(f"[monitoring] relay_endpoint={relay_ep!r} — not a valid IP address")
 
     return errors, warnings
 

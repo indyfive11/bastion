@@ -64,6 +64,8 @@ def manifest_dest(rel: Path, mode: str, out_base: Path) -> Path | None:
         return None if mode == "endpoint" else _join(out_base, "/etc/nftables.conf")
     if name == "nftables-endpoint.nft":
         return _join(out_base, "/etc/nftables.conf") if mode == "endpoint" else None
+    if name == "sysctl-forward.conf":   # edge-only forwarding sysctl (L0); endpoints never forward
+        return None if mode == "endpoint" else _join(out_base, "/etc/sysctl.d/99-bastion-forward.conf")
     if name.startswith("systemd/"):
         return _join(out_base, "/etc/systemd/system/" + rel.name)
     if name in mapping:

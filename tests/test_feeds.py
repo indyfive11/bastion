@@ -99,17 +99,35 @@ def test_env_protected_nets_parses_mgmt_sources(monkeypatch):
     m = _load_recon()
     monkeypatch.setenv("TRUSTED_HOSTS", "203.0.113.7, 10.5.5.0/24")
     monkeypatch.setenv("RELAY_DST", "198.51.100.2")
+    monkeypatch.setenv("RELAY_ENDPOINT", "198.51.100.9")        # G2: public relay far end
     monkeypatch.setenv("GATEWAY", "10.0.1.254")
     nets = {str(n) for n in m.env_protected_nets()}
-    assert nets == {"203.0.113.7/32", "10.5.5.0/24", "198.51.100.2/32", "10.0.1.254/32"}
+    assert nets == {"203.0.113.7/32", "10.5.5.0/24", "198.51.100.2/32",
+                    "198.51.100.9/32", "10.0.1.254/32"}
 
 
 def test_env_protected_nets_ignores_blank_and_garbage(monkeypatch):
     m = _load_recon()
     monkeypatch.setenv("TRUSTED_HOSTS", "not-an-ip, 203.0.113.8")
     monkeypatch.delenv("RELAY_DST", raising=False)
+    monkeypatch.delenv("RELAY_ENDPOINT", raising=False)
     monkeypatch.delenv("GATEWAY", raising=False)
     assert {str(n) for n in m.env_protected_nets()} == {"203.0.113.8/32"}   # garbage dropped, never raises
+
+
+def test_relay_endpoint_folds_and_blocks_lockout(tmp_path, monkeypatch):
+    # G2: a poisoned feed listing the operator's OWN upstream relay public endpoint must be rejected.
+    m = _load_recon()
+    allow_file = tmp_path / "policy.allowlist"
+    allow_file.write_text("127.0.0.0/8\n10.0.0.0/8\n")          # shipped floors only (no public IP)
+    monkeypatch.setattr(m, "ALLOWLIST", str(allow_file))
+    for v in ("TRUSTED_HOSTS", "RELAY_DST", "GATEWAY"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("RELAY_ENDPOINT", "45.33.32.156")        # a public relay far end
+    allow = m.load_allowlist()
+    assert any(str(n) == "45.33.32.156/32" for n in allow)
+    ok, reason, _ = m.validate("45.33.32.156", allow, {4: 8, 6: 19})
+    assert ok is False and "allowlisted" in reason
 
 
 def test_load_allowlist_folds_env_and_blocks_lockout(tmp_path, monkeypatch):
@@ -119,6 +137,7 @@ def test_load_allowlist_folds_env_and_blocks_lockout(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "ALLOWLIST", str(allow_file))
     monkeypatch.setenv("TRUSTED_HOSTS", "203.0.113.7")          # a PUBLIC management host
     monkeypatch.delenv("RELAY_DST", raising=False)
+    monkeypatch.delenv("RELAY_ENDPOINT", raising=False)
     monkeypatch.delenv("GATEWAY", raising=False)
     allow = m.load_allowlist()
     assert any(str(n) == "203.0.113.7/32" for n in allow)       # folded in from machine.env

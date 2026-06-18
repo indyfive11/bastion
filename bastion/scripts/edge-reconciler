@@ -106,11 +106,11 @@ def load_allowlist():
     return nets
 
 def env_protected_nets():
-    # TRUSTED_HOSTS is comma/space-separated; RELAY_DST/GATEWAY are single IPs. Bare IPs parse as
+    # TRUSTED_HOSTS is comma/space-separated; RELAY_DST/RELAY_ENDPOINT/GATEWAY are single IPs. Parse as
     # /32 (v4) or /128 (v6). Garbage is ignored — this only ever ADDS protection, never rejects.
     nets = []
     raw = os.environ.get("TRUSTED_HOSTS", "").replace(",", " ").split()
-    for var in ("RELAY_DST", "GATEWAY"):
+    for var in ("RELAY_DST", "RELAY_ENDPOINT", "GATEWAY"):
         v = os.environ.get(var, "").strip()
         if v:
             raw.append(v)

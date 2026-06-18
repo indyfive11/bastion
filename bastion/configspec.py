@@ -38,8 +38,10 @@ APPLY_GENERATE = "generate"               # re-render machine.env / a config fil
 APPLY_GENERATE_FIREWALL = "generate+firewall"   # + `firewall reload` (nft)
 APPLY_GENERATE_DNSMASQ = "generate+dns"   # + reload dnsmasq/unbound (L4)
 APPLY_GENERATE_AI = "generate+ai"         # + `ai enable` (re-render edge-ai.timer + daemon-reload + re-arm)
+APPLY_GENERATE_SYSCTL = "generate+sysctl" # + `sysctl --system` (re-apply the forwarding drop-in)
 
-_APPLY_TAGS = {APPLY_NONE, APPLY_GENERATE, APPLY_GENERATE_FIREWALL, APPLY_GENERATE_DNSMASQ, APPLY_GENERATE_AI}
+_APPLY_TAGS = {APPLY_NONE, APPLY_GENERATE, APPLY_GENERATE_FIREWALL, APPLY_GENERATE_DNSMASQ,
+               APPLY_GENERATE_AI, APPLY_GENERATE_SYSCTL}
 
 _APPLY_DESC = {
     APPLY_NONE: "stored only (reserved / inert — nothing re-renders)",
@@ -47,6 +49,7 @@ _APPLY_DESC = {
     APPLY_GENERATE_FIREWALL: "re-renders configs, then reloads the firewall (`bastion firewall reload`)",
     APPLY_GENERATE_DNSMASQ: "re-renders configs, then reloads DNS/DHCP (dnsmasq + unbound)",
     APPLY_GENERATE_AI: "re-renders configs, then re-arms the AI timer (`bastion ai enable`)",
+    APPLY_GENERATE_SYSCTL: "re-renders configs, then re-applies kernel sysctls (`sysctl --system`)",
 }
 
 
@@ -143,6 +146,9 @@ SETTINGS: tuple[Setting, ...] = (
        EVERYDAY, _v_choice("yes", "no"), "yes | no", APPLY_GENERATE, choices=("yes", "no")),
     _S("monitoring.egress_probe", "Egress probe", "URL the watchdog/flowcheck use as the ISP-up canary.",
        EVERYDAY, _v_url, "an http(s) URL", APPLY_GENERATE),
+    _S("monitoring.relay_endpoint", "Relay public endpoint",
+       "Public IP of the upstream relay/tunnel far end; folded into the never-block allowlist.",
+       EVERYDAY, _v_ip, "an IP like 198.51.100.1", APPLY_GENERATE, scope="edge"),
     _S("monitoring.feed_sources", "IP blocklist feeds",
        "Public IP-blocklist feed URLs edge-feed-fetch pulls (space-separated; blank = built-in defaults).",
        EVERYDAY, _v_url_list, "space-separated http(s) URLs", APPLY_GENERATE, layer_gate="l1",
@@ -162,6 +168,10 @@ SETTINGS: tuple[Setting, ...] = (
        "an IP like 10.0.1.1", APPLY_GENERATE_FIREWALL, scope="edge"),
     _S("network.gateway", "Gateway", "Upstream router IP (watchdog ISP-up probe).", ADVANCED, _v_ip,
        "an IP like 10.0.1.254", APPLY_GENERATE_FIREWALL, scope="edge"),
+    _S("network.ipv6_forward", "IPv6 forwarding",
+       "Route IPv6 (make the edge box a real v6 router). no = v4-only routing, v6 rules stay inert.",
+       ADVANCED, _v_choice("yes", "no"), "yes | no", APPLY_GENERATE_SYSCTL, choices=("yes", "no"),
+       scope="edge"),
     _S("interfaces.lan", "LAN interface", "LAN NIC name.", ADVANCED, _v_iface, "an interface name",
        APPLY_GENERATE_FIREWALL),
     _S("interfaces.wan", "WAN interface", "Uplink NIC name.", ADVANCED, _v_iface, "an interface name",
@@ -380,4 +390,7 @@ def _run_apply(cli, setting: Setting, sys_: System, conf_path: Path, root: str |
     elif tag == APPLY_GENERATE_AI:
         rc = cli.cmd_ai(argparse.Namespace(action="enable", id=None, conf=str(conf_path), root=root))
         res.steps.append("ai re-arm")
+    elif tag == APPLY_GENERATE_SYSCTL:
+        sys_.run("sysctl", "--system")
+        res.steps.append("sysctl --system")
     return rc

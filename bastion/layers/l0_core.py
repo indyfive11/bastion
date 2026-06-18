@@ -30,6 +30,8 @@ class L0Core(Layer):
         rels = super().owned_templates(mode)
         rels.add("nftables-endpoint.nft" if mode == "endpoint" else "nftables-edge.nft")
         rels.add("policy.allowlist")
+        if mode != "endpoint":
+            rels.add("sysctl-forward.conf")   # edge forwarding sysctl; endpoints never forward
         return rels
 
     def _nft_table(self, ctx: Context) -> tuple[str, str]:
@@ -39,6 +41,9 @@ class L0Core(Layer):
     # nftables.service ExecStart override — pins the canonical loader to /etc/nftables.conf so the
     # bastion ruleset loads on every distro (Fedora/RHEL otherwise read /etc/sysconfig/nftables.conf).
     NFT_DROPIN = "/etc/systemd/system/nftables.service.d/10-bastion-load.conf"
+
+    # Edge IP-forwarding sysctl drop-in. Without it the forward chain (incl. the v6 rules) is inert.
+    FORWARD_SYSCTL = "/etc/sysctl.d/99-bastion-forward.conf"
 
     @staticmethod
     def _nft_path(sys) -> str:
@@ -82,6 +87,14 @@ class L0Core(Layer):
         self.render_to(ctx, self._nft_template(ctx), "/etc/nftables.conf")
         self.render_to(ctx, "policy.allowlist", "/etc/edge-reconciler/policy.allowlist")
 
+        # Edge mode routes between networks — enable kernel IP forwarding so the forward chain
+        # (LAN<->WAN, LAN<->tunnels, and the v6 rules) is not inert. An endpoint never forwards
+        # (defense-in-depth), so it gets no drop-in; remove a stale one from a prior edge install.
+        if ctx.mode != "endpoint":
+            self.render_to(ctx, "sysctl-forward.conf", self.FORWARD_SYSCTL)
+        else:
+            sys.path(self.FORWARD_SYSCTL).unlink(missing_ok=True)
+
         # Install the always-present recovery script + unit (recovery stays DISABLED).
         for script in self.scripts:
             self.install_script(ctx, script)
@@ -120,6 +133,10 @@ class L0Core(Layer):
                     sys.run("nft", "-f", conf)
             else:
                 print("l0: WARNING — rendered nftables.conf failed `nft -c`; not loaded")
+            # Apply the forwarding sysctl now (edge only) so routing works without a reboot.
+            # `--system` re-reads all of /etc/sysctl.d (idempotent); a no-op in endpoint mode.
+            if ctx.mode != "endpoint":
+                sys.run("sysctl", "--system")
         else:
             print("l0: staged install (root != / or dry-run) — files written, live "
                   "firewall/systemd NOT touched.")
@@ -136,6 +153,10 @@ class L0Core(Layer):
             sys.run("systemctl", "disable", "nftables")
             family, table = self._nft_table(ctx)
             sys.run("nft", "delete", "table", family, table)
+        # Remove the forwarding sysctl drop-in so it doesn't persist across reboot. (The running
+        # kernel keeps its current ip_forward value until a reboot or an explicit `sysctl -w`; we
+        # don't force it off live, which could disrupt traffic mid-teardown.)
+        sys.path(self.FORWARD_SYSCTL).unlink(missing_ok=True)
         # Remove the nftables.service loader drop-in (restores the distro's default ExecStart).
         drop = sys.path(self.NFT_DROPIN)
         drop.unlink(missing_ok=True)

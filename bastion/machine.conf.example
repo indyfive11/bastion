@@ -40,6 +40,11 @@ lan_cidr = 10.0.1.0/24
 lan_ip = 10.0.1.1
 # upstream default gateway (router) — ISP-up probe + default-route restore
 gateway = 10.0.1.254
+# IPv6 forwarding (edge mode): yes = the box routes IPv6 too, so the v6 firewall rules it ships
+# are live (a real edge router); no = v4-only routing, the v6 rules stay ready-but-inert. When
+# yes, generate also pins accept_ra=2 on the WAN so enabling forwarding can't strip the box's own
+# WAN IPv6. Ignored in endpoint mode (endpoints never forward).
+ipv6_forward = yes
 # ZeroTier subnet (edge full profile); set equal to lan_cidr if unused
 zt_cidr = 10.147.17.0/24
 # WireGuard server subnet (L5)
@@ -97,6 +102,11 @@ try_port_22 = yes
 egress_probe = https://api.anthropic.com
 # relay far-end / masquerade-side IP (edge-watchdog, lan-verify); blank if no relay
 relay_dst = 10.0.0.3
+# PUBLIC endpoint IP of the upstream relay/tunnel — the address the tunnel dials OUT to (e.g. a
+# WireGuard `Endpoint` host). Distinct from relay_dst (the tunnel's inner/private IP). The
+# reconciler folds this into the never-block allowlist so a poisoned IP feed can never blackhole
+# your own uplink's far end. Blank if no upstream relay.
+relay_endpoint =
 # NetworkManager connection to re-up on rollback; blank if not using NM
 nm_conn =
 # space-separated IP-blocklist feed URLs (edge-feed-fetch); blank = built-in defaults

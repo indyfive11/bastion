@@ -58,15 +58,36 @@ def _derived(config: dict) -> dict:
       ``elements = { }`` is an nftables *syntax error*, so when a family is blank the whole line
       must vanish, not render empty braces. (Blank ``trusted_hosts`` is a valid operator choice —
       the wizard offers "blank = none".)
+    * ``network.ipv6_forward_block`` — the IPv6 forwarding lines for the edge sysctl drop-in
+      (``templates/sysctl-forward.conf``): empty when ``[network] ipv6_forward`` is off, else
+      ``net.ipv6.conf.all.forwarding = 1`` plus an ``accept_ra = 2`` on the WAN (see
+      :func:`_ipv6_forward_block`). Always present so the sysctl template resolves.
     """
-    net = config.get("network")
-    if not net or "trusted_hosts" not in net:
-        return config
-    hosts = str(net.get("trusted_hosts") or "").strip().strip(",").strip()
-    v4, v6 = _split_hosts_by_family(hosts)
-    return {**config, "network": {**net,
-                                  "trusted_hosts_elements": f"elements = {{ {v4} }}" if v4 else "",
-                                  "trusted_hosts6_elements": f"elements = {{ {v6} }}" if v6 else ""}}
+    net = dict(config.get("network") or {})
+    if "trusted_hosts" in net:
+        hosts = str(net.get("trusted_hosts") or "").strip().strip(",").strip()
+        v4, v6 = _split_hosts_by_family(hosts)
+        net["trusted_hosts_elements"] = f"elements = {{ {v4} }}" if v4 else ""
+        net["trusted_hosts6_elements"] = f"elements = {{ {v6} }}" if v6 else ""
+    net["ipv6_forward_block"] = _ipv6_forward_block(config)
+    return {**config, "network": net}
+
+
+def _ipv6_forward_block(config: dict) -> str:
+    """The IPv6 lines for the edge forwarding sysctl drop-in. ``[network] ipv6_forward`` defaults
+    to ON (a real edge box routes the v6 firewall it ships); off => v4-only routing, v6 rules stay
+    ready-but-inert. When on, also pin ``accept_ra = 2`` on the WAN: enabling v6 forwarding makes
+    Linux stop honoring Router Advertisements by default, which would strip the box's OWN WAN IPv6
+    address — ``accept_ra = 2`` keeps SLAAC working on the uplink while forwarding."""
+    net = config.get("network", {})
+    raw = str(net.get("ipv6_forward", "yes")).strip().lower()
+    if raw in ("no", "false", "0", "off"):
+        return ""
+    lines = ["net.ipv6.conf.all.forwarding = 1"]
+    wan = str(config.get("interfaces", {}).get("wan", "")).strip()
+    if wan:
+        lines.append(f"net.ipv6.conf.{wan}.accept_ra = 2")
+    return "\n".join(lines)
 
 
 def _split_hosts_by_family(hosts: str) -> tuple[str, str]:
