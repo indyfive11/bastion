@@ -194,6 +194,66 @@ def test_build_machine_conf_resolves_all_templates():
             assert templates.check_file(tmpl, conf) == [], f"{tmpl} unresolved"
 
 
+# --- P3: detection -> synthesis -> conf (the "point it at any box" proof) -------------------
+
+# A libvirt+media host shaped like the EM validation fixture: 2 NICs + virbr0, libvirt's nft table,
+# and a disabled ufw whose saved rules encode the source->ports policy.
+_EM_UFW = """\
+ufw allow from 192.168.1.0/24 to any port 8096,8989
+ufw allow from 10.0.0.0/24 to any port 22,1111
+ufw allow in on virbr0
+ufw allow 9993
+"""
+
+
+def _libvirt_em_system():
+    cmds = {
+        ("ip", "-o", "link", "show"): LINK,
+        ("ip", "-o", "-4", "addr", "show"): ADDR,
+        ("ip", "route", "show", "default"): ROUTE,
+        ("sshd", "-T"): "port 22\n",
+        ("nft", "list", "tables"): "table inet edge\ntable ip libvirt_network\n",
+        ("ufw", "show", "added"): _EM_UFW,
+    }
+    return FakeSystem(cmds, {"/etc/os-release": "ID=arch\n"}, {"pacman", "nft", "virsh"})
+
+
+def test_synthesize_scope_cooperative_on_libvirt_box():
+    d = detect.detect(_libvirt_em_system())
+    assert detect.synthesize_scope(d) == "cooperative"
+    assert d.proposed_scope == "cooperative"
+    assert d.proposed_zones["net_192_168_1_0_24"] == "192.168.1.0/24 -> 8096, 8989"
+    assert d.proposed_zones["iface_virbr0"] == "iface:virbr0 -> all"
+
+
+def test_build_machine_conf_applies_synthesized_scope_and_zones():
+    base = state.load_conf(EXAMPLE)
+    d = detect.detect(_libvirt_em_system())
+    conf = wizard.build_machine_conf(d, "full-edge", {}, base)
+    # the synthesised proposal lands in machine.conf...
+    assert conf["machine"]["firewall_scope"] == "cooperative"
+    assert conf["zones"]["iface_virbr0"] == "iface:virbr0 -> all"
+    # ...and the result is a VALID conf that resolves every template (the generalisation proof).
+    assert state.validate_conf(conf)[0] == []
+    for tmpl in (REPO / "bastion" / "templates").rglob("*"):
+        if tmpl.is_file():
+            assert templates.check_file(tmpl, conf) == [], f"{tmpl} unresolved"
+    # rendered edge ruleset carries the cooperative preamble + the synthesised inline zone rules
+    rendered = templates.render_file(REPO / "bastion" / "templates" / "nftables-edge.nft", conf)
+    assert "flush ruleset" not in rendered
+    assert "ip saddr 192.168.1.0/24 tcp dport { 8096, 8989 } accept" in rendered
+    assert 'iifname "virbr0" accept' in rendered
+
+
+def test_build_machine_conf_declined_synthesis_stays_exclusive():
+    # An operator can decline: answers force exclusive + no zones (the conservative default).
+    base = state.load_conf(EXAMPLE)
+    d = detect.detect(_libvirt_em_system())
+    conf = wizard.build_machine_conf(d, "full-edge", {"firewall_scope": "exclusive", "zones": {}}, base)
+    assert conf["machine"]["firewall_scope"] == "exclusive"
+    assert not conf.get("zones")
+
+
 # --- full wizard run (non-interactive dry-run) ----------------------------
 
 def test_wizard_writes_confirmed_mode_over_detection():
@@ -588,6 +648,7 @@ def test_existing_ai_depth_survives_rerun(tmp_path):
 def test_install_step_reports_host_firewall_in_dry_run():
     s = edge_system()
     s._have = set(s._have) | {"ufw"}          # unit_active("ufw") -> True
+    s._cmds[("ufw", "status")] = "Status: active\n"   # ...and genuinely enforcing
     lines: list[str] = []
     w = wizard.Wizard(s, dry_run=True, assume_defaults=True, example_conf=str(EXAMPLE),
                       out=lambda *a: lines.append(" ".join(str(x) for x in a)))

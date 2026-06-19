@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,12 @@ def firewall_conflict_message(fw: str) -> str:
             f"  then re-run. To let bastion take over anyway, set {FIREWALL_TAKEOVER_ENV}=1.")
 
 
+def firewall_coexist_message(fw: str) -> str:
+    return (f"l0: WARNING — {fw} is active. bastion is in COOPERATIVE scope, so it manages only "
+            f"its own nft table and will NOT flush {fw}'s rules — but two active input-hook filters "
+            f"at the same priority is ambiguous. Consider `sudo systemctl disable --now {fw}`.")
+
+
 class FirewallConflict(Exception):
     """A conflicting OS firewall (ufw/firewalld) is active and bastion would otherwise flush it.
     The active firewall's name is in ``.firewall``."""
@@ -56,21 +63,96 @@ class FirewallConflict(Exception):
         super().__init__(firewall_conflict_message(firewall))
 
 
+def _firewall_enforcing(system: System, fw: str) -> bool:
+    """Whether ``fw`` is actually ENFORCING rules, not merely loaded. ufw's systemd unit is a
+    RemainAfterExit oneshot that stays ``active`` even after ``ufw disable`` — so ``unit_active``
+    alone over-reports a conflict: an inactive ufw owns no table, and flushing it removes nothing.
+    Ask the tool itself (``ufw status`` / ``firewall-cmd --state``). Fail-soft: if status can't be
+    read (tool absent, or non-root in a staged preview) assume enforcing, so we never silently skip
+    a real conflict — the conservative side is to keep warning/blocking, not to proceed blind."""
+    if fw == "ufw":
+        res = system.run("ufw", "status")
+        if res.returncode == 0:
+            return "Status: active" in (res.stdout or "")
+        return True
+    if fw == "firewalld":
+        res = system.run("firewall-cmd", "--state")
+        if res.returncode == 0:
+            return "running" in (res.stdout or "").lower()
+        return True
+    return True
+
+
 def active_conflicting_firewall(system: System) -> str | None:
-    """Name of a conflicting OS firewall (ufw/firewalld) currently active, else None. Meaningful
-    only on a live host — a staged ``--root`` install loads no ruleset."""
+    """Name of a conflicting OS firewall (ufw/firewalld) currently ENFORCING, else None. Meaningful
+    only on a live host — a staged ``--root`` install loads no ruleset. A firewall whose unit is
+    loaded but which enforces nothing (e.g. ``ufw disable`` left the oneshot unit ``active``) is not
+    a conflict: it owns no table, so bastion's ruleset has nothing of its to flush."""
     for fw in CONFLICTING_FIREWALLS:
-        if system.unit_active(fw):
+        if system.unit_active(fw) and _firewall_enforcing(system, fw):
             return fw
     return None
 
 
-def blocking_conflicting_firewall(system: System) -> str | None:
-    """The active conflicting firewall that should BLOCK a live ruleset load, or None — None when
-    none is active OR the operator set ``BASTION_ALLOW_FIREWALL_TAKEOVER=1`` to override the guard."""
+# nft tables bastion itself owns. Anything else live in `nft list tables` belongs to a co-resident
+# manager (libvirt/Docker/Kubernetes-CNI/Tailscale/...) that an `exclusive` `flush ruleset` would wipe.
+BASTION_NFT_TABLES = {("inet", "edge"), ("inet", "bastion"), ("ip", "edge_nat"),
+                      ("inet", "bastion_recovery")}
+
+
+def live_foreign_nft_tables(system: System) -> list[tuple[str, str]]:
+    """Live `nft list tables` minus bastion's own — the co-resident tables an `exclusive`
+    `flush ruleset` would delete. Empty when nft can't be read (e.g. non-root) or nothing is foreign;
+    fail-soft, never raises (a detection failure must not block an install)."""
+    try:
+        res = system.run("nft", "list", "tables")
+    except Exception:
+        return []
+    if getattr(res, "returncode", 1) != 0:
+        return []
+    foreign = []
+    for line in (res.stdout or "").splitlines():
+        m = re.match(r"\s*table\s+(\S+)\s+(\S+)", line)
+        if m and (m.group(1), m.group(2)) not in BASTION_NFT_TABLES:
+            foreign.append((m.group(1), m.group(2)))
+    return foreign
+
+
+def warn_if_exclusive_flush(system: System, scope: str, out=print) -> list[tuple[str, str]]:
+    """Hard-warn before an `exclusive`-scope apply runs `flush ruleset` and wipes co-resident nft
+    tables (the general safety net — fires for ANY foreign table, whatever owns it). Returns the
+    foreign tables found (so callers/tests can act on them). No-op in `cooperative` scope (it never
+    flushes) or when nothing foreign is present."""
+    if scope == "cooperative":
+        return []
+    foreign = live_foreign_nft_tables(system)
+    if not foreign:
+        return []
+    names = ", ".join(f"{fam} {n}" for fam, n in foreign)
+    out("  !!! WARNING — exclusive firewall_scope runs `flush ruleset`, which DELETES every")
+    out(f"  !!! nftables table on this host, including these co-resident tables: {names}")
+    out("  !!! If a hypervisor / container engine / mesh VPN (libvirt, Docker, Kubernetes/CNI,")
+    out("  !!! Tailscale, ...) owns them, this can take the machine's networking DOWN.")
+    out("  !!! To coexist instead, set cooperative scope BEFORE applying:")
+    out("  !!!     bastion config set machine.firewall_scope cooperative --advanced")
+    return foreign
+
+
+def blocking_conflicting_firewall(system: System, scope: str = "exclusive") -> str | None:
+    """The active conflicting firewall that should BLOCK a live ruleset load, or None.
+
+    None when: none is active; the operator set ``BASTION_ALLOW_FIREWALL_TAKEOVER=1``; OR the
+    firewall_scope is ``cooperative`` — in which case bastion no longer flushes the ruleset (the
+    rendered preamble is a table-scoped reset, see ``templates._firewall_preamble``), so it won't
+    wipe the other firewall's tables and need not block. Cooperative still PRINTS a coexist warning
+    (two active input filters at the same priority is ambiguous); it just stops aborting."""
     if os.environ.get(FIREWALL_TAKEOVER_ENV):
         return None
-    return active_conflicting_firewall(system)
+    fw = active_conflicting_firewall(system)
+    if fw and scope == "cooperative":
+        print(firewall_coexist_message(fw))
+        return None
+    return fw
 
 
 @dataclass

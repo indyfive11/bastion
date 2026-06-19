@@ -158,7 +158,9 @@ def test_doctor_json_fail_without_machine_conf(monkeypatch, tmp_path, capsys):
 
 # --- E8: status --json (the status projection of the world-state document) ----
 def test_status_json_projection(tmp_path, capsys):
-    rc = cli.main(["status", "--json", "--root", str(tmp_path)])
+    # Pin --conf so the projection is hermetic — without it, find_conf falls through to a real
+    # /etc/bastion/machine.conf on a host that has bastion installed (endpoint), not the example.
+    rc = cli.main(["status", "--json", "--conf", str(EXAMPLE), "--root", str(tmp_path)])
     assert rc == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["schema_version"] == 2 and doc["mode"] == "edge"

@@ -78,6 +78,14 @@ class _FwSys(System):
 
     def run(self, *args, **kwargs):
         self.calls.append(tuple(args))
+        # Model real enforcement, not just unit-active: the conflict guard now asks the tool itself.
+        if args[:2] == ("ufw", "status"):
+            body = "Status: active\n" if self._active_fw == "ufw" else "Status: inactive\n"
+            return subprocess.CompletedProcess(args, 0, body, "")
+        if args[:2] == ("firewall-cmd", "--state"):
+            if self._active_fw == "firewalld":
+                return subprocess.CompletedProcess(args, 0, "running\n", "")
+            return subprocess.CompletedProcess(args, 1, "not running\n", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -108,6 +116,105 @@ def test_l0_install_override_env_allows_takeover(tmp_path, monkeypatch):
 def test_l0_install_no_conflict_proceeds(tmp_path):
     layers.get("l0").install(_fw_ctx(tmp_path, None))    # nothing active
     assert (tmp_path / "etc/nftables.conf").is_file()
+
+
+class _UfwLoadedNotEnforcingSys(_FwSys):
+    """ufw's systemd unit is active (RemainAfterExit oneshot) but `ufw status` is inactive — ufw
+    enforces nothing and owns no nft table. This must NOT count as a conflict."""
+    def unit_active(self, unit: str) -> bool:
+        return unit == "ufw"
+
+    def run(self, *args, **kwargs):
+        self.calls.append(tuple(args))
+        if args[:2] == ("ufw", "status"):
+            return subprocess.CompletedProcess(args, 0, "Status: inactive\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def test_loaded_but_inactive_ufw_is_not_a_conflict():
+    # The EM case: ufw.service active, `ufw status` inactive. Unit-active alone over-reported it.
+    from bastion.layers.base import active_conflicting_firewall
+    assert active_conflicting_firewall(_UfwLoadedNotEnforcingSys(Path("/"))) is None
+
+
+def test_l0_exclusive_install_proceeds_over_loaded_but_inactive_ufw(tmp_path):
+    # Even in exclusive scope, a ufw that enforces nothing must not abort the install.
+    ctx = Context(system=_UfwLoadedNotEnforcingSys(tmp_path), config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    layers.get("l0").install(ctx)                        # no FirewallConflict raised
+    assert (tmp_path / "etc/nftables.conf").is_file()
+
+
+def test_l0_cooperative_scope_coexists_with_active_ufw(tmp_path, capsys):
+    # In cooperative scope bastion no longer flushes the ruleset, so an active ufw is a WARN, not an
+    # abort — the install proceeds and renders the (table-scoped) ruleset. Exclusive still aborts.
+    ctx = _fw_ctx(tmp_path, "ufw")
+    ctx.config["machine"]["firewall_scope"] = "cooperative"
+    layers.get("l0").install(ctx)                        # no FirewallConflict raised
+    assert (tmp_path / "etc/nftables.conf").is_file()
+    out = capsys.readouterr().out
+    assert "ufw" in out and "COOPERATIVE" in out         # coexist warning surfaced
+    # and the rendered ruleset uses the table-scoped reset, not a global flush
+    assert "flush ruleset" not in (tmp_path / "etc/nftables.conf").read_text()
+
+
+# --- runtime hard-warn: exclusive scope will flush co-resident tables -----------------------------
+from bastion.layers import base as _base
+
+
+class _NftSys(System):
+    """Live+root System whose `nft list tables` returns a scripted listing; other commands rc 0."""
+    def __init__(self, root, tables_out=""):
+        super().__init__(root=root)
+        self._tables_out = tables_out
+    @property
+    def is_live(self): return True
+    @property
+    def is_root(self): return True
+    def command_exists(self, name): return True
+    def unit_active(self, unit): return False            # no conflicting firewall active
+    def run(self, *args, **kw):
+        if args[:3] == ("nft", "list", "tables"):
+            return subprocess.CompletedProcess(args, 0, self._tables_out, "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def test_live_foreign_nft_tables_filters_bastions_own():
+    out = "table inet bastion\ntable ip libvirt_network\ntable ip edge_nat\ntable ip6 kube_proxy\n"
+    foreign = _base.live_foreign_nft_tables(_NftSys(Path("/"), out))
+    assert ("ip", "libvirt_network") in foreign and ("ip6", "kube_proxy") in foreign
+    assert ("inet", "bastion") not in foreign and ("ip", "edge_nat") not in foreign
+
+
+def test_warn_if_exclusive_flush_fires_on_foreign_table():
+    lines = []
+    res = _base.warn_if_exclusive_flush(_NftSys(Path("/"), "table ip libvirt_network\n"),
+                                        "exclusive", out=lines.append)
+    blob = "\n".join(lines)
+    assert ("ip", "libvirt_network") in res
+    assert "flush ruleset" in blob and "libvirt_network" in blob and "cooperative" in blob
+
+
+def test_warn_if_exclusive_flush_silent_in_cooperative_and_when_clean():
+    # cooperative never flushes -> no warning even with foreign tables present
+    lines = []
+    assert _base.warn_if_exclusive_flush(_NftSys(Path("/"), "table ip libvirt_network\n"),
+                                         "cooperative", out=lines.append) == []
+    assert lines == []
+    # exclusive but only bastion's own table -> nothing to warn about
+    lines2 = []
+    assert _base.warn_if_exclusive_flush(_NftSys(Path("/"), "table inet bastion\n"),
+                                         "exclusive", out=lines2.append) == []
+    assert lines2 == []
+
+
+def test_l0_install_warns_when_exclusive_would_flush_foreign(tmp_path, capsys):
+    sys_ = _NftSys(tmp_path, "table ip libvirt_network\n")
+    cfg = state.load_conf(EXAMPLE); cfg["machine"]["firewall_scope"] = "exclusive"
+    layers.get("l0").install(Context(system=sys_, config=cfg, templates_dir=TEMPLATES,
+                                     scripts_dir=SCRIPTS))
+    out = capsys.readouterr().out
+    assert "flush ruleset" in out and "libvirt_network" in out      # the hard-warn fired
 
 
 def test_l0_install_enables_nftables_for_persistence(tmp_path):

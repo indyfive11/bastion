@@ -8,7 +8,7 @@
 #   {{ interfaces.lan }}=LAN  {{ interfaces.wan }}=WAN
 #   {{ interfaces.wg_server_iface }}=WG server  {{ interfaces.wg_vps_iface }}=upstream relay  {{ interfaces.zt_iface }}=ZeroTier
 
-flush ruleset
+{{ machine.firewall_preamble }}
 
 table inet edge {
 
@@ -85,6 +85,11 @@ table inet edge {
         # here — these open the ports to LAN/overlay only. Blank by default.
         {{ network.service_ports_tcp_accept }}
         {{ network.service_ports_udp_accept }}
+
+        # Zones ([zones]): the general source->action accept primitive (inline rules, no named set —
+        # so CIDR sources need no `flags interval`). The WAN jump+drop above fires first, so these
+        # apply to LAN/overlay sources only. Blank by default. See templates._render_zones.
+        {{ network.zones_input_rules }}
     }
 
     chain forward {

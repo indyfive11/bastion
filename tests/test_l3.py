@@ -15,8 +15,21 @@ TEMPLATES = REPO / "bastion" / "templates"
 SCRIPTS = REPO / "bastion" / "scripts"
 
 
+class _StagedSystem(System):
+    """A staged tree has no loaded systemd units, so unit_active/enabled are False by definition.
+    The real System probes live host systemd (correct for `bastion status` at root=/), which makes
+    a staged-install test non-hermetic on a host that happens to run a same-named unit (e.g. a box
+    where AI is genuinely deployed runs edge-ai.timer). Pin them off so the test verifies the layer's
+    own contract — install does not arm the timer — not the host's coincidental state."""
+    def unit_active(self, unit: str) -> bool:
+        return False
+
+    def unit_enabled(self, unit: str) -> bool:
+        return False
+
+
 def _ctx(root: Path, config: dict, dry_run=True) -> Context:
-    return Context(system=System(root=root, dry_run=dry_run), config=config,
+    return Context(system=_StagedSystem(root=root, dry_run=dry_run), config=config,
                    templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
 
 

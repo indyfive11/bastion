@@ -24,7 +24,7 @@ DEFAULT_CONF_PATHS = (
 # machine.conf schema version. Bump when a release renames/repurposes a conf key; add the matching
 # step to _MIGRATIONS so `bastion migrate` carries old configs forward. A conf with no
 # [machine] schema_version is version 0 (pre-versioning) and migrates up to here. (F5)
-CONF_SCHEMA_VERSION = 1
+CONF_SCHEMA_VERSION = 2
 
 
 def _parser() -> configparser.ConfigParser:
@@ -124,6 +124,10 @@ def write_secrets(secrets: dict[str, str], path: str | Path) -> None:
 # (env_var, section, key) mapping for the flat shell file the operational scripts source.
 # Scripts carry generic fallbacks, so a blank value here is fine.
 ENV_MAP: tuple[tuple[str, str, str], ...] = (
+    # Ownership mode — read by net-rollback so a cooperative rollback deletes only bastion's own
+    # table (`nft delete table $NFT_TABLE`) instead of `nft flush ruleset` (which would wipe
+    # co-resident libvirt/docker tables). Blank -> the script defaults to exclusive.
+    ("FIREWALL_SCOPE", "machine", "firewall_scope"),
     ("LAN_IF", "interfaces", "lan"),
     ("WAN_IF", "interfaces", "wan"),
     ("ZT_IF", "interfaces", "zt_iface"),
@@ -173,6 +177,10 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
     if mode not in ("edge", "endpoint"):
         errors.append(f"[machine] mode={mode!r} — must be 'edge' or 'endpoint'")
 
+    scope = _get("machine", "firewall_scope")
+    if scope and scope not in ("exclusive", "cooperative"):
+        errors.append(f"[machine] firewall_scope={scope!r} — must be 'exclusive' or 'cooperative'")
+
     ssh = _get("ports", "ssh")
     if ssh and not (ssh.isdigit() and 1 <= int(ssh) <= 65535):
         errors.append(f"[ports] ssh={ssh!r} — must be an integer 1–65535")
@@ -213,6 +221,36 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         elif sep and proto.lower() not in ("tcp", "udp"):
             errors.append(f"[network] service_ports entry {tok!r} — proto must be tcp or udp")
 
+    # [zones]: name = <source> -> <action>. source ∈ {any, IP/CIDR, iface:NAME}; action ∈ {all,
+    # service_ports-style port list}. The general source->action input-accept primitive — rendered
+    # inline (templates._render_zones), so a CIDR source needs no named set (sidesteps the
+    # trusted_hosts `flags interval` bug). Malformed entries block generate.
+    for name, raw in (config.get("zones") or {}).items():
+        src_raw, sep, act_raw = str(raw).partition("->")
+        source, action = src_raw.strip(), act_raw.strip()
+        if not sep or not source or not action:
+            errors.append(f"[zones] {name}={raw!r} — must be '<source> -> <action>'")
+            continue
+        if source.startswith("iface:"):
+            iface = source[len("iface:"):].strip()
+            if not iface or len(iface) > 15 or not _IFACE_RE.fullmatch(iface):
+                errors.append(f"[zones] {name} source {source!r} — not a valid interface name (<=15 chars)")
+        elif source != "any":
+            try:
+                ipaddress.ip_network(source, strict=False)
+            except ValueError:
+                errors.append(f"[zones] {name} source {source!r} — must be 'any', an IP/CIDR, or 'iface:NAME'")
+        if action != "all":
+            toks = action.replace(",", " ").split()
+            if not toks:
+                errors.append(f"[zones] {name} action {action!r} — must be 'all' or a port list")
+            for tok in toks:
+                port, psep, proto = tok.partition("/")
+                if not (port.isdigit() and 1 <= int(port) <= 65535):
+                    errors.append(f"[zones] {name} action entry {tok!r} — port must be an integer 1–65535")
+                elif psep and proto.lower() not in ("tcp", "udp"):
+                    errors.append(f"[zones] {name} action entry {tok!r} — proto must be tcp or udp")
+
     for key in ("lan", "wan", "zt_iface", "wg_vps_iface", "wg_server_iface"):
         val = _get("interfaces", key)
         if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):
@@ -247,8 +285,16 @@ def _migrate_0_to_1(config: dict[str, dict[str, str]]) -> list[str]:
     return ["stamped [machine] schema_version = 1"]
 
 
+def _migrate_1_to_2(config: dict[str, dict[str, str]]) -> list[str]:
+    """v1 -> v2: introduce [machine] firewall_scope (ownership mode). Default `exclusive` = the
+    historical behavior (bastion owns the whole ruleset; the rendered preamble is `flush ruleset`).
+    `cooperative` makes bastion manage only its own nft table (leaves libvirt/docker tables intact)."""
+    config.setdefault("machine", {}).setdefault("firewall_scope", "exclusive")
+    return ["set [machine] firewall_scope = exclusive (default — bastion owns the whole ruleset)"]
+
+
 # Ordered forward migrations: _MIGRATIONS[N] upgrades a vN config to v(N+1), mutating it in place.
-_MIGRATIONS = {0: _migrate_0_to_1}
+_MIGRATIONS = {0: _migrate_0_to_1, 1: _migrate_1_to_2}
 
 
 def migrate_conf(config: dict[str, dict[str, str]]) -> tuple[dict[str, dict[str, str]], list[str], int]:

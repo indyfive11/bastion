@@ -149,6 +149,10 @@ ACTIONS: tuple[Action, ...] = (
            warn="Can drop the base table + kill switch. Tear down in reverse order (l6→l0)."),
     Action("firewall.reload", "Firewall: reload ruleset", "Firewall", DESTRUCTIVE, ("firewall", "reload"),
            warn="Flushes and re-applies the entire nftables ruleset."),
+    Action("switch", "Switch (deadman cutover)", "Firewall", DESTRUCTIVE, ("switch",),
+           params=(Param("minutes", "auto-revert minutes (optional)", required=False, flag="--minutes"),),
+           warn="Cuts over to the bastion firewall behind an auto-reverting deadman — confirm "
+                "(`bastion confirm`) within the window or it rolls back."),
     Action("rollback", "Rollback network state", "Snapshots", DESTRUCTIVE, ("rollback",),
            params=(Param("name", "snapshot name (optional)", required=False),
                    Param("reason", "reason (optional)", required=False, flag="--reason")),

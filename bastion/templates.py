@@ -68,6 +68,19 @@ def _derived(config: dict) -> dict:
       ``dport { }`` is an nft syntax error, so the whole line must vanish). Lets a server that runs
       bastion open its service ports without hand-editing the default-drop ruleset. See
       :func:`_parse_service_ports`.
+    * ``machine.firewall_preamble`` — the opening reset of the rendered nft ruleset (ownership mode).
+      ``exclusive`` (default) => ``flush ruleset`` (bastion owns the whole ruleset). ``cooperative``
+      => an idempotent, table-scoped reset of ONLY bastion's own tables (``add table`` then ``delete
+      table``, so a re-load is clean) — leaves co-resident tables (libvirt/docker) intact. Edge owns
+      two tables (``inet edge`` filter + ``ip edge_nat``), endpoint one (``inet bastion``). See
+      :func:`_firewall_preamble`.
+    * ``network.zones_input_rules`` — the input-chain accept rules synthesised from the dynamic
+      ``[zones]`` section (the general source→action primitive), rendered as one block under a single
+      placeholder (the engine has no loops). A zone is ``name = <source> -> <action>`` where source
+      is ``any`` / an IP-or-CIDR / ``iface:NAME`` and action is ``all`` or a service-ports-style port
+      list. Rendered as INLINE rules (``ip saddr <cidr> tcp dport { ... } accept``), which need no
+      ``flags interval`` and so sidestep the ``trusted_hosts`` named-set CIDR bug. ``""`` when no
+      ``[zones]`` section is present. See :func:`_render_zones`.
     """
     net = dict(config.get("network") or {})
     if "trusted_hosts" in net:
@@ -81,7 +94,10 @@ def _derived(config: dict) -> dict:
         f"tcp dport {{ {', '.join(str(p) for p in tcp_ports)} }} accept" if tcp_ports else "")
     net["service_ports_udp_accept"] = (
         f"udp dport {{ {', '.join(str(p) for p in udp_ports)} }} accept" if udp_ports else "")
-    return {**config, "network": net}
+    net["zones_input_rules"] = _render_zones(config)
+    mach = dict(config.get("machine") or {})
+    mach["firewall_preamble"] = _firewall_preamble(config)
+    return {**config, "network": net, "machine": mach}
 
 
 def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
@@ -105,6 +121,74 @@ def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
         if n not in bucket:
             bucket.append(n)
     return tcp, udp
+
+
+def _zone_prefix(source: str) -> str:
+    """Map a zone source token to its nft rule prefix (with trailing space, or '' for any).
+
+    ``any`` -> '' (no saddr/iif match — applies to every source); ``iface:NAME`` -> ``iifname
+    "NAME" ``; an IP/CIDR -> ``ip saddr <s> `` (v4) or ``ip6 saddr <s> `` (v6). An unparseable
+    address falls back to ``ip saddr`` so a genuinely bad token surfaces as an nft load error the
+    same way trusted_hosts does, rather than being silently dropped (validate_conf blocks it first)."""
+    import ipaddress
+    if source == "any":
+        return ""
+    if source.startswith("iface:"):
+        return f'iifname "{source[len("iface:"):].strip()}" '
+    try:
+        fam = "ip6" if ipaddress.ip_network(source, strict=False).version == 6 else "ip"
+    except ValueError:
+        fam = "ip"
+    return f"{fam} saddr {source} "
+
+
+def _render_zones(config: dict) -> str:
+    """Render the dynamic ``[zones]`` section into inline nft input-chain accept rules.
+
+    Each entry is ``name = <source> -> <action>``. ``action: all`` emits a source-only accept (the
+    ``trusted_hosts`` semantic); a port list emits one ``dport { ... } accept`` line per transport
+    (tcp/udp can't be mixed in one rule). Identical rendered rules are de-duplicated, order
+    preserved. Returns one string (joined at the placeholder's 8-space chain-input indent); ``""``
+    for an absent/empty section, so the ``{{ network.zones_input_rules }}`` line vanishes (an empty
+    block would otherwise leave a stray indented blank line — harmless, but we keep it clean)."""
+    rules: list[str] = []
+    for spec in (config.get("zones") or {}).values():
+        src_raw, sep, act_raw = str(spec).partition("->")
+        source, action = src_raw.strip(), act_raw.strip()
+        if not sep or not source or not action:
+            continue  # malformed; validate_conf blocks generate before we get here
+        prefix = _zone_prefix(source)
+        if action == "all":
+            rules.append(f"{prefix}accept".strip())
+            continue
+        tcp_ports, udp_ports = _parse_service_ports(action)
+        if tcp_ports:
+            rules.append(f"{prefix}tcp dport {{ {', '.join(str(p) for p in tcp_ports)} }} accept")
+        if udp_ports:
+            rules.append(f"{prefix}udp dport {{ {', '.join(str(p) for p in udp_ports)} }} accept")
+    seen: set[str] = set()
+    deduped = [r for r in rules if not (r in seen or seen.add(r))]
+    return "\n        ".join(deduped)
+
+
+def _firewall_preamble(config: dict) -> str:
+    """The opening reset line(s) of the rendered nft ruleset, per ``[machine] firewall_scope``.
+
+    ``exclusive`` (default) -> ``flush ruleset``: bastion owns the entire ruleset. ``cooperative``
+    -> an idempotent table-scoped reset of bastion's OWN tables only, so re-loading is clean while
+    co-resident tables (libvirt/docker) survive: ``add table <t>`` (ensures it exists so the delete
+    can't error on a first load) then ``delete table <t>`` (drops the old instance; the template's
+    own ``table <t> { ... }`` block below recreates it fresh) — all atomic in one ``nft -f``. Edge
+    owns two tables (``inet edge`` + ``ip edge_nat``); endpoint one (``inet bastion``)."""
+    scope = str(config.get("machine", {}).get("firewall_scope", "exclusive")).strip().lower()
+    if scope != "cooperative":
+        return "flush ruleset"
+    mode = config.get("machine", {}).get("mode", "edge")
+    tables = ["inet bastion"] if mode == "endpoint" else ["inet edge", "ip edge_nat"]
+    lines = []
+    for t in tables:
+        lines += [f"add table {t}", f"delete table {t}"]
+    return "\n".join(lines)
 
 
 def _ipv6_forward_block(config: dict) -> str:

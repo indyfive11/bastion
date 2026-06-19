@@ -199,9 +199,10 @@ dns_leak_watch(){
 # ---------- heals (graduated) ----------
 heal_light(){   # cheapest: atomic reload of the governing firewall's config (re-adds relay rules)
   if nft list table inet edge >/dev/null 2>&1 || [ -f "$SNAP/fw-nftables-active" ]; then
-    # $NFT_CONF begins with `flush ruleset`. A plain `nft -f $NFT_CONF` would therefore ALSO wipe
-    # two things the static file does not own: the live `inet bastion_recovery` table (severing
-    # emergency SSH at the worst possible moment — mid-recovery) and the managed blocklist sets
+    # $NFT_CONF begins with a reset preamble (exclusive: `flush ruleset`; cooperative: a delete of
+    # bastion's own tables). A plain `nft -f $NFT_CONF` would therefore ALSO wipe two things the
+    # static file does not own: in EXCLUSIVE mode the live `inet bastion_recovery` table (severing
+    # emergency SSH at the worst possible moment — mid-recovery), and the managed blocklist sets
     # (cs_block/blk_feed/ai_*), leaving the node unprotected until the next reconcile (≤ a full
     # interval). Avoid both: if recovery is active, fold its current table definition into the SAME
     # atomic transaction so it survives the flush; then immediately kick the reconciler to refill

@@ -37,7 +37,7 @@ def test_require_root_blocks_only_live_nonroot(tmp_path, capsys):
 # --------------------------------------------------------------------------- #2 schema/migrate
 def test_example_conf_is_current_schema():
     cfg = state.load_conf(EXAMPLE)
-    assert state.conf_schema_version(cfg) == state.CONF_SCHEMA_VERSION == 1
+    assert state.conf_schema_version(cfg) == state.CONF_SCHEMA_VERSION == 2
 
 
 def test_conf_schema_version_absent_is_zero():
@@ -48,10 +48,12 @@ def test_conf_schema_version_absent_is_zero():
 def test_migrate_conf_stamps_and_is_idempotent():
     old = {"machine": {"mode": "edge"}}
     new, changes, start = state.migrate_conf(old)
-    assert start == 0 and new["machine"]["schema_version"] == "1" and changes
+    # v0 -> v2 runs both steps: stamps schema_version AND adds the v2 firewall_scope default.
+    assert start == 0 and new["machine"]["schema_version"] == "2" and changes
+    assert new["machine"]["firewall_scope"] == "exclusive"
     assert old == {"machine": {"mode": "edge"}}          # input not mutated
     again, changes2, start2 = state.migrate_conf(new)
-    assert start2 == 1 and changes2 == []                # already current
+    assert start2 == 2 and changes2 == []                # already current
 
 
 def test_wizard_stamps_schema_version():
@@ -65,7 +67,7 @@ def test_cmd_migrate_check_then_write(tmp_path, capsys):
                               if not l.strip().startswith("schema_version")) + "\n")
     assert cli.main(["migrate", "--check", "--conf", str(conf)]) == 1     # due
     assert cli.main(["migrate", "--conf", str(conf)]) == 0                # writes
-    assert state.conf_schema_version(state.load_conf(conf)) == 1
+    assert state.conf_schema_version(state.load_conf(conf)) == 2
     assert cli.main(["migrate", "--check", "--conf", str(conf)]) == 0     # now current
 
 

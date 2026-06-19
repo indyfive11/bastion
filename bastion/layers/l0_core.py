@@ -4,7 +4,7 @@ bastion-recovery service. Foundation for every profile; prerequisite of all othe
 from __future__ import annotations
 
 from .base import (Layer, Context, LayerStatus, HealthCheck, nft_table_health,
-                   FirewallConflict, blocking_conflicting_firewall)
+                   FirewallConflict, blocking_conflicting_firewall, warn_if_exclusive_flush)
 
 
 class L0Core(Layer):
@@ -73,9 +73,13 @@ class L0Core(Layer):
         # is active — it would wipe ufw/firewalld's rules and the two would fight. Abort with an
         # instruction; the operator disables the other firewall (or sets the override env var).
         if sys.is_live:
-            fw = blocking_conflicting_firewall(sys)
+            scope = ctx.config.get("machine", {}).get("firewall_scope", "exclusive")
+            fw = blocking_conflicting_firewall(sys, scope)
             if fw:
                 raise FirewallConflict(fw)
+            # Hard-warn if exclusive scope will flush a co-resident manager's tables (the general
+            # safety net — libvirt/Docker/k8s/Tailscale/hand-written; install proceeds).
+            warn_if_exclusive_flush(sys, scope)
 
         # Packages are checked, not installed, until pkg.py (Phase 5). Surface what's missing.
         missing = [p for p in ("nft", "sshd") if not sys.command_exists(p)]

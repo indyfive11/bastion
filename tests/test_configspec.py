@@ -40,6 +40,7 @@ def test_every_example_value_validates():
     ("monitoring.dnsblock_sources", "https://a/x https://b/y", "noturl"),
     ("network.service_ports", "8096 53/udp 7878/tcp", "8096 99999"),
     ("interfaces.lan", "eth0", "this-iface-name-is-too-long-x"),
+    ("machine.firewall_scope", "cooperative", "shared"),
 ])
 def test_validators_accept_good_reject_bad(key, good, bad):
     s = cfg.get(key)

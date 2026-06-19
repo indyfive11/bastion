@@ -15,6 +15,19 @@ LAN_NET=${LAN_NET:-}                   # LAN CIDR
 LAN_IP_CIDR=${LAN_IP_CIDR:-}           # this node's LAN addr in CIDR form, e.g. <ip>/<prefix>
 GATEWAY=${GATEWAY:-}                   # LAN default gateway IP
 NM_CONN=${NM_CONN:-}                   # NetworkManager connection name to re-up after profile restore
+FIREWALL_SCOPE=${FIREWALL_SCOPE:-exclusive}   # exclusive | cooperative (ownership mode)
+NFT_TABLE=${NFT_TABLE:-inet edge}      # bastion's base filter table (inet edge | inet bastion)
+# Tear down ONLY bastion's own nft tables. Exclusive scope = `flush ruleset` (bastion owns the whole
+# ruleset). Cooperative scope = delete just bastion's tables, so co-resident tables (libvirt/docker)
+# survive the rollback — edge owns two (the filter table + ip edge_nat), endpoint just the filter one.
+clear_bastion_nft(){
+  if [ "$FIREWALL_SCOPE" = cooperative ]; then
+    nft delete table $NFT_TABLE 2>/dev/null || true
+    nft delete table ip edge_nat 2>/dev/null || true   # edge NAT table; no-op on an endpoint
+  else
+    nft flush ruleset 2>/dev/null || true
+  fi
+}
 log(){ logger -t net-safe "net-rollback[$REASON]: $*"; }
 [ -d "$SNAP" ] || { log "NO SNAPSHOT at $SNAP — cannot roll back"; exit 1; }
 changed=0
@@ -56,7 +69,7 @@ if [ -f "$SNAP/fw-ufw-active" ]; then
   # hard-restore UFW: stop+flush nftables/edge, then re-apply UFW rules.
   if edge_loaded || ! systemctl is-active --quiet ufw; then
     systemctl stop nftables 2>/dev/null || true
-    nft flush ruleset 2>/dev/null || true          # clear edge table (+ any remnant)
+    clear_bastion_nft                              # clear bastion's table(s); scope-aware (coop keeps libvirt/docker)
     systemctl restart ufw 2>/dev/null || ufw --force enable 2>/dev/null || true
     log "firewall RESTORED to known-good: UFW up, edge flushed"
     changed=1

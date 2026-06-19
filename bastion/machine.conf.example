@@ -18,8 +18,11 @@ layers = l0,l1,l2,l3,l4,l5,l6
 # distro: arch | debian | ubuntu | fedora | auto
 distro = arch
 secrets_file = /etc/bastion/secrets.conf
+# firewall_scope: ownership mode. exclusive = bastion owns the whole nft ruleset (flush ruleset);
+# cooperative = manage only bastion's own table, leaving co-resident firewalls (libvirt/docker) intact.
+firewall_scope = exclusive
 # schema_version: machine.conf format version — `bastion migrate` carries an old conf forward.
-schema_version = 1
+schema_version = 2
 
 [interfaces]
 # LAN interface — detected by wizard, confirm or override

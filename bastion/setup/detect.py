@@ -25,6 +25,13 @@ _ZT_PREFIXES = ("zt",)
 _WIFI_PREFIXES = ("wl",)
 _ETH_PREFIXES = ("en", "eth", "em", "eno", "ens", "enp")
 
+# Coarser P3 categorisation (orthogonal to `kind`, which stays as-is so propose_mode/tests don't
+# move): how an interface relates to the firewall topology. physical = a real NIC; bridge = a
+# software bridge a hypervisor/container engine owns (libvirt virbr*, docker*, br-*, CNI); overlay =
+# a VPN/mesh tunnel (wg/zt/tun/tailscale); virtual = everything else (lo/veth/vnet/dummy/bond).
+_BRIDGE_PREFIXES = ("virbr", "docker", "br-", "br0", "cni", "flannel", "kube", "cali")
+_OVERLAY_PREFIXES = ("wg", "zt", "tun", "tap", "tailscale", "wt")
+
 # Services the wizard cares about: id -> (binary, unit). Presence = binary OR unit-file;
 # active = unit reported active by systemd.
 _SERVICES: dict[str, tuple[str, str]] = {
@@ -37,7 +44,16 @@ _SERVICES: dict[str, tuple[str, str]] = {
     "zerotier": ("zerotier-cli", "zerotier-one.service"),
     "wireguard": ("wg", "wg-quick.target"),
     "isc-dhcp": ("dhcpd", "dhcpd.service"),
+    # Self-managing dynamic firewalls (own their own nft tables / forward+NAT rules). Their presence
+    # is what makes bastion propose COOPERATIVE scope (don't flush their tables). See propose_scope.
+    "libvirt": ("virsh", "libvirtd.service"),
+    "docker": ("docker", "docker.service"),
+    "podman": ("podman", "podman.service"),
 }
+
+# nft tables bastion itself owns — anything else in `nft list tables` is a co-resident manager's.
+_BASTION_NFT_TABLES = {("inet", "edge"), ("inet", "bastion"), ("ip", "edge_nat"),
+                       ("inet", "bastion_recovery")}
 
 # distro ID (from /etc/os-release) -> package-manager name.
 _DISTRO_PKG = {
@@ -54,6 +70,7 @@ class Iface:
     up: bool             # administratively up (UP flag) — NOT proof of a live link
     addrs: list[str] = field(default_factory=list)   # IPv4 CIDRs, e.g. "10.0.1.1/24"
     carrier: bool = False  # link is actually up (LOWER_UP) — an unplugged NIC is up but not carrier
+    category: str = "virtual"   # physical | bridge | overlay | virtual (P3 topology role)
 
     @property
     def physical(self) -> bool:
@@ -80,6 +97,12 @@ class Detection:
     wan_iface: str | None
     lan_ip: str | None
     lan_cidr: str | None
+    # P3 detection/synthesis (defaults keep older Detection construction + tests valid).
+    co_resident_firewalls: list[str] = field(default_factory=list)   # present managers (ufw/libvirt/…)
+    nft_foreign_tables: list[tuple[str, str]] = field(default_factory=list)  # (family, name) not ours
+    listeners: list[tuple[str, int]] = field(default_factory=list)   # (proto, port) non-loopback
+    proposed_scope: str = "exclusive"                # exclusive | cooperative
+    proposed_zones: dict[str, str] = field(default_factory=dict)     # name -> "source -> action"
 
     def physical_ifaces(self) -> list[Iface]:
         return [i for i in self.interfaces if i.physical]
@@ -101,6 +124,22 @@ def classify_iface(name: str, flags: set[str]) -> str:
     if name.startswith(_ETH_PREFIXES):
         return "ethernet"
     return "other"
+
+
+def categorize_iface(name: str) -> str:
+    """Coarse topology role (P3), orthogonal to :func:`classify_iface`'s ``kind``. Used to spot the
+    bridges a hypervisor/container engine owns (cooperative-scope signal) and to keep overlays as
+    'trust the iface' zones. physical = real NIC; bridge = libvirt/docker/CNI bridge; overlay =
+    VPN/mesh tunnel; virtual = lo/veth/vnet/dummy/bond and anything else."""
+    if name == "lo":
+        return "virtual"
+    if name.startswith(_OVERLAY_PREFIXES):
+        return "overlay"
+    if name.startswith(_BRIDGE_PREFIXES):
+        return "bridge"
+    if name.startswith(_WIFI_PREFIXES) or name.startswith(_ETH_PREFIXES):
+        return "physical"
+    return "virtual"
 
 
 def parse_interfaces(link_text: str, addr_text: str) -> list[Iface]:
@@ -125,7 +164,8 @@ def parse_interfaces(link_text: str, addr_text: str) -> list[Iface]:
         up = "UP" in flags
         carrier = "LOWER_UP" in flags and "NO-CARRIER" not in flags
         ifaces.append(Iface(name=name, kind=classify_iface(name, flags), up=up,
-                            addrs=addrs.get(name, []), carrier=carrier))
+                            addrs=addrs.get(name, []), carrier=carrier,
+                            category=categorize_iface(name)))
     return ifaces
 
 
@@ -234,6 +274,158 @@ def _network_cidr(ip: str, prefix: str) -> str | None:
         return None
 
 
+# --- P3 detection parsers (co-resident managers, listeners, existing intent) ------------------
+
+def parse_nft_tables(text: str) -> list[tuple[str, str]]:
+    """Parse `nft list tables` -> list of (family, name), e.g. ('ip', 'libvirt_network')."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"\s*table\s+(\S+)\s+(\S+)", line)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def foreign_nft_tables(tables: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The tables bastion does NOT own — a co-resident firewall/manager's (libvirt/docker/ufw)."""
+    return [(f, n) for (f, n) in tables if (f, n) not in _BASTION_NFT_TABLES]
+
+
+def parse_listeners(ss_text: str) -> list[tuple[str, int]]:
+    """Parse `ss -tulnH` -> sorted unique (proto, port) for NON-loopback listeners (a server the box
+    runs that a zone might need to open). Loopback-only binds (127.0.0.1/::1) are filtered — they're
+    never reachable off-box, so they need no firewall rule."""
+    out: set[tuple[str, int]] = set()
+    for line in ss_text.splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        proto = f[0]
+        addr, _, port = f[4].rpartition(":")
+        if not port.isdigit():
+            continue
+        addr = addr.strip("[]")
+        if addr in ("127.0.0.1", "::1") or addr.startswith("127."):
+            continue
+        out.add((proto, int(port)))
+    return sorted(out)
+
+
+def parse_ufw_show_added(text: str) -> list[tuple[str, str, str | None]]:
+    """Parse `ufw show added` into (source, port, proto) rule tuples — the box's EXISTING intent,
+    even when ufw is disabled (its saved rules still encode the source->ports policy). ``port`` is
+    ``'all'`` for a source-only rule; ``proto`` is None unless the rule pins tcp/udp. source is
+    ``'any'`` | an IP/CIDR | ``'iface:NAME'``. Only ALLOW rules synthesize (deny = default-drop)."""
+    rules: list[tuple[str, str, str | None]] = []
+    for line in text.splitlines():
+        toks = line.strip().split()
+        if len(toks) < 2 or toks[0].lower() != "ufw":
+            continue
+        toks = toks[1:]
+        if toks and toks[0].lower() in ("allow", "deny", "reject", "limit"):
+            verb, toks = toks[0].lower(), toks[1:]
+        else:
+            continue
+        if verb != "allow":
+            continue
+        # 'in on IFACE' / 'out on IFACE' -> an interface zone (trust the whole iface).
+        if len(toks) >= 3 and toks[0] in ("in", "out") and toks[1] == "on":
+            rules.append((f"iface:{toks[2]}", "all", None))
+            continue
+        toks = [t for t in toks if t not in ("in", "out")]
+        source = "any"
+        if "from" in toks:
+            i = toks.index("from")
+            if i + 1 < len(toks):
+                source = toks[i + 1]
+        proto = None
+        if "proto" in toks:
+            i = toks.index("proto")
+            if i + 1 < len(toks):
+                proto = toks[i + 1].lower()
+        if "port" in toks:
+            i = toks.index("port")
+            ports = toks[i + 1].split(",") if i + 1 < len(toks) else []
+            for p in ports:
+                pp, _, pr = p.partition("/")
+                rules.append((source, pp, (pr or proto) or None))
+        elif source != "any":
+            # 'ufw allow from SRC' (no port) -> trust the whole source.
+            rules.append((source, "all", None))
+        else:
+            # 'ufw allow 9993' / 'ufw allow 9993/tcp' -> any-source port.
+            p = toks[0] if toks else ""
+            pp, _, pr = p.partition("/")
+            if pp.isdigit():
+                rules.append(("any", pp, (pr or proto) or None))
+    return rules
+
+
+# --- P3 synthesis (facts -> proposed conf the operator confirms) ------------------------------
+
+def _zone_name(source: str) -> str:
+    """A deterministic, INI-key-safe [zones] name for a source (so re-synthesis is idempotent)."""
+    if source == "any":
+        return "anyports"
+    if source.startswith("iface:"):
+        return "iface_" + re.sub(r"[^0-9A-Za-z]", "_", source[len("iface:"):])
+    return "net_" + re.sub(r"[^0-9A-Za-z]", "_", source)
+
+
+def synthesize_zones(ufw_text: str) -> dict[str, str]:
+    """Turn a box's existing ufw policy (even disabled) into a proposed ``[zones]`` mapping
+    ``name -> 'source -> action'``. Rules are grouped by source: ports merge into one zone, and a
+    source-only ('all') rule wins for that source. A PROPOSAL only — the wizard makes the operator
+    confirm. Empty when there's nothing to synthesise. (firewalld/listener synthesis can extend this
+    later; ufw covers the reference fixture + the common case.)"""
+    from collections import OrderedDict
+    by_source: "OrderedDict[str, dict]" = OrderedDict()
+    for source, port, proto in parse_ufw_show_added(ufw_text):
+        ent = by_source.setdefault(source, {"all": False, "ports": []})
+        if port == "all":
+            ent["all"] = True
+        else:
+            tok = f"{port}/{proto}" if proto else port
+            if tok not in ent["ports"]:
+                ent["ports"].append(tok)
+    zones: dict[str, str] = {}
+    for source, ent in by_source.items():
+        action = "all" if ent["all"] else ", ".join(ent["ports"])
+        if action:
+            zones[_zone_name(source)] = f"{source} -> {action}"
+    return zones
+
+
+def propose_scope(services: dict[str, "ServiceState"],
+                  foreign_tables: list[tuple[str, str]]) -> str:
+    """``cooperative`` when bastion would otherwise flush co-resident nft state; else ``exclusive``.
+
+    Two triggers, the second a catch-all:
+      1. A known self-managing manager's SERVICE is present (libvirt/docker/podman) — forward-looking,
+         so it fires even before that manager has loaded an nft table (e.g. Docker with no containers
+         running yet).
+      2. **Catch-all:** ANY co-resident nft table bastion doesn't own. When *something else* already
+         owns nft state — Kubernetes/CNI, Tailscale, a hand-written table, anything — default to NOT
+         flushing it. Erring toward cooperative is the non-destructive failure mode: exclusive's
+         ``flush ruleset`` would delete every table on the box.
+
+    A proposal; the operator confirms. (Specific managers are still named via ``services`` for clearer
+    wizard messaging; the runtime also hard-warns before an exclusive apply that would flush foreign
+    tables — see ``layers.base.warn_if_exclusive_flush``.)"""
+    for sid in ("libvirt", "docker", "podman"):
+        st = services.get(sid)
+        if st and st.present:
+            return "cooperative"
+    if foreign_tables:
+        return "cooperative"
+    return "exclusive"
+
+
+def synthesize_scope(detection: "Detection") -> str:
+    """The Detection-level wrapper over :func:`propose_scope` (for the wizard + tests)."""
+    return propose_scope(detection.services, detection.nft_foreign_tables)
+
+
 # --- live orchestrator -----------------------------------------------------
 
 def detect(sys: System) -> Detection:
@@ -262,11 +454,21 @@ def detect(sys: System) -> Detection:
     lan_iface, wan_iface = propose_lan_wan(interfaces, default_iface, mode)
     lan_ip, lan_cidr = lan_addr_of(interfaces, lan_iface)
 
+    # P3: co-resident managers + existing intent (all read-only, fail-soft -> empty when absent).
+    foreign = foreign_nft_tables(parse_nft_tables(sys.run("nft", "list", "tables").stdout))
+    listeners = parse_listeners(sys.run("ss", "-tulnH").stdout)
+    co_resident = [sid for sid in ("ufw", "firewalld", "libvirt", "docker", "podman")
+                   if services.get(sid) and services[sid].present]
+    proposed_scope = propose_scope(services, foreign)
+    proposed_zones = synthesize_zones(sys.run("ufw", "show", "added").stdout)
+
     return Detection(
         distro=distro or "auto", pkg_manager=pkg_manager, interfaces=interfaces,
         default_iface=default_iface, gateway=gateway, ssh_port=ssh_port, services=services,
         proposed_mode=mode, lan_iface=lan_iface, wan_iface=wan_iface,
         lan_ip=lan_ip, lan_cidr=lan_cidr,
+        co_resident_firewalls=co_resident, nft_foreign_tables=foreign, listeners=listeners,
+        proposed_scope=proposed_scope, proposed_zones=proposed_zones,
     )
 
 

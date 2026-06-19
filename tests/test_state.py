@@ -7,6 +7,7 @@ from bastion import state
 MACHINE_CONF = """\
 [machine]
 mode = edge
+firewall_scope = cooperative
 [network]
 lan_cidr = 10.0.1.0/24
 lan_ip = 10.0.1.1
@@ -82,6 +83,8 @@ def test_render_machine_env_maps_and_derives(tmp_path):
     assert "NM_CONN=''" in env                       # blank renders empty
     assert "LAN_IP_CIDR='10.0.1.1/24'" in env        # derived from lan_ip + lan_cidr prefix
     assert "DNS_UPSTREAM='127.0.0.1#5335'" in env     # local stub host#port (flowcheck probes it)
+    assert "FIREWALL_SCOPE='cooperative'" in env       # ownership mode -> net-rollback reads it
+    assert "NFT_TABLE='inet edge'" in env
 
 
 def test_render_machine_env_is_shell_safe():

@@ -232,6 +232,9 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
     put("machine", "profile", profile)
     put("machine", "layers", layers)
     put("machine", "distro", detection.distro)
+    # P3: ownership mode — explicit answer wins, else the synthesised proposal (cooperative when a
+    # self-managing firewall like libvirt/docker is present), else the skeleton default (exclusive).
+    put("machine", "firewall_scope", answers.get("firewall_scope") or detection.proposed_scope)
     put("machine", "schema_version", str(state.CONF_SCHEMA_VERSION))
 
     put("interfaces", "lan", answers.get("lan_iface") or detection.lan_iface)
@@ -255,6 +258,12 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
         conf.setdefault("network", {})["trusted_hosts"] = answers["trusted_hosts"]
     if "dns_upstream" in answers:
         put("network", "dns_upstream", answers["dns_upstream"])
+
+    # P3: [zones] — the synthesised/confirmed source->action policy. Explicit answers win; else the
+    # proposal detected from the box's existing intent (e.g. a disabled ufw's saved rules).
+    zones = answers.get("zones") if "zones" in answers else detection.proposed_zones
+    if zones:
+        conf["zones"] = {name: str(spec) for name, spec in zones.items()}
 
     put("ports", "ssh", answers.get("ssh_port") or detection.ssh_port)
 
@@ -607,6 +616,10 @@ class Wizard:
         else:
             self.out(f"  interface: {ifc.get('lan', '') or '-'}")
         self.out(f"  trusted hosts (full inbound): {net.get('trusted_hosts', '') or 'none'}")
+        self.out(f"  firewall scope: {m.get('firewall_scope', 'exclusive')}")
+        zones = config.get("zones") or {}
+        if zones:
+            self.out(f"  zones ({len(zones)}): {', '.join(f'{n}={s}' for n, s in zones.items())}")
         self.out(f"  packages: {', '.join(self._active_packages(config)) or 'none'}")
         if self.dry_run:
             self.out("  (dry-run — nothing will be written or installed.)")
@@ -633,6 +646,7 @@ class Wizard:
         a["trusted_hosts"] = self._ask_validated(
             "IPs allowed FULL inbound access (e.g. a desktop you admin this box from) — "
             "comma-separated, blank = none (typical)", "", _v_hosts, "comma-separated IPs/CIDRs")
+        a.update(self._scope_zones_answers(d))
         if mode == "edge":
             a["lan_iface"] = iface_answer("LAN interface (NIC facing your local network, e.g. eth0)",
                                           d.lan_iface or "")
@@ -651,6 +665,38 @@ class Wizard:
             if not self.assume_defaults:
                 self.out("  endpoint mode — DNS/DHCP, WireGuard-server, relay and gateway "
                          "settings don't apply here and are skipped.")
+        return a
+
+    def _scope_zones_answers(self, d: detectmod.Detection) -> dict:
+        """P3: surface the firewall-ownership + zones that detection synthesised from the box's
+        existing state (a co-resident libvirt/docker => cooperative; a disabled ufw's saved rules =>
+        zones), and let the operator accept or decline. Declining falls back to the conservative
+        exclusive scope with no synthesised zones. Nothing detected => silently keep the defaults."""
+        a: dict = {}
+        if d.proposed_scope != "cooperative" and not d.proposed_zones:
+            return a
+        if d.proposed_scope == "cooperative":
+            drivers = [s for s in ("libvirt", "docker", "podman") if s in d.co_resident_firewalls]
+            if drivers:
+                who = ", ".join(drivers)
+            elif d.nft_foreign_tables:
+                who = "co-resident nft tables: " + ", ".join(f"{f} {n}" for f, n in d.nft_foreign_tables)
+            else:
+                who = "a co-resident manager"
+            self.out(f"  detected a self-managing firewall ({who}) -> proposing firewall_scope = "
+                     "cooperative (manage only bastion's table; leave theirs intact).")
+        if d.proposed_zones:
+            self.out("  synthesised inbound zones from the box's existing rules (source -> action):")
+            for name, spec in d.proposed_zones.items():
+                self.out(f"    {name} = {spec}")
+        if self._confirm("Apply the proposed firewall scope + zones?", default=True):
+            a["firewall_scope"] = d.proposed_scope
+            if d.proposed_zones:
+                a["zones"] = dict(d.proposed_zones)
+        else:
+            a["firewall_scope"] = "exclusive"
+            a["zones"] = {}
+            self.out("  -> keeping exclusive scope, no synthesised zones.")
         return a
 
     def _secrets_step(self, profile: str, answers: dict) -> list[str]:
@@ -888,7 +934,8 @@ class Wizard:
         # conflict is a property of the host the ruleset eventually loads on, not of the staging
         # root. is_live is False under --root, but `systemctl is-active` still queries the real
         # host, so the preview now warns instead of looking clean and aborting only at the real apply.
-        fw = layerbase.blocking_conflicting_firewall(self.sys)
+        scope = config.get("machine", {}).get("firewall_scope", "exclusive")
+        fw = layerbase.blocking_conflicting_firewall(self.sys, scope)
 
         if self.dry_run or not self.sys.is_live:
             notes = []

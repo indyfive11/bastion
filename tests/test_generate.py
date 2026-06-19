@@ -130,6 +130,86 @@ def test_real_nft_templates_render_valid_with_service_ports():
         assert ok, f"{tmpl} (blank service_ports) failed nft -c: {err}"
 
 
+def test_real_nft_templates_render_valid_with_zones():
+    # The zones primitive must render the full source->action matrix into BOTH rulesets as valid
+    # inline rules, and a blank [zones] must leave the chain syntactically valid. Models the EM
+    # validation fixture (CIDR/iface/any sources; ports + `all`) — proving the trusted_hosts CIDR
+    # named-set bug is sidestepped (inline `ip saddr <cidr>` needs no `flags interval`).
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)
+    cfg["zones"] = {
+        "lan": "192.168.1.0/24 -> 8096, 8989, 7878",
+        "ztmedia": "192.168.192.0/24 -> 8096, 1111",
+        "wg": "10.0.0.0/24 -> 22, 1111",
+        "ztctl": "any -> 9993",
+        "vms": "iface:virbr0 -> all",
+    }
+    for tmpl in ("nftables-edge.nft", "nftables-endpoint.nft"):
+        out = templates.render_file(TEMPLATES / tmpl, cfg)
+        assert "ip saddr 192.168.1.0/24 tcp dport { 8096, 8989, 7878 } accept" in out, tmpl
+        assert 'iifname "virbr0" accept' in out, tmpl
+        assert "tcp dport { 9993 } accept" in out, tmpl
+        assert templates.find_placeholders(out) == set()
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"{tmpl} (zones matrix) failed nft -c: {err}"
+
+    cfg["zones"] = {}                                  # blank [zones] -> chain still valid
+    for tmpl in ("nftables-edge.nft", "nftables-endpoint.nft"):
+        out = templates.render_file(TEMPLATES / tmpl, cfg)
+        assert templates.find_placeholders(out) == set()
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"{tmpl} (blank zones) failed nft -c: {err}"
+
+
+def _load_with_seeded_libvirt(ruleset_text: str):
+    """In a fresh netns: seed a foreign `table ip libvirt_network`, load `ruleset_text` via a real
+    `nft -f`, then return (returncode, tables_listing). Returns None when nft/unshare are absent
+    (CI bare runner) so the caller can skip. Proves at unit level whether the load preserves or
+    wipes a co-resident table — the cooperative-vs-exclusive differentiator."""
+    import os, shutil, subprocess, tempfile
+    if not (shutil.which("nft") and shutil.which("unshare")):
+        return None
+    with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as f:
+        f.write(ruleset_text); path = f.name
+    seed = ("nft add table ip libvirt_network; "
+            "nft add chain ip libvirt_network pr '{ type nat hook postrouting priority 100; }'; ")
+    try:
+        p = subprocess.run(["unshare", "-rn", "bash", "-c",
+                            f"{seed} nft -f {path} && nft list tables"],
+                           capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    return p.returncode, p.stdout + p.stderr
+
+
+def test_cooperative_preamble_preserves_libvirt_exclusive_wipes_it():
+    # The P2 differentiator at unit level: load the rendered edge ruleset into a netns that already
+    # has a foreign `table ip libvirt_network`. Cooperative scope must leave it intact (and recreate
+    # bastion's OWN tables fresh); exclusive scope's `flush ruleset` must wipe it.
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)
+
+    cfg["machine"]["firewall_scope"] = "cooperative"
+    coop = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    assert "flush ruleset" not in coop and "delete table inet edge" in coop
+    res = _load_with_seeded_libvirt(coop)
+    if res is not None:
+        rc, tables = res
+        assert rc == 0, f"cooperative load failed: {tables}"
+        assert "libvirt_network" in tables, "cooperative scope WIPED the co-resident libvirt table"
+        assert "table inet edge" in tables and "table ip edge_nat" in tables  # bastion's own, fresh
+
+    cfg["machine"]["firewall_scope"] = "exclusive"
+    excl = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    assert "flush ruleset" in excl and "delete table inet edge" not in excl
+    res = _load_with_seeded_libvirt(excl)
+    if res is not None:
+        rc, tables = res
+        assert rc == 0, f"exclusive load failed: {tables}"
+        assert "libvirt_network" not in tables, "exclusive `flush ruleset` should wipe libvirt"
+        assert "table inet edge" in tables
+
+
 def test_active_template_rels_excludes_inactive_layers():
     from bastion import state
     conf = {"machine": {"mode": "endpoint", "layers": "l0,l1,l6"}}

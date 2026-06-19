@@ -177,6 +177,11 @@ SETTINGS: tuple[Setting, ...] = (
        layer_gate="l4", list_sep=" "),
 
     # ---- ADVANCED (gated) -----------------------------------------------------------------------
+    _S("machine.firewall_scope", "Firewall ownership",
+       "exclusive = bastion owns the whole ruleset (flush ruleset); cooperative = manage only "
+       "bastion's own nft table, leaving co-resident firewalls (libvirt/docker) intact.",
+       ADVANCED, _v_choice("exclusive", "cooperative"), "exclusive | cooperative",
+       APPLY_GENERATE_FIREWALL, choices=("exclusive", "cooperative")),
     _S("network.lan_cidr", "LAN subnet", "The LAN CIDR. Changing it reshapes DHCP + firewall scope.",
        ADVANCED, _v_cidr, "a CIDR like 10.0.1.0/24", APPLY_GENERATE_FIREWALL, scope="edge"),
     _S("network.lan_ip", "LAN IP", "This node's LAN address.", ADVANCED, _v_ip,
@@ -378,6 +383,25 @@ def apply_change(key: str, value: str, *, conf: str | None = None, root: str | N
     res.rc = rc
     out("  done" if rc == 0 else f"  apply step returned rc={rc}")
     return res
+
+
+def apply_firewall_change(conf_path: Path, root: str | None, *, out=print) -> int:
+    """Regenerate templates from machine.conf and (live only) reload the firewall.
+
+    The generate→nft-reload tail shared by domain verbs that edit a whole *section* (e.g. `bastion
+    zones`) rather than a single registry `Setting`, so they reuse `apply_change`'s apply behaviour
+    without a `Setting`. The caller is responsible for validating + writing the conf first. On a
+    staged `--root` tree the live reload is skipped (regen still runs into the staged tree)."""
+    from . import cli  # lazy: cli imports configspec
+    sys_ = System(root=Path(root) if root else Path("/"))
+    out_base = None if sys_.root == Path("/") else str(sys_.root)
+    rc = cli.cmd_generate(argparse.Namespace(conf=str(conf_path), templates=None, out=out_base, check=False))
+    if rc != 0:
+        return rc
+    if not sys_.is_live:
+        out("  (staged --root: live reload skipped)")
+        return 0
+    return cli.cmd_firewall(argparse.Namespace(action="reload", conf=str(conf_path), root=root))
 
 
 def _run_apply(cli, setting: Setting, sys_: System, conf_path: Path, root: str | None,

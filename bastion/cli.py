@@ -423,6 +423,58 @@ def cmd_feeds(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_zones(args: argparse.Namespace) -> int:
+    """`bastion zones list|add <name> <source> <all|ports...>|remove <name>` — manage the dynamic
+    [zones] source->action input-accept primitive. A zone is `name = <source> -> <action>` where
+    source is `any` / an IP-or-CIDR / `iface:NAME` and action is `all` or a port list. Edits the
+    whole [zones] section (not a single registry Setting), so it validates + writes the conf then
+    runs the shared generate->firewall-reload tail (configspec.apply_firewall_change)."""
+    from . import configspec as cfg
+    conf_path = cfg.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
+    try:
+        config = state.load_conf(conf_path)
+    except FileNotFoundError:
+        print(f"no machine.conf at {conf_path} — run `bastion setup` first", file=sys.stderr)
+        return 1
+    zones = config.get("zones") or {}
+
+    if args.op == "list":
+        if not zones:
+            print("(no zones defined)")
+        for name, spec in zones.items():
+            print(f"{name} = {spec}")
+        return 0
+
+    if not args.name:
+        print(f"usage: bastion zones {args.op} <name> ...", file=sys.stderr)
+        return 1
+
+    if args.op == "remove":
+        if args.name not in zones:
+            print(f"{args.name} is not a defined zone — no change")
+            return 0
+        del config["zones"][args.name]
+        if not config["zones"]:
+            del config["zones"]
+    else:  # add
+        if not args.source or not args.action:
+            print("usage: bastion zones add <name> <source> <all|ports...>", file=sys.stderr)
+            return 1
+        config.setdefault("zones", {})[args.name] = f"{args.source} -> {' '.join(args.action)}"
+
+    errs, warns = state.validate_conf(config)
+    if errs:
+        print("refused — the change would make machine.conf invalid:", file=sys.stderr)
+        for e in errs:
+            print(f"  {e}", file=sys.stderr)
+        return 1
+    for w in warns:
+        print(f"  WARNING: {w}")
+    state.write_conf(config, conf_path)
+    print(f"wrote {conf_path}")
+    return cfg.apply_firewall_change(conf_path, getattr(args, "root", None))
+
+
 def cmd_dnsblock(args: argparse.Namespace) -> int:
     """`bastion dnsblock list|add|remove [<url>]` — manage DNS blocklist feed sources."""
     from . import configspec as cfg
@@ -485,6 +537,9 @@ def cmd_firewall(args: argparse.Namespace) -> int:
         if sys_.run("nft", "-c", "-f", conf).returncode != 0:
             print("firewall reload: validation (`nft -c`) FAILED — not applied", file=sys.stderr)
             return 1
+        # Hard-warn if exclusive scope will flush a co-resident manager's tables before we reload.
+        from .layers.base import warn_if_exclusive_flush
+        warn_if_exclusive_flush(sys_, ctx.config.get("machine", {}).get("firewall_scope", "exclusive"))
         rc = sys_.run("nft", "-f", conf, capture=False).returncode
         print("firewall reloaded" if rc == 0 else "firewall reload FAILED")
         return rc
@@ -687,9 +742,97 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     return _run_sbin(ctx, "net-rollback", reason)
 
 
+# P4: deadman cutover. `bastion switch` applies the bastion ruleset behind an auto-reverting timer so
+# a cutover that locks the operator out (which edge-watchdog's egress-only healing would never catch)
+# self-reverts. The transient unit name is shared with cmd_confirm, which disarms it.
+_SWITCH_DEADMAN_UNIT = "bastion-switch-deadman"
+
+
+def _switch_manual_rollback(ctx: Context) -> str:
+    """The scope/mode-aware manual one-liner to undo a switch by hand (printed before applying, so the
+    operator has it even if the deadman or their session dies)."""
+    mode = ctx.mode
+    table = "inet bastion" if mode == "endpoint" else "inet edge"
+    scope = ctx.config.get("machine", {}).get("firewall_scope", "exclusive")
+    if scope == "cooperative":
+        teardown = f"sudo nft delete table {table}"
+        if mode != "endpoint":
+            teardown += "; sudo nft delete table ip edge_nat"
+    else:
+        teardown = "sudo nft flush ruleset"
+    return f"{teardown}; sudo systemctl restart ufw 2>/dev/null || true"
+
+
+def cmd_switch(args: argparse.Namespace) -> int:
+    """Deadman cutover (P4): apply the bastion firewall behind an auto-reverting timer. Order: (1)
+    print the manual rollback one-liner FIRST, (2) net-snapshot the known-good state, (3) apply
+    (generate + firewall reload), (4) arm a `systemd-run` timer that runs net-rollback after
+    --minutes, (5) tell the operator to `bastion confirm` within the window. If apply or arming
+    fails, roll back immediately. Live-only — a staged --root/--dry-run previews and changes nothing."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    minutes = getattr(args, "minutes", 10)
+    if minutes <= 0:
+        print("bastion switch: --minutes must be a positive integer", file=sys.stderr)
+        return 1
+
+    # (1) manual rollback one-liner, ALWAYS first (so a preview shows it without needing root).
+    print("bastion switch: if you lose access after the cutover, roll back by hand with:")
+    print(f"    {_switch_manual_rollback(ctx)}")
+
+    live = sys_.is_live and not getattr(args, "dry_run", False)
+    if not live:
+        print("  (preview — staged --root / --dry-run: nothing applied, no deadman armed)")
+        return 0
+
+    # The live cutover (snapshot → apply → arm) needs real root.
+    if not _require_root(sys_, "bastion switch"):
+        return 1
+
+    # (2) snapshot known-good — no cutover without a rollback point.
+    if _run_sbin(ctx, "net-snapshot") != 0:
+        print("bastion switch: net-snapshot failed — aborting (won't cut over without a snapshot)",
+              file=sys.stderr)
+        return 1
+
+    # (3) apply: regenerate + reload the firewall.
+    if cmd_generate(argparse.Namespace(conf=getattr(args, "conf", None), templates=None,
+                                       out=None, check=False)) != 0:
+        print("bastion switch: generate failed — not applied", file=sys.stderr)
+        return 1
+    if cmd_firewall(argparse.Namespace(action="reload", conf=getattr(args, "conf", None),
+                                       root=getattr(args, "root", None))) != 0:
+        print("bastion switch: firewall reload FAILED — rolling back now", file=sys.stderr)
+        _run_sbin(ctx, "net-rollback", "switch-apply-failed")
+        return 1
+
+    # (4) arm the deadman: net-rollback fires after --minutes unless cancelled.
+    rollback = str(sys_.path(f"{ctx.sbin_dir}/net-rollback"))
+    armed = sys_.run("systemd-run", f"--unit={_SWITCH_DEADMAN_UNIT}", f"--on-active={minutes}min",
+                     rollback, "switch-deadman").returncode
+    if armed != 0:
+        print("bastion switch: WARNING — could not arm the deadman timer; rolling back now for safety",
+              file=sys.stderr)
+        _run_sbin(ctx, "net-rollback", "switch-deadman-arm-failed")
+        return 1
+
+    # (5) tell the operator how to keep it.
+    print(f"bastion switch: APPLIED behind a {minutes}-min deadman ({_SWITCH_DEADMAN_UNIT}).")
+    print(f"  run `bastion confirm` within {minutes} min to KEEP it — otherwise it auto-reverts.")
+    return 0
+
+
 def cmd_confirm(args: argparse.Namespace) -> int:
-    """Confirm egress is genuinely up + stable, then disarm the watchdog (net-confirm)."""
-    return _run_sbin(build_context(args), "net-confirm")
+    """Confirm egress is genuinely up + stable, then disarm the watchdog (net-confirm). Also cancels
+    a `bastion switch` deadman if one is armed — the operator running this IS the 'I still have
+    access' signal a cutover waits for (P4). Disarm only on a clean net-confirm, so a confirm with
+    egress still down lets the deadman revert."""
+    ctx = build_context(args)
+    rc = _run_sbin(ctx, "net-confirm")
+    if rc == 0 and ctx.system.is_live and ctx.system.is_root:
+        # Stop the transient timer (no-op if none armed); cancels the pending net-rollback.
+        ctx.system.run("systemctl", "stop", f"{_SWITCH_DEADMAN_UNIT}.timer")
+    return rc
 
 
 def cmd_recovery(args: argparse.Namespace) -> int:
@@ -1167,6 +1310,14 @@ def build_parser() -> argparse.ArgumentParser:
     dbp.add_argument("--conf"); dbp.add_argument("--root")
     dbp.set_defaults(func=cmd_dnsblock)
 
+    zon = sub.add_parser("zones", help="manage [zones] source->action input-accept rules")
+    zon.add_argument("op", choices=["list", "add", "remove"])
+    zon.add_argument("name", nargs="?", help="zone name (add/remove)")
+    zon.add_argument("source", nargs="?", help="any | <IP/CIDR> | iface:NAME (add)")
+    zon.add_argument("action", nargs="*", help="all | a port list e.g. 8096 53/udp (add)")
+    zon.add_argument("--conf"); zon.add_argument("--root")
+    zon.set_defaults(func=cmd_zones)
+
     lay = sub.add_parser("layer", help="manage an individual layer")
     lay.add_argument("action", choices=["status", "install", "uninstall", "enable", "disable"],
                      help="status/install/uninstall a layer; enable/disable also add/remove it from "
@@ -1221,6 +1372,14 @@ def build_parser() -> argparse.ArgumentParser:
     cf.add_argument("--conf", help="path to machine.conf")
     cf.add_argument("--root", help="operate under this base dir instead of /")
     cf.set_defaults(func=cmd_confirm)
+
+    sw = sub.add_parser("switch", help="cut over to the bastion firewall behind an auto-reverting deadman")
+    sw.add_argument("--minutes", type=int, default=10,
+                    help="auto-revert after this many minutes unless `bastion confirm` (default: 10)")
+    sw.add_argument("--dry-run", action="store_true", help="preview only; apply nothing, arm no timer")
+    sw.add_argument("--conf", help="path to machine.conf")
+    sw.add_argument("--root", help="operate under this base dir instead of /")
+    sw.set_defaults(func=cmd_switch)
 
     rec = sub.add_parser("recovery", help="operate the bastion-recovery rescue service")
     rec.add_argument("action", choices=["start", "stop", "extend", "status"])

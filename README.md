@@ -17,7 +17,10 @@ system.
 
 - **Seven composable layers** (L0–L6) — install only what you need.
 - **Two modes** — `edge` (routing firewall / gateway) and `endpoint` (defense-in-depth on a workstation or server).
-- **Guided setup** — `bastion setup` detects your topology, recommends a profile, renders configs, installs packages, and verifies the result.
+- **Guided setup** — `bastion setup` detects your topology, recommends a profile, renders configs, installs packages, and verifies the result. It also **detects a co-resident firewall (libvirt/Docker) and synthesizes a zone policy from your existing rules**, proposing a safe configuration you confirm.
+- **Zones** — a unified `source → action` inbound policy (`192.168.1.0/24 → 8096, 8989`, `iface:virbr0 → all`, `any → 9993`) managed with `bastion zones`.
+- **Coexists with libvirt/Docker** — `cooperative` ownership mode manages only bastion's own nftables table and leaves a hypervisor/container engine's tables intact (`exclusive` is the default, where bastion owns the whole ruleset).
+- **Safe cutover** — `bastion switch` applies a firewall change behind an auto-reverting deadman, so a change that locks you out rolls itself back.
 - **A single nft writer** — the reconciler is the only process that mutates managed nftables sets; everything else feeds it.
 - **Optional AI analysis** — a provider-agnostic backend turns sanitized signals into firewall intents; **only sanitized topology ever leaves the host**.
 - **Resilience built in** — a standing watchdog with snapshot/rollback, an always-present recovery service, and a human kill switch.
@@ -158,9 +161,10 @@ Key sections you provide:
 
 | Section | What you set |
 |---|---|
-| `[machine]` | `mode` (edge/endpoint), `profile`, active `layers`, `distro` |
+| `[machine]` | `mode` (edge/endpoint), `profile`, active `layers`, `distro`, `firewall_scope` (exclusive/cooperative) |
 | `[interfaces]` | `lan`, `wan` (edge), optional `wg_server_iface` / `wg_vps_iface` / `zt_iface` |
-| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts` |
+| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts`, `service_ports` |
+| `[zones]` | inbound `source → action` rules (e.g. `lan = 192.168.1.0/24 -> 8096, 8989`) — see [zones](#firewall-zones--ownership-mode) |
 | `[ports]` | `ssh` listen port (detected from running sshd; confirm before locking down) |
 | `[ai]` | backend command, model, analysis `depth` (regular/advanced/expert) |
 | `[recovery]` | `bastion-recovery` knobs (self-destruct window, fallback ports) |
@@ -252,6 +256,57 @@ The AI layer is opt-in and provider-agnostic. Two knobs in `machine.conf [ai]` s
   It controls breadth of context, **not** authority — base/access changes (e.g. the SSH port) are
   always routed to a human-review queue and never auto-applied at any depth.
 
+### Firewall zones & ownership mode
+
+**Zones** are bastion's unified inbound-access policy — one rule per `source → action`, where the
+source is `any`, an IP/CIDR, or a whole interface (`iface:NAME`), and the action is `all` or a port
+list. They render as inline nftables accepts; on edge boxes they apply to LAN/overlay traffic (the
+WAN drop fires first).
+
+```sh
+bastion zones list
+bastion zones add lan 192.168.1.0/24 8096 8989     # LAN reaches media ports (not SSH)
+bastion zones add wg  10.0.0.0/24 22               # a WireGuard subnet reaches SSH
+bastion zones add vms iface:virbr0 all             # trust the libvirt bridge entirely
+bastion zones remove lan
+```
+
+**Ownership mode** (`[machine] firewall_scope`) decides how much of the kernel ruleset bastion
+claims. The default `exclusive` owns the whole ruleset (`flush ruleset`); **`cooperative`** manages
+only bastion's own table so a host that also runs **libvirt or Docker** keeps its VM/container
+networking:
+
+```sh
+bastion config set machine.firewall_scope cooperative --advanced
+```
+
+`bastion setup` detects libvirt/Docker and **proposes `cooperative` automatically**, and synthesizes
+a starter `[zones]` policy from your existing (even disabled) `ufw` rules — preview it with
+`sudo bastion setup --dry-run`. Full reference:
+**[docs/options/zones-and-ownership.md](docs/options/zones-and-ownership.md)**.
+
+> ⚠️ **`exclusive` mode runs `flush ruleset`, which deletes _every_ nftables table on the box.**
+> Two safety nets guard this: setup defaults to `cooperative` whenever **anything** else owns an nft
+> table (libvirt/Docker/podman by service, plus a catch-all for any foreign table — k8s/CNI, Tailscale,
+> hand-written), and a **runtime hard-warning** fires before an `exclusive` apply would flush a foreign
+> table. The one gap: a manager with no table loaded at install time. When unsure, check
+> `sudo nft list tables` first and use `cooperative` if you see any non-bastion table. See the safety
+> note in [docs/options/zones-and-ownership.md](docs/options/zones-and-ownership.md).
+
+### Safe cutover with `bastion switch`
+
+Changing a live firewall can lock you out, and the watchdog only heals *egress* failures — not "I
+can't reach the box anymore". `bastion switch` applies a change behind an auto-reverting deadman:
+
+```sh
+sudo bastion switch --minutes 10   # print manual-rollback line → snapshot → apply → arm timer
+bastion confirm                    # still have access? lock it in (cancels the deadman)
+# ...do nothing and the timer runs net-rollback, restoring the previous firewall on its own
+```
+
+Use it for any risky cutover (turning a box into an edge router, applying synthesized zones, flipping
+ownership mode). `--dry-run` previews without applying or arming anything.
+
 ### DNS-leak guard (edge mode)
 
 When the hardened local resolver chain is expected (a loopback `dns_upstream`), the L6 watchdog
@@ -269,12 +324,14 @@ bastion never rewrites your resolver config.
 | `bastion tui` | live dashboard (layer health, set counts, AI state, audit tail) + a command palette for every operation, with confirmation gating — a single confirm for state changes and a typed confirmation for destructive ones (layer teardown, firewall reload, network rollback) |
 | `bastion layer <install\|uninstall\|status> <id>` | manage a single layer |
 | `bastion firewall <reload\|status>` | reconcile / inspect the nft ruleset |
+| `bastion zones <list\|add\|remove>` | manage inbound `source → action` zones |
+| `bastion switch [--minutes N]` | apply a firewall change behind an auto-reverting deadman (cutover safety) |
 | `bastion ai <enable\|disable\|panic\|status>` | control the optional AI layer (kill switch) |
 | `bastion ai proposals \| accept <id> \| reject <id>` | review the AI human-review queue and record a decision (nothing auto-applies) |
 | `bastion ai rollback <id>` | undo the elements one audit record applied |
 | `bastion verify` | check live configs still match what `generate` would produce (drift detection) |
 | `bastion doctor` | one-shot triage: binaries, drift, firewall persistence, recovery, AI |
-| `bastion snapshot [--name N] \| snapshots \| rollback [N] \| confirm` | capture (optionally named) / list / restore known-good network state; confirm egress then disarm the watchdog |
+| `bastion snapshot [--name N] \| snapshots \| rollback [N] \| confirm` | capture (optionally named) / list / restore known-good network state; confirm egress then disarm the watchdog (and any `switch` deadman) |
 | `bastion setup --bootstrap` | soft recovery: re-detect from scratch and show where the current config disagrees with the live system |
 | `bastion recovery <start\|stop\|extend\|status>` | operate the out-of-band rescue service |
 | `bastion update <feeds\|dnsblock>` | refresh threat feeds / DNS blocklist now (don't wait for the timer) |

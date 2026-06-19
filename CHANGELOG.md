@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-06-18
+
+Bastion becomes a general firewall **detect → synthesize → apply engine**. It can now firewall the
+full spectrum of hosts — a simple endpoint, an edge router, **and** a server that already runs
+libvirt or Docker — by detecting what's on the box, proposing a configuration, and cutting over
+behind an auto-reverting safety net. Validated live: edge-VM data plane, real **libvirt** coexistence
+in a VM, the full zone matrix synthesized from a real box's existing firewall, and the deadman
+cutover.
+
+### Added
+
+- **Zones — a unified `source → action` inbound policy.** A new `[zones]` section maps a source
+  (`any`, an IP/CIDR, or a whole interface via `iface:NAME`) to an action (`all`, or a port list like
+  `8096, 53/udp`), rendered as inline nftables accepts. Managed with `bastion zones <list|add|remove>`.
+  It generalizes `trusted_hosts` (source → `all`) and `service_ports` (`any` → ports), which keep
+  working. Inline CIDR rules also sidestep the named-set limitation that constrained `trusted_hosts`.
+- **Ownership mode — coexist with libvirt/Docker.** A new `[machine] firewall_scope` chooses
+  `exclusive` (default — bastion owns the whole ruleset, `flush ruleset`) or **`cooperative`** (manage
+  only bastion's own table, leaving a hypervisor/container engine's NAT/forward tables intact). The
+  rollback path is scope-aware: a cooperative rollback deletes only bastion's table.
+- **`bastion switch` — deadman cutover.** Applies a firewall change behind an auto-reverting timer:
+  it prints the manual rollback one-liner, snapshots, applies, then arms `net-rollback` to fire after
+  `--minutes` (default 10) unless `bastion confirm` cancels it. Closes the lockout gap the egress-only
+  watchdog can't cover. `--dry-run` previews.
+- **Detection & synthesis in the wizard.** `bastion setup` now detects a co-resident self-managing
+  firewall (libvirt/Docker/podman, by service or a co-resident nft table) and **proposes
+  `cooperative`**, and synthesizes a starter `[zones]` policy from the box's existing intent — most
+  usefully by parsing an existing (even *disabled*) `ufw` rule set. You confirm or decline; preview
+  with `sudo bastion setup --dry-run`.
+
+### Changed
+
+- **`machine.conf` schema is now version 2.** `bastion migrate` carries an older config forward,
+  adding `firewall_scope = exclusive` (the historical behavior) so existing installs are unaffected.
+- **The firewall-conflict guard understands cooperative scope.** In `cooperative` mode an active
+  `ufw`/`firewalld` is a warning (two input filters at one hook priority is ambiguous) rather than an
+  abort — bastion no longer flushes their tables, so it can coexist.
+- **`bastion confirm` also cancels a pending `switch` deadman** (in addition to disarming the
+  watchdog), on a clean egress check.
+
+### Safety
+
+- **`exclusive` scope can no longer silently flush a co-resident manager's nftables tables.**
+  `exclusive` begins with `flush ruleset`, which deletes every nft table on the box. Two guards now
+  protect against wiping libvirt/Docker/Kubernetes-CNI/Tailscale/hand-written tables: (1) detection
+  defaults to `cooperative` whenever **anything** else owns an nft table — the libvirt/Docker/podman
+  services *plus a catch-all for any foreign table*; and (2) a **runtime hard-warning** fires before
+  an `exclusive` `layer install l0` / `firewall reload` / `switch` that would flush a foreign table,
+  naming the tables and how to switch to `cooperative`. Residual gap: a manager configured but with no
+  table loaded at install time (and not libvirt/Docker/podman) — check `sudo nft list tables` first
+  when unsure. See [docs/options/zones-and-ownership.md](docs/options/zones-and-ownership.md).
+
+### Fixed
+
+- **A loaded-but-disabled `ufw`/`firewalld` no longer falsely aborts an install.** The conflict guard
+  treated a firewall whose systemd unit was merely *active* as enforcing — but `ufw`'s unit is a
+  `RemainAfterExit` oneshot that stays active after `ufw disable`, owning no table. The guard now asks
+  the tool itself (`ufw status` / `firewall-cmd --state`) and only blocks when it is genuinely
+  enforcing (fail-soft: assume enforcing if the status can't be read). Surfaced dogfooding the
+  cooperative install on a real libvirt host.
+
 ## [1.4.0] - 2026-06-17
 
 A round of supply-chain and egress hardening, a managed control surface for the IP

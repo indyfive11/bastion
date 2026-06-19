@@ -131,3 +131,81 @@ def test_service_ports_blank_omits_both_lines():
         net = templates._derived(cfg)["network"]
         assert net["service_ports_tcp_accept"] == ""
         assert net["service_ports_udp_accept"] == ""
+
+
+# --- zones: the general source->action input-accept primitive (inline rules, no named set) -------
+
+def _zones(entries):
+    return templates._derived({"zones": entries})["network"]["zones_input_rules"]
+
+
+def test_zones_absent_or_empty_renders_empty():
+    assert templates._derived({})["network"]["zones_input_rules"] == ""
+    assert _zones({}) == ""
+
+
+def test_zones_cidr_source_single_port():
+    # CIDR source -> inline `ip saddr` (no named set, so no `flags interval` needed).
+    assert _zones({"lan": "192.168.1.0/24 -> 8096"}) == \
+        "ip saddr 192.168.1.0/24 tcp dport { 8096 } accept"
+
+
+def test_zones_multi_port_and_tcp_udp_split():
+    # tcp+udp can't mix in one rule -> two lines; order preserved within a transport.
+    out = _zones({"mix": "10.0.0.0/8 -> 8096, 8989, 53/udp"})
+    assert out == ("ip saddr 10.0.0.0/8 tcp dport { 8096, 8989 } accept\n"
+                   "        ip saddr 10.0.0.0/8 udp dport { 53 } accept")
+
+
+def test_zones_action_all_emits_source_only_accept():
+    assert _zones({"vms": "iface:virbr0 -> all"}) == 'iifname "virbr0" accept'
+    assert _zones({"trust": "192.168.5.5 -> all"}) == "ip saddr 192.168.5.5 accept"
+
+
+def test_zones_any_source_omits_saddr():
+    assert _zones({"zt": "any -> 9993"}) == "tcp dport { 9993 } accept"
+
+
+def test_zones_v6_source_uses_ip6_saddr():
+    assert _zones({"v6": "fd00::/8 -> 22"}) == "ip6 saddr fd00::/8 tcp dport { 22 } accept"
+
+
+def test_zones_dedupes_identical_rules():
+    out = _zones({"a": "any -> 9993", "b": "any -> 9993"})
+    assert out == "tcp dport { 9993 } accept"
+
+
+def test_zones_multiple_entries_joined_at_chain_indent():
+    out = _zones({"lan": "192.168.1.0/24 -> 8096", "zt": "any -> 9993"})
+    assert out == ("ip saddr 192.168.1.0/24 tcp dport { 8096 } accept\n"
+                   "        tcp dport { 9993 } accept")
+
+
+def test_zones_malformed_entry_skipped_in_render():
+    # No `->` -> skipped by the renderer (validate_conf blocks generate before this runs).
+    assert _zones({"bad": "192.168.1.0/24 8096"}) == ""
+
+
+# --- firewall_preamble: ownership mode (exclusive flush vs cooperative table-scoped reset) --------
+
+def _preamble(machine):
+    return templates._derived({"machine": machine})["machine"]["firewall_preamble"]
+
+
+def test_preamble_default_and_exclusive_is_flush():
+    assert _preamble({"mode": "edge"}) == "flush ruleset"          # absent scope -> exclusive
+    assert _preamble({"mode": "edge", "firewall_scope": "exclusive"}) == "flush ruleset"
+    assert _preamble({"mode": "endpoint", "firewall_scope": "exclusive"}) == "flush ruleset"
+
+
+def test_preamble_cooperative_edge_resets_both_tables():
+    # edge owns the filter table AND ip edge_nat — cooperative reset must cover both, NOT flush.
+    out = _preamble({"mode": "edge", "firewall_scope": "cooperative"})
+    assert "flush ruleset" not in out
+    assert out == ("add table inet edge\ndelete table inet edge\n"
+                   "add table ip edge_nat\ndelete table ip edge_nat")
+
+
+def test_preamble_cooperative_endpoint_resets_one_table():
+    out = _preamble({"mode": "endpoint", "firewall_scope": "cooperative"})
+    assert out == "add table inet bastion\ndelete table inet bastion"

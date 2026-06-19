@@ -203,3 +203,114 @@ def test_detect_falls_back_when_tools_absent():
     assert d.ssh_port == 22
     assert d.distro == "auto" and d.pkg_manager == "auto"
     assert d.lan_iface is None
+    assert d.proposed_scope == "exclusive"      # nothing co-resident -> bastion owns the ruleset
+    assert d.proposed_zones == {}
+
+
+# --- P3: categorisation, co-resident detection, listeners, synthesis -------
+
+def test_categorize_iface():
+    assert detect.categorize_iface("enp3s0") == "physical"
+    assert detect.categorize_iface("wlan0") == "physical"
+    assert detect.categorize_iface("virbr0") == "bridge"
+    assert detect.categorize_iface("docker0") == "bridge"
+    assert detect.categorize_iface("br-abc123") == "bridge"
+    assert detect.categorize_iface("wg0") == "overlay"
+    assert detect.categorize_iface("ztabc123") == "overlay"
+    assert detect.categorize_iface("lo") == "virtual"
+    assert detect.categorize_iface("veth7f") == "virtual"
+    # category is orthogonal to kind (kind stays as-is for propose_mode)
+    ifaces = {i.name: i for i in detect.parse_interfaces(LINK, ADDR)}
+    assert ifaces["docker0"].kind == "virtual" and ifaces["docker0"].category == "bridge"
+    assert ifaces["enp3s0"].category == "physical"
+
+
+def test_parse_nft_tables_and_foreign():
+    text = "table inet edge\ntable ip edge_nat\ntable ip libvirt_network\ntable ip6 libvirt_network\n"
+    tables = detect.parse_nft_tables(text)
+    assert ("inet", "edge") in tables and ("ip", "libvirt_network") in tables
+    foreign = detect.foreign_nft_tables(tables)
+    assert ("ip", "libvirt_network") in foreign
+    assert ("inet", "edge") not in foreign and ("ip", "edge_nat") not in foreign
+
+
+def test_parse_listeners_drops_loopback():
+    ss = ("tcp   LISTEN 0 4096  0.0.0.0:8096  0.0.0.0:*\n"
+          "tcp   LISTEN 0 128   127.0.0.1:6379 0.0.0.0:*\n"      # loopback -> dropped
+          "udp   UNCONN 0 0     0.0.0.0:53    0.0.0.0:*\n"
+          "tcp   LISTEN 0 128   [::1]:11211   [::]:*\n")          # v6 loopback -> dropped
+    assert detect.parse_listeners(ss) == [("tcp", 8096), ("udp", 53)]
+
+
+# EM-shaped ufw policy (the validation fixture): LAN->media, ZeroTier->media+ssh, wg->ssh,
+# virbr0->all, 9993 global. SSH NOT open from plain LAN.
+EM_UFW = """\
+Added user rules (see 'ufw status' for running firewall):
+ufw allow from 192.168.1.0/24 to any port 8096,8080,8989,7878,9117
+ufw allow from 192.168.192.0/24 to any port 8096,1111 proto tcp
+ufw allow from 10.0.0.0/24 to any port 22,1111
+ufw allow in on virbr0
+ufw allow 9993
+ufw allow 9993/udp
+"""
+
+
+def test_parse_ufw_show_added():
+    rules = detect.parse_ufw_show_added(EM_UFW)
+    assert ("192.168.1.0/24", "8096", None) in rules
+    assert ("192.168.192.0/24", "1111", "tcp") in rules       # proto carried onto each port
+    assert ("iface:virbr0", "all", None) in rules
+    assert ("any", "9993", None) in rules and ("any", "9993", "udp") in rules
+
+
+def test_synthesize_zones_from_em_ufw():
+    zones = detect.synthesize_zones(EM_UFW)
+    assert zones["net_192_168_1_0_24"] == "192.168.1.0/24 -> 8096, 8080, 8989, 7878, 9117"
+    assert zones["net_192_168_192_0_24"] == "192.168.192.0/24 -> 8096/tcp, 1111/tcp"
+    assert zones["net_10_0_0_0_24"] == "10.0.0.0/24 -> 22, 1111"
+    assert zones["iface_virbr0"] == "iface:virbr0 -> all"
+    assert zones["anyports"] == "any -> 9993, 9993/udp"
+    assert detect.synthesize_zones("") == {}
+
+
+def test_propose_scope_cooperative_when_libvirt_present():
+    coop = {"libvirt": detect.ServiceState(present=True, active=True)}
+    assert detect.propose_scope(coop, []) == "cooperative"        # by service (table not loaded yet)
+    # via a co-resident table even if the service probe missed it
+    assert detect.propose_scope({}, [("ip", "libvirt_network")]) == "cooperative"
+    # CATCH-ALL: ANY foreign nft table -> cooperative (k8s/CNI, Tailscale, hand-written, even ufw's
+    # filter table). When something else already owns nft state, default to NOT flushing it.
+    assert detect.propose_scope({}, [("ip", "kube_proxy")]) == "cooperative"
+    assert detect.propose_scope({}, [("ip", "filter")]) == "cooperative"
+    # only when NOTHING foreign exists -> exclusive (bastion owns the whole ruleset)
+    assert detect.propose_scope({}, []) == "exclusive"
+
+
+def test_detect_proposes_cooperative_with_libvirt(monkeypatch):
+    cmds = {
+        ("ip", "-o", "link", "show"): LINK,
+        ("ip", "-o", "-4", "addr", "show"): ADDR,
+        ("ip", "route", "show", "default"): ROUTE,
+        ("nft", "list", "tables"): "table inet edge\ntable ip libvirt_network\n",
+        ("ufw", "show", "added"): EM_UFW,
+    }
+    have = {"pacman", "nft", "virsh", "libvirtd.service"}     # libvirt present
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=arch\n"}, have))
+    assert d.proposed_scope == "cooperative"
+    assert "libvirt" in d.co_resident_firewalls
+    assert ("ip", "libvirt_network") in d.nft_foreign_tables
+    assert d.proposed_zones["iface_virbr0"] == "iface:virbr0 -> all"
+
+
+def test_detect_catch_all_cooperative_on_unknown_foreign_table():
+    # No libvirt/docker/podman service, but a co-resident table bastion doesn't recognize (e.g. a
+    # Kubernetes CNI / hand-written table) -> the catch-all proposes cooperative anyway.
+    cmds = {
+        ("ip", "-o", "link", "show"): LINK,
+        ("ip", "-o", "-4", "addr", "show"): ADDR,
+        ("nft", "list", "tables"): "table inet bastion\ntable ip cilium_post_nat\n",
+    }
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=arch\n"}, {"nft"}))
+    assert d.proposed_scope == "cooperative"
+    assert ("ip", "cilium_post_nat") in d.nft_foreign_tables       # foreign (not bastion's)
+    assert ("inet", "bastion") not in d.nft_foreign_tables          # bastion's own, excluded

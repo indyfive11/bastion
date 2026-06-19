@@ -161,6 +161,31 @@ def test_feeds_bad_url_rejected(staged):
     assert not (_conf_of(staged)["monitoring"].get("feed_sources") or "")   # nothing written
 
 
+def test_zones_add_list_remove(staged, capsys):
+    assert cli.main(["zones", "add", "lan", "192.168.1.0/24", "8096", "8989", "--root", str(staged)]) == 0
+    assert _conf_of(staged)["zones"]["lan"] == "192.168.1.0/24 -> 8096 8989"
+    capsys.readouterr()
+    assert cli.main(["zones", "list", "--root", str(staged)]) == 0
+    assert "lan = 192.168.1.0/24 -> 8096 8989" in capsys.readouterr().out
+    assert cli.main(["zones", "remove", "lan", "--root", str(staged)]) == 0
+    assert "zones" not in _conf_of(staged) or "lan" not in _conf_of(staged).get("zones", {})
+
+
+def test_zones_add_iface_all(staged):
+    assert cli.main(["zones", "add", "vms", "iface:virbr0", "all", "--root", str(staged)]) == 0
+    assert _conf_of(staged)["zones"]["vms"] == "iface:virbr0 -> all"
+
+
+def test_zones_bad_source_rejected(staged):
+    assert cli.main(["zones", "add", "bad", "not-an-ip", "8096", "--root", str(staged)]) == 1
+    assert "zones" not in _conf_of(staged)              # nothing written
+
+
+def test_zones_remove_unknown_no_change(staged, capsys):
+    assert cli.main(["zones", "remove", "ghost", "--root", str(staged)]) == 0
+    assert "no change" in capsys.readouterr().out
+
+
 def test_layer_disable_delists(staged):
     assert cli.main(["layer", "disable", "l4", "--root", str(staged)]) == 0
     assert "l4" not in _conf_of(staged)["machine"]["layers"].split(",")

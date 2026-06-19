@@ -5,7 +5,7 @@
 #
 # Interface (resolved from machine.conf at generate time): {{ interfaces.lan }}=primary NIC
 
-flush ruleset
+{{ machine.firewall_preamble }}
 
 table inet bastion {
 
@@ -71,6 +71,11 @@ table inet bastion {
         # bastion can serve its apps. Blank by default — a client endpoint stays fully locked down.
         {{ network.service_ports_tcp_accept }}
         {{ network.service_ports_udp_accept }}
+
+        # Zones ([zones]): the general source->action accept primitive (inline rules, no named set —
+        # so CIDR sources need no `flags interval`). Blank by default; folds in trusted_hosts/
+        # service_ports as zones in a later step. See templates._render_zones.
+        {{ network.zones_input_rules }}
     }
 
     # No forward chain and no NAT table: an endpoint never routes for other hosts.

@@ -42,6 +42,13 @@ Anything that loads nft rules, installs units, or installs packages needs **root
 | `bastion layer uninstall <id>` | Remove one layer. Blocked if other layers depend on it — `--force` to override. |
 | `bastion firewall status` | Show the live nftables ruleset state. |
 | `bastion firewall reload` | Re-apply the rendered ruleset (`nft -f`). |
+| `bastion zones list` | Show the `[zones]` inbound-access rules (`source -> action`). |
+| `bastion zones add <name> <source> <all\|ports…>` | Add/replace a zone, then generate + reload. `source` = `any` / IP-or-CIDR / `iface:NAME`; ports are space-separated (`8096 53/udp`). |
+| `bastion zones remove <name>` | Delete a zone, then generate + reload. |
+| `bastion switch [--minutes N]` | **Deadman cutover.** Print the manual rollback one-liner, snapshot, apply (generate + reload), then arm an auto-revert timer (default 10 min) that runs `net-rollback` unless `bastion confirm` cancels it. `--dry-run` previews only. Live-only; needs root. |
+
+See **[options/zones-and-ownership.md](options/zones-and-ownership.md)** for zones, ownership mode
+(`firewall_scope`), and `switch` in depth.
 
 ## AI layer (L3) — operator kill switch
 
@@ -65,7 +72,7 @@ goes to a human-review queue. These verbs are the controls.
 | `bastion snapshot --name <n>` | …and also save it as a named snapshot. |
 | `bastion snapshots` | List the auto snapshot + any named ones. |
 | `bastion rollback [name]` | Restore a snapshot (`net-rollback`). Omit the name for the auto slot; `--reason "..."` is logged. |
-| `bastion confirm` | Confirm egress is stable (~45 s), then disarm the watchdog and accept the current config as the new baseline (`net-confirm`). |
+| `bastion confirm` | Confirm egress is stable (~45 s), then disarm the watchdog and accept the current config as the new baseline (`net-confirm`). Also cancels a pending `bastion switch` deadman. |
 | `bastion recovery start` | Stand up the emergency console-initiated rescue SSH (ephemeral user + one-time password on a free port; self-destructs after the window). Run from the **console**. |
 | `bastion recovery stop` / `extend` / `status` | Tear down / extend the window / report state. |
 

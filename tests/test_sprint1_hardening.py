@@ -69,6 +69,44 @@ def test_validate_conf_rejects_bad_service_ports():
     assert "8096" not in blob               # the valid token is not flagged
 
 
+def test_validate_conf_firewall_scope():
+    c = _conf()
+    for good in ("exclusive", "cooperative", ""):       # blank = template default (exclusive)
+        c["machine"]["firewall_scope"] = good
+        assert state.validate_conf(c)[0] == []
+    c["machine"]["firewall_scope"] = "shared"
+    errs, _ = state.validate_conf(c)
+    assert any("firewall_scope" in e and "shared" in e for e in errs)
+
+
+def test_validate_conf_accepts_good_zones():
+    # CIDR source (proves the trusted_hosts named-set CIDR bug is sidestepped — inline rules accept
+    # CIDRs that a named set without `flags interval` rejects), iface source, any source, `all`.
+    c = _conf()
+    c["zones"] = {
+        "lan": "192.168.1.0/24 -> 8096, 8989",
+        "vms": "iface:virbr0 -> all",
+        "ztctl": "any -> 9993",
+        "v6": "fd00::/8 -> 22",
+    }
+    errs, _ = state.validate_conf(c)
+    assert errs == []
+
+
+def test_validate_conf_rejects_bad_zones():
+    c = _conf()
+    c["zones"] = {
+        "noarrow": "192.168.1.0/24 8096",       # missing ->
+        "badsrc": "not-an-ip -> 8096",
+        "badport": "any -> 70000",
+        "badproto": "any -> 53/sctp",
+        "badiface": "iface:this-name-is-way-too-long -> all",
+    }
+    errs, _ = state.validate_conf(c)
+    blob = " ".join(errs)
+    assert all(t in blob for t in ("noarrow", "not-an-ip", "70000", "53/sctp", "badiface"))
+
+
 def test_validate_conf_warns_on_default_route():
     c = _conf()
     c["network"]["lan_cidr"] = "0.0.0.0/0"
