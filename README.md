@@ -342,11 +342,45 @@ Full per-command reference: **[docs/commands.md](docs/commands.md)**. When somet
 
 ## Design principles
 
-- No real IPs, hostnames, MACs, or keys in the repository — templates use `{{ }}` placeholders.
-- No-arch-leak: the AI wizard sends only sanitized topology signals to any external API.
-- No hard service dependencies on external or boot-path units.
-- Idempotent: every install action is safe to re-run.
-- Narrowest scope; a human kill switch and an always-installed recovery service are mandatory.
+These are the convictions that shape what bastion does for the person running it — and what
+make it straightforward to adopt on almost any Linux host.
+
+- **Detect, propose, confirm — never assume.** The setup wizard reaches every value by detecting it
+  from your system or asking you: interface names, the SSH port, subnets, the services already
+  running. It proposes sensible defaults and you confirm or correct them — nothing about your network
+  is hardcoded into the tool. You get a working configuration for *your* box without hand-authoring
+  it, and you stay in control of every choice.
+- **One engine for the whole spectrum of hosts.** The same detect → synthesize → apply engine secures
+  a laptop endpoint, a dedicated edge router, or a server already running libvirt/Docker — selected by
+  mode, profile, and zones rather than by different tools. A host is just a set of values in
+  `machine.conf`, so bastion adapts to your use case instead of asking you to adapt to it.
+- **Layered and composable.** Capabilities are independent layers — core, feeds, CrowdSec, AI,
+  DNS/DHCP, VPN, monitoring. Pick a ready-made profile (from `minimal-endpoint` to `full-edge`) or
+  assemble your own. You run only what you enable, and one layer degrading never takes the rest down.
+- **Coexist, don't conquer.** Bastion applies the minimum changes your chosen profile needs and
+  detects what's already there — existing DHCP, default routes, another firewall, a hypervisor's NAT
+  tables — and works alongside it (`cooperative` ownership mode) rather than flushing it. You can drop
+  bastion onto a live, already-configured host without fear of wiping its network.
+- **Safe to apply, hard to lock yourself out.** A human kill switch is always present, a recovery
+  service is always installed, and risky cutovers run behind `bastion switch` — an auto-reverting
+  deadman that rolls the change back unless you confirm you still have access. Snapshots and one-line
+  rollbacks back every change, so you can experiment without painting yourself into a corner.
+- **Idempotent and reproducible.** Every action is safe to re-run; setup applies only the difference
+  between the current and the desired state. Your entire firewall is reproducible from a single
+  `machine.conf`, which makes adoption low-risk and rebuilding a machine trivial.
+- **Preview before you commit.** `bastion setup --dry-run` walks the whole wizard and shows exactly
+  what it would write — making no network calls and changing nothing. `bastion verify` and
+  `bastion doctor` then report any drift between your intent and what's live, with `--json` for
+  automation and dashboards.
+- **Privacy by design.** No real addresses, keys, or hostnames live anywhere in the project, and the
+  AI layer is entirely optional — when enabled it only ever sees sanitized topology signals (interface
+  types, which services were detected, your wizard answers), never your IPs, MACs, or credentials.
+  Secrets stay in a locked-down file separate from your config. A firewall should protect your
+  network, not export it.
+- **No required cloud, no lock-in.** Bastion is fully usable with rule-based detection and needs no API
+  key or account; AI assistance is an enhancement you switch on or off. It orchestrates standard tools
+  — nftables, systemd, and well-known daemons — across Arch, Debian/Ubuntu, and Fedora, so your stack
+  stays transparent, inspectable, and yours.
 
 ## Development
 
