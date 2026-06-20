@@ -233,7 +233,8 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
     put("machine", "layers", layers)
     put("machine", "distro", detection.distro)
     # P3: ownership mode — explicit answer wins, else the synthesised proposal (cooperative when a
-    # self-managing firewall like libvirt/docker is present), else the skeleton default (exclusive).
+    # self-managing firewall like libvirt/docker/k8s/tailscale is present), else the skeleton
+    # default (exclusive).
     put("machine", "firewall_scope", answers.get("firewall_scope") or detection.proposed_scope)
     put("machine", "schema_version", str(state.CONF_SCHEMA_VERSION))
 
@@ -676,7 +677,7 @@ class Wizard:
         if d.proposed_scope != "cooperative" and not d.proposed_zones:
             return a
         if d.proposed_scope == "cooperative":
-            drivers = [s for s in ("libvirt", "docker", "podman") if s in d.co_resident_firewalls]
+            drivers = [s for s in detectmod._SELF_MANAGING if s in d.co_resident_firewalls]
             if drivers:
                 who = ", ".join(drivers)
             elif d.nft_foreign_tables:

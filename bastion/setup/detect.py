@@ -49,7 +49,22 @@ _SERVICES: dict[str, tuple[str, str]] = {
     "libvirt": ("virsh", "libvirtd.service"),
     "docker": ("docker", "docker.service"),
     "podman": ("podman", "podman.service"),
+    # Kubernetes node agents + their CNI plugins (kube-proxy, calico, cilium, flannel) program
+    # nft/iptables for pod networking; the host-level signal is the node agent (kubelet / k3s).
+    # Tailscale's tailscaled installs its own `inet ts_*`-style table for the tailscale0 overlay.
+    # All three are self-managing like libvirt/docker -> COOPERATIVE.
+    "kubernetes": ("kubelet", "kubelet.service"),
+    "k3s": ("k3s", "k3s.service"),
+    "tailscale": ("tailscale", "tailscaled.service"),
 }
+
+# The subset of _SERVICES that are self-managing dynamic firewalls/overlays: their mere PRESENCE
+# makes bastion propose cooperative scope, because they own nft tables / forward+NAT rules that an
+# exclusive `flush ruleset` would wipe. Forward-looking — fires on service presence before the
+# manager has even loaded a table (Docker with no containers, a freshly-installed kubelet, a
+# tailscaled that hasn't come up yet). Anything NOT named here is still caught at runtime by
+# propose_scope's foreign-table catch-all (any unowned nft table -> cooperative).
+_SELF_MANAGING = ("libvirt", "docker", "podman", "kubernetes", "k3s", "tailscale")
 
 # nft tables bastion itself owns — anything else in `nft list tables` is a co-resident manager's.
 _BASTION_NFT_TABLES = {("inet", "edge"), ("inet", "bastion"), ("ip", "edge_nat"),
@@ -401,18 +416,19 @@ def propose_scope(services: dict[str, "ServiceState"],
     """``cooperative`` when bastion would otherwise flush co-resident nft state; else ``exclusive``.
 
     Two triggers, the second a catch-all:
-      1. A known self-managing manager's SERVICE is present (libvirt/docker/podman) — forward-looking,
-         so it fires even before that manager has loaded an nft table (e.g. Docker with no containers
-         running yet).
+      1. A known self-managing manager's SERVICE is present (libvirt/docker/podman, a Kubernetes node
+         agent — kubelet/k3s — or Tailscale; see ``_SELF_MANAGING``) — forward-looking, so it fires
+         even before that manager has loaded an nft table (e.g. Docker with no containers running yet,
+         or a freshly-installed kubelet whose CNI hasn't programmed pod rules).
       2. **Catch-all:** ANY co-resident nft table bastion doesn't own. When *something else* already
-         owns nft state — Kubernetes/CNI, Tailscale, a hand-written table, anything — default to NOT
+         owns nft state — an unrecognized CNI, a hand-written table, anything — default to NOT
          flushing it. Erring toward cooperative is the non-destructive failure mode: exclusive's
          ``flush ruleset`` would delete every table on the box.
 
     A proposal; the operator confirms. (Specific managers are still named via ``services`` for clearer
     wizard messaging; the runtime also hard-warns before an exclusive apply that would flush foreign
     tables — see ``layers.base.warn_if_exclusive_flush``.)"""
-    for sid in ("libvirt", "docker", "podman"):
+    for sid in _SELF_MANAGING:
         st = services.get(sid)
         if st and st.present:
             return "cooperative"
@@ -457,7 +473,7 @@ def detect(sys: System) -> Detection:
     # P3: co-resident managers + existing intent (all read-only, fail-soft -> empty when absent).
     foreign = foreign_nft_tables(parse_nft_tables(sys.run("nft", "list", "tables").stdout))
     listeners = parse_listeners(sys.run("ss", "-tulnH").stdout)
-    co_resident = [sid for sid in ("ufw", "firewalld", "libvirt", "docker", "podman")
+    co_resident = [sid for sid in ("ufw", "firewalld", *_SELF_MANAGING)
                    if services.get(sid) and services[sid].present]
     proposed_scope = propose_scope(services, foreign)
     proposed_zones = synthesize_zones(sys.run("ufw", "show", "added").stdout)

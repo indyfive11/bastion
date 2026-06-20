@@ -286,6 +286,18 @@ def test_propose_scope_cooperative_when_libvirt_present():
     assert detect.propose_scope({}, []) == "exclusive"
 
 
+def test_propose_scope_cooperative_for_named_self_managers():
+    # Forward-looking trigger: a self-managing manager's SERVICE present -> cooperative even before
+    # it has loaded an nft table (no foreign tables passed). Covers the k8s/CNI + Tailscale naming
+    # that previously relied on the foreign-table catch-all alone.
+    for sid in ("kubernetes", "k3s", "tailscale", "docker", "podman"):
+        present = {sid: detect.ServiceState(present=True, active=False)}
+        assert detect.propose_scope(present, []) == "cooperative", sid
+    # present=False must NOT trip it (binary/unit absent) -> exclusive
+    absent = {"tailscale": detect.ServiceState(present=False, active=False)}
+    assert detect.propose_scope(absent, []) == "exclusive"
+
+
 def test_detect_proposes_cooperative_with_libvirt(monkeypatch):
     cmds = {
         ("ip", "-o", "link", "show"): LINK,
@@ -300,6 +312,22 @@ def test_detect_proposes_cooperative_with_libvirt(monkeypatch):
     assert "libvirt" in d.co_resident_firewalls
     assert ("ip", "libvirt_network") in d.nft_foreign_tables
     assert d.proposed_zones["iface_virbr0"] == "iface:virbr0 -> all"
+
+
+def test_detect_proposes_cooperative_with_tailscale_no_table_yet():
+    # Forward-looking: tailscaled present but it hasn't programmed its nft table yet (none foreign).
+    # The named-service trigger must still propose cooperative and surface it for wizard messaging.
+    cmds = {
+        ("ip", "-o", "link", "show"): LINK,
+        ("ip", "-o", "-4", "addr", "show"): ADDR,
+        ("ip", "route", "show", "default"): ROUTE,
+        ("nft", "list", "tables"): "table inet bastion\n",     # only bastion's own -> nothing foreign
+    }
+    have = {"pacman", "nft", "tailscale", "tailscaled.service"}
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=arch\n"}, have))
+    assert d.proposed_scope == "cooperative"
+    assert "tailscale" in d.co_resident_firewalls
+    assert d.nft_foreign_tables == []                          # proven without the catch-all
 
 
 def test_detect_catch_all_cooperative_on_unknown_foreign_table():

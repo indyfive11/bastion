@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Detection now names Kubernetes/CNI and Tailscale as self-managing firewalls.** Cooperative scope
+  was already proposed for any box carrying a foreign nftables table, so these were covered once their
+  rules loaded. They are now also recognized *forward-looking* by service presence (`kubelet`/`k3s`,
+  `tailscaled`) — so a freshly-installed node agent or a tailscaled that hasn't programmed its table
+  yet still proposes cooperative, and the manager is named in the wizard's scope prompt. The runtime
+  foreign-table catch-all remains the backstop for anything unrecognized.
+
 ## [1.5.0] - 2026-06-18
 
 Bastion becomes a general firewall **detect → synthesize → apply engine**. It can now firewall the
