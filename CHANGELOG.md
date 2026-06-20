@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.5.1] - 2026-06-19
+
+A polish release: more accurate L2/CrowdSec install reporting, a forward-looking detector for
+Kubernetes and Tailscale, and a hardened nftables loader unit. Live-validated on a cooperative
+libvirt host plus Arch and Debian VMs.
 
 ### Changed
 
