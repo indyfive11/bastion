@@ -32,6 +32,21 @@ To deliberately let bastion take over (it becomes the only firewall): set
 - Setup now warns about this at **profile selection**, not just at install time.
 - Every other layer works without CrowdSec — it's only a detection *source*.
 
+### CrowdSec is installed but won't start (`address already in use`)
+**Symptom.** `layer install l2` enabled the service but `systemctl status crowdsec` shows it FATALed
+with `listen tcp 127.0.0.1:8080: bind: address already in use`.
+**Cause.** CrowdSec's local API (LAPI) defaults to `127.0.0.1:8080`; another service on the box (a
+torrent client, a dev server, …) already holds that port. `layer install l2` now **warns** when it
+sees `:8080` busy before starting — but the move is yours to make.
+**Fix.** Pick a free port and set it in **both** files, then restart:
+```sh
+# /etc/crowdsec/config.yaml            -> api.server.listen_uri: 127.0.0.1:8081
+# /etc/crowdsec/local_api_credentials.yaml -> url: http://127.0.0.1:8081
+sudo systemctl restart crowdsec
+```
+> When the `crowdsec` package isn't installed at all, `layer install l2` no longer claims it started —
+> it tells you the package is absent and to install it first.
+
 ### "missing required command(s): …"
 **Cause.** An operational script (e.g. `flowcheck`, `edge-watchdog`) needs a binary that isn't
 installed — it now says so up front instead of failing obscurely.
@@ -63,6 +78,20 @@ nft list tables                                   # -> table inet bastion (or in
 **Cause.** `nftables.service` wasn't enabled, so nothing reloads the rules at boot.
 **Fix.** `bastion layer install l0` enables it. Check with `systemctl is-enabled nftables` (should be
 `enabled`) and `bastion doctor` (reports persistence).
+
+### `systemctl is-active nftables` says `inactive` but the rules are loaded
+**Cause.** `nftables.service` is a oneshot loader — it runs `nft -f` and exits. Some distros' stock
+unit doesn't keep it marked active afterward, so `is-active` reads `inactive` even though the ruleset
+is in the kernel.
+**Fix.** Current versions ship a drop-in that sets `RemainAfterExit=yes`, so a loaded firewall now
+reports `active (exited)`. The same drop-in clears the unit's `ExecStop` so a `restart`/`stop` never
+flushes co-resident tables (libvirt/Docker) under `cooperative` scope. Reinstall L0 to pick it up:
+```sh
+sudo bastion layer install l0
+systemctl is-active nftables     # -> active (exited)
+```
+Either way, the source of truth for "is my firewall loaded" is `nft list tables` / `bastion doctor`,
+not the unit's active state.
 
 ### LAN clients get an address but can't reach the internet (edge)
 **Cause.** A router passes traffic between networks only when the kernel's IP-forwarding switch is on.

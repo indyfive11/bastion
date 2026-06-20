@@ -17,7 +17,7 @@ system.
 
 - **Seven composable layers** (L0–L6) — install only what you need.
 - **Two modes** — `edge` (routing firewall / gateway) and `endpoint` (defense-in-depth on a workstation or server).
-- **Guided setup** — `bastion setup` detects your topology, recommends a profile, renders configs, installs packages, and verifies the result. It also **detects a co-resident firewall (libvirt/Docker) and synthesizes a zone policy from your existing rules**, proposing a safe configuration you confirm.
+- **Guided setup** — `bastion setup` detects your topology, recommends a profile, renders configs, installs packages, and verifies the result. It also **detects a co-resident firewall (libvirt/Docker/Kubernetes/Tailscale) and synthesizes a zone policy from your existing rules**, proposing a safe configuration you confirm.
 - **Zones** — a unified `source → action` inbound policy (`192.168.1.0/24 → 8096, 8989`, `iface:virbr0 → all`, `any → 9993`) managed with `bastion zones`.
 - **Coexists with libvirt/Docker** — `cooperative` ownership mode manages only bastion's own nftables table and leaves a hypervisor/container engine's tables intact (`exclusive` is the default, where bastion owns the whole ruleset).
 - **Safe cutover** — `bastion switch` applies a firewall change behind an auto-reverting deadman, so a change that locks you out rolls itself back.
@@ -280,16 +280,19 @@ networking:
 bastion config set machine.firewall_scope cooperative --advanced
 ```
 
-`bastion setup` detects libvirt/Docker and **proposes `cooperative` automatically**, and synthesizes
+`bastion setup` detects a self-managing firewall (libvirt, Docker/podman, a Kubernetes node agent, or
+Tailscale) and **proposes `cooperative` automatically**, and synthesizes
 a starter `[zones]` policy from your existing (even disabled) `ufw` rules — preview it with
 `sudo bastion setup --dry-run`. Full reference:
 **[docs/options/zones-and-ownership.md](docs/options/zones-and-ownership.md)**.
 
 > ⚠️ **`exclusive` mode runs `flush ruleset`, which deletes _every_ nftables table on the box.**
 > Two safety nets guard this: setup defaults to `cooperative` whenever **anything** else owns an nft
-> table (libvirt/Docker/podman by service, plus a catch-all for any foreign table — k8s/CNI, Tailscale,
-> hand-written), and a **runtime hard-warning** fires before an `exclusive` apply would flush a foreign
-> table. The one gap: a manager with no table loaded at install time. When unsure, check
+> table (libvirt/Docker/podman, a Kubernetes node agent — kubelet/k3s — or Tailscale by service, plus a
+> catch-all for any other foreign table — an unrecognized CNI, hand-written), and a **runtime
+> hard-warning** fires before an `exclusive` apply would flush a foreign table. The named managers are
+> caught even before they've loaded a table; an unrecognized manager with no table loaded at install
+> time is the remaining gap. When unsure, check
 > `sudo nft list tables` first and use `cooperative` if you see any non-bastion table. See the safety
 > note in [docs/options/zones-and-ownership.md](docs/options/zones-and-ownership.md).
 

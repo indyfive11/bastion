@@ -63,6 +63,19 @@ class L0Core(Layer):
             "[Service]\n"
             "ExecStart=\n"
             f"ExecStart={nft} -f /etc/nftables.conf\n"
+            # Re-assert the oneshot + RemainAfterExit semantics in our own drop-in so the unit
+            # reports `active (exited)` after a successful load (not `inactive`) regardless of what
+            # the distro base unit sets — `systemctl is-active nftables` then truthfully reflects
+            # that the ruleset is loaded (the l0 install comment below relies on this).
+            "Type=oneshot\n"
+            "RemainAfterExit=yes\n"
+            # Clear any distro ExecStop (several ship `nft flush ruleset`). With RemainAfterExit=yes
+            # the unit is active, so a `systemctl restart`/`stop` would otherwise run ExecStop and
+            # wipe EVERY table — including a co-resident manager's (libvirt/Docker) under cooperative
+            # scope, re-introducing the very flush the cooperative mode exists to prevent. The
+            # service is a pure loader; tear-down is bastion's job (layer uninstall / net-rollback /
+            # firewall verbs), which is scope-aware.
+            "ExecStop=\n"
         )
 
     # --- lifecycle --------------------------------------------------------

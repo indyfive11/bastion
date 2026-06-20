@@ -14,6 +14,24 @@ from __future__ import annotations
 from .base import Layer, Context, LayerStatus, HealthCheck, nft_set_health
 
 UNIT = "crowdsec.service"
+LAPI_DEFAULT_PORT = 8080          # CrowdSec's local API default (127.0.0.1:8080)
+
+
+def _port_listening(sys, port: int) -> bool:
+    """True if a TCP socket is already LISTENing on ``port`` (any local address). Fail-soft: if
+    ``ss`` is missing or unparseable, return False — never block an install on a check we couldn't
+    run. Used to spot a LAPI port clash before crowdsec FATALs 'address already in use' on start."""
+    res = sys.run("ss", "-ltnH")
+    if res.returncode != 0:
+        return False
+    for line in res.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        _, _, p = fields[3].rpartition(":")   # Local Address:Port column
+        if p == str(port):
+            return True
+    return False
 
 
 class L2Crowdsec(Layer):
@@ -29,7 +47,8 @@ class L2Crowdsec(Layer):
     def install(self, ctx: Context) -> None:
         sys = ctx.system
 
-        if not sys.command_exists("cscli"):
+        have_cscli = sys.command_exists("cscli")
+        if not have_cscli:
             print("l2: WARNING — cscli not found; install the 'crowdsec' package first. "
                   "On Arch it is AUR-only (e.g. `paru -S crowdsec`); bastion does not build it "
                   "for you. Then re-run `bastion layer install l2`.")
@@ -38,13 +57,35 @@ class L2Crowdsec(Layer):
             print("l2: WARNING — edge-reconciler (L1) is not installed; cs_block will not be "
                   "populated until L1 is installed (L2 prerequisite).")
 
-        if sys.is_live:
-            sys.run("systemctl", "enable", "--now", UNIT)
+        if not sys.is_live:
+            print("l2: staged — L2 owns no bastion files; it only manages the system "
+                  "crowdsec.service (skipped: root != / or dry-run).")
+            return
+
+        # Don't claim to have enabled a service whose package isn't installed — the unit doesn't
+        # exist, so `systemctl enable --now` would just error and the old success line lied.
+        if not have_cscli:
+            print("l2: crowdsec package absent — NOT enabling crowdsec.service (the unit does not "
+                  "exist yet). Install crowdsec, then re-run `bastion layer install l2`.")
+            return
+
+        # CrowdSec's local API defaults to 127.0.0.1:8080; if that port is already taken the daemon
+        # FATALs 'address already in use' on start (a silent failure: enable succeeds, start dies).
+        # Warn (don't block) with the concrete fix before we try to start it.
+        if _port_listening(sys, LAPI_DEFAULT_PORT):
+            print(f"l2: WARNING — TCP :{LAPI_DEFAULT_PORT} is already in use. CrowdSec's local API "
+                  f"(LAPI) defaults to 127.0.0.1:{LAPI_DEFAULT_PORT} and will FATAL 'address "
+                  "already in use' on start. Move it to a free port in BOTH "
+                  "/etc/crowdsec/config.yaml (api.server.listen_uri) and "
+                  "/etc/crowdsec/local_api_credentials.yaml (url), then `systemctl restart crowdsec`.")
+
+        if sys.run("systemctl", "enable", "--now", UNIT).returncode == 0:
             print("l2: crowdsec.service enabled + started. The reconciler picks up its "
                   "decisions into cs_block on the next pass (≤60s).")
         else:
-            print("l2: staged — L2 owns no bastion files; it only manages the system "
-                  "crowdsec.service (skipped: root != / or dry-run).")
+            print(f"l2: WARNING — `systemctl enable --now {UNIT}` did not succeed. Check "
+                  "`systemctl status crowdsec` / `journalctl -u crowdsec` (a busy LAPI port is "
+                  "the common cause).")
 
     def uninstall(self, ctx: Context) -> None:
         sys = ctx.system

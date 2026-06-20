@@ -100,26 +100,26 @@ bastion config set machine.firewall_scope cooperative --advanced
 > moment an `exclusive` ruleset loads. Two safety nets guard against this:
 >
 > 1. **Detection defaults to `cooperative` whenever anything else owns nft state.** The wizard
->    proposes `cooperative` if it finds a libvirt/Docker/podman *service* **or — the catch-all —**
->    **any** co-resident nft table that isn't bastion's. So k8s/CNI, Tailscale, and hand-written
->    tables are covered as long as their table is present when you run setup.
+>    proposes `cooperative` if it finds a self-managing manager's *service* — libvirt, Docker/podman, a
+>    Kubernetes node agent (kubelet/k3s), or Tailscale — **or — the catch-all — any** co-resident nft
+>    table that isn't bastion's. The named managers are caught **forward-looking**, by service presence,
+>    even before they've programmed a table; an unrecognized manager is covered as long as its table is
+>    present when you run setup.
 > 2. **A runtime hard-warning** fires before any `exclusive` apply/reload (`layer install l0`,
 >    `firewall reload`, `switch`) that would flush a foreign table, naming the tables that would be
 >    deleted and how to switch to `cooperative`.
 >
-> **The residual gap to mind:** if a manager is configured but has **no table loaded at the moment you
-> install** (e.g. Docker installed with no containers, a CNI that's down) *and* it isn't libvirt/
-> Docker/podman, detection can't see it — and a later `exclusive` reload would flush it once it comes
-> up. When in doubt, run `sudo nft list tables` first: if you see **any** table that isn't bastion's
-> (`inet edge` / `inet bastion` / `ip edge_nat` / `inet bastion_recovery`), use `cooperative`:
+> **The residual gap to mind:** if an **unrecognized** manager is configured but has **no table loaded
+> at the moment you install** (e.g. a CNI that's down) — i.e. it isn't one of the named services above
+> *and* hasn't programmed a table yet — detection can't see it, and a later `exclusive` reload would
+> flush it once it comes up. When in doubt, run `sudo nft list tables` first: if you see **any** table
+> that isn't bastion's (`inet edge` / `inet bastion` / `ip edge_nat` / `inet bastion_recovery`), use
+> `cooperative`:
 >
 > ```sh
 > bastion config set machine.firewall_scope cooperative --advanced
 > # ...or set `firewall_scope = cooperative` in machine.conf directly.
 > ```
->
-> *(Naming more managers explicitly — k8s/Tailscale — for clearer messaging is a tracked roadmap item;
-> the catch-all already protects them.)*
 
 > **Note:** `cooperative` is about coexisting with NAT/forward managers (libvirt/Docker/k8s/mesh). It
 > is **not** for running beside a second *input-filter* firewall — bastion still warns if `ufw`/
@@ -130,13 +130,13 @@ bastion config set machine.firewall_scope cooperative --advanced
 
 `bastion setup` reads the box's live state and **proposes** a scope:
 
-- It finds a libvirt/Docker/podman **service**, **or — the catch-all — any** co-resident nft table
-  that isn't bastion's (Kubernetes/CNI, Tailscale, a hand-written table, …) → proposes
-  **`cooperative`**.
+- It finds a self-managing manager's **service** — libvirt, Docker/podman, a Kubernetes node agent
+  (kubelet/k3s), or Tailscale — **or — the catch-all — any** co-resident nft table that isn't bastion's
+  (an unrecognized CNI, a hand-written table, …) → proposes **`cooperative`**.
 - Only when nothing else owns nft state → **`exclusive`**.
 
 Always review the proposed scope (`sudo bastion setup --dry-run`) before a live apply. See the safety
-warning above for the one residual gap (a manager with no table loaded at install time).
+warning above for the one residual gap (an unrecognized manager with no table loaded at install time).
 
 It also **synthesizes a `[zones]` policy** from the box's existing intent — most usefully by parsing
 an existing (even *disabled*) `ufw` rule set (`ufw show added`) into zones. You see the proposal and

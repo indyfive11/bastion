@@ -15,6 +15,24 @@ All notable changes to this project are documented here. The format is based on
   yet still proposes cooperative, and the manager is named in the wizard's scope prompt. The runtime
   foreign-table catch-all remains the backstop for anything unrecognized.
 
+### Fixed
+
+- **`layer install l2` no longer claims to have started crowdsec when the package is absent.** With
+  no `crowdsec` package the service unit doesn't exist, yet the installer still printed
+  "crowdsec.service enabled + started". It now skips the enable and says the package is absent, and
+  reports a warning (instead of a success line) if `systemctl enable --now` fails.
+- **`layer install l2` warns when CrowdSec's LAPI port is already taken.** CrowdSec's local API
+  defaults to `127.0.0.1:8080`; on a box where `:8080` is in use the daemon FATALs "address already
+  in use" on start while the enable appears to succeed. The installer now detects a busy `:8080` and
+  points at the `listen_uri` / credentials move before starting the service.
+- **The nftables loader drop-in re-asserts `Type=oneshot` + `RemainAfterExit=yes` and clears
+  `ExecStop`.** RemainAfterExit makes `systemctl is-active nftables` report `active (exited)` after a
+  successful load (not `inactive`) on any distro base unit, so the unit state truthfully reflects that
+  the ruleset is loaded. Clearing `ExecStop` (some distros ship `nft flush ruleset` there) keeps a
+  `restart`/`stop` from flushing every table — which, now that the unit stays active, would otherwise
+  wipe a co-resident manager's table under cooperative scope. The service is a pure loader; tear-down
+  stays bastion's scope-aware job.
+
 ## [1.5.0] - 2026-06-18
 
 Bastion becomes a general firewall **detect → synthesize → apply engine**. It can now firewall the

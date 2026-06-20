@@ -324,6 +324,13 @@ def test_l0_install_pins_nftables_loader_path(tmp_path):
     body = drop.read_text()
     assert "ExecStart=\n" in body                       # reset before re-setting (systemd idiom)
     assert "-f /etc/nftables.conf" in body
+    # The drop-in re-asserts oneshot+RemainAfterExit so the unit reads `active (exited)` after a
+    # successful load (not `inactive`) on any distro base unit — `is-active` then reflects reality.
+    assert "Type=oneshot\n" in body
+    assert "RemainAfterExit=yes\n" in body
+    # ...and clears any distro ExecStop (some ship `nft flush ruleset`): with RemainAfterExit=yes a
+    # stop/restart would otherwise flush every table, wiping a co-resident manager's under cooperative.
+    assert "ExecStop=\n" in body
 
 
 def test_l0_uninstall_removes_loader_dropin(tmp_path):
