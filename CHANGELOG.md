@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-06-19
+
+### Fixed
+
+- **The wheel now ships the `templates/logrotate/` files, so packaged `layer install l1`/`l3` no longer
+  crash.** The package-data spec listed template subdirectories explicitly and never named
+  `templates/logrotate/`, so those two extensionless files were absent from every wheel since v1.1.0 —
+  a packaged install (`yay -S bastionfw`) hit `FileNotFoundError` in `install_logrotate`. Every live
+  install to date was from the source tree or the pre-logrotate v1.0.0 wheel, so it stayed latent until
+  a real packaged install on a host surfaced it. The spec now uses a recursive `templates/**/*` glob,
+  and a new `test_packaging` regression guard asserts every file under `scripts/` + `templates/` is
+  covered by the wheel's package-data.
+
 ## [1.5.1] - 2026-06-19
 
 A polish release: more accurate L2/CrowdSec install reporting, a forward-looking detector for

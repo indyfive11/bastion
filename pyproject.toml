@@ -31,4 +31,7 @@ include = ["bastion*"]
 [tool.setuptools.package-data]
 # Operational scripts + config templates ship inside the wheel so an installed
 # `bastion setup` can find them (resolved package-relative in cli.find_*_dir).
-bastion = ["scripts/*", "templates/*", "templates/systemd/*", "machine.conf.example"]
+# templates/**/* is recursive so EVERY template subdir ships (systemd/, logrotate/, and any
+# future one) — an explicit per-subdir list silently dropped templates/logrotate/* before. The
+# test_packaging regression guard asserts this spec covers every file under scripts/ + templates/.
+bastion = ["scripts/*", "templates/*", "templates/**/*", "machine.conf.example"]
