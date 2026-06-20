@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bastionfw"
-version = "1.5.1"
+version = "1.5.2"
 description = "Modular, layered Linux firewall framework with an operator CLI, optional AI analysis layer, and an intelligent setup wizard."
 readme = "README.md"
 requires-python = ">=3.11"
