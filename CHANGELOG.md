@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.6] - 2026-06-21
+
+Watchdog failover-resilience hardening, driven by a live incident: an upstream VPN far-end (an
+edge node's relay tunnel) died and the **prototype** self-heal logic that bastion's `edge-watchdog`
+descends from would have locked the LAN off the internet — the "heal" loop *was* the outage. bastion's
+watchdog was already well ahead of that prototype (it has no conntrack-parse bug, preserves the
+recovery table across a reload, is mode-aware, and treats ISP outages as alert-only), but it still
+shared latent gaps on an edge node with a relay configured. Those are closed here, generically and
+config-driven (no hardcoded topology). bastion deliberately does **not** implement forced-tunnel VPN
+egress; this is purely about the watchdog never thrashing.
+
+### Fixed
+
+- **A down relay/tunnel interface is no longer treated as "our config broken."** A WireGuard tunnel is
+  connectionless, so the interface vanishing means the far-end is gone — an upstream condition a local
+  heal or rollback can never repair (re-asserting a dead-tunnel dependency is exactly what loops). The
+  `relay-iface-down` fault was removed from `config_ok`; relay forward health stays evidence-based
+  (active LAN flows with zero replies), and a dead relay with a working direct-WAN fallback is normal.
+- **`heal_light` no longer flushes live state on a hot poll.** When bastion's table is present it now
+  only refills the reconciler-managed sets (no ruleset reload); it recreates the table from the static
+  config **only when the table is actually gone** (the preamble flush is then moot). Previously, in
+  exclusive scope, a per-poll reload briefly dropped all NAT/conntrack.
+- **Heals are cooldown-gated.** A new `HEAL_COOLDOWN` (default 900s) floor, stamped per incident (so a
+  light→full escalation within one incident still runs), makes the watchdog structurally unable to
+  re-heal in a tight loop when the cause is something a heal can't fix.
+
 ## [1.5.5] - 2026-06-21
 
 The third VPS dogfood wave: an in-place 1.5.4 upgrade on the production box (fully armed cooperative,

@@ -6,7 +6,13 @@
 #     footgun that caused the 2026-06-05 edge<->UFW flap)
 #   * us-vs-ISP discrimination: upstream/ISP outages => ALERT ONLY, never roll back
 #     (a rollback can't fix an upstream outage; avoid churn)
-#   * graduated heal: cheapest first (atomic nft reload) -> full net-rollback
+#   * desired-state aware: a DOWN relay/tunnel interface is upstream, NOT "our config
+#     broken" — never heals/rolls back to repair it (a heal can't revive a dead far-end)
+#   * graduated heal, but flush-averse + cooldown-gated: reload the static ruleset ONLY
+#     when the table is actually GONE (never flush live NAT/conntrack on a hot poll); when
+#     the table is present, just refill the reconciler-managed sets. HEAL_COOLDOWN floor
+#     between heals so a heal that can't fix the cause can't thrash (the failover-lockout
+#     class: forced-tunnel far-end dies -> dead-relay "heal" loop IS the outage).
 #   * closes the LAN-client blind spot via conntrack (node self-egress can be green
 #     while LAN clients are cut)
 #   * firewall-aware: reuses /var/lib/net-safe snapshot + net-{snapshot,rollback}
@@ -17,7 +23,7 @@
 #
 # Modes:  edge-watchdog          -> daemon loop
 #         edge-watchdog once     -> single evaluation (testing)
-# Env:    POLL, EGRESS_FAIL_TRIPS, REFRESH_AFTER, WAN_DOWN_BACKOFF, DRYRUN=1 (log, don't act)
+# Env:    POLL, EGRESS_FAIL_TRIPS, REFRESH_AFTER, WAN_DOWN_BACKOFF, HEAL_COOLDOWN, DRYRUN=1 (log, don't act)
 # Test hooks (in $RUN): simulate-egress-dead, simulate-isp-down,
 #         simulate-config-broken, simulate-lan-broken, simulate-wan-carrier-down
 # Pause:  touch /run/edge-watchdog/pause   (or /etc/edge-watchdog/disabled)
@@ -34,6 +40,7 @@ POLL=${POLL:-30}
 EGRESS_FAIL_TRIPS=${EGRESS_FAIL_TRIPS:-3}     # consecutive fails before acting (~90s @30s)
 REFRESH_AFTER=${REFRESH_AFTER:-1800}          # re-snapshot known-good after this many stable sec
 WAN_DOWN_BACKOFF=${WAN_DOWN_BACKOFF:-300}     # while WAN carrier is physically down: re-log at most this often
+HEAL_COOLDOWN=${HEAL_COOLDOWN:-900}           # anti-thrash floor: minimum seconds between firewall heals
 DRYRUN=${DRYRUN:-0}
 
 # Machine-specific values are sourced from the bastion-generated env file
@@ -113,7 +120,11 @@ config_ok(){
   else
     iptables -t nat -C POSTROUTING -s "$LAN_NET" -o "$RELAY_IF" -j MASQUERADE 2>/dev/null || { echo "relay-masq-missing(ufw)"; return 1; }
   fi
-  ip link show "$RELAY_IF" >/dev/null 2>&1            || { echo "relay-iface-down"; return 1; }
+  # A DOWN relay/tunnel interface is NOT "our config broken": a wg tunnel is connectionless, so the
+  # iface vanishing means the far-end (the VPS) is gone — an upstream/desired-state condition a local
+  # heal or rollback can NEVER repair (it would only thrash, re-asserting a dead-tunnel dependency —
+  # the failover-lockout class). Relay forward health is judged by evidence instead (lan_relay_broken);
+  # a dead relay with a working direct-WAN fallback is normal. So config_ok no longer fails here.
   ip route show default | grep -q .                  || { echo "default-route-missing"; return 1; }
   return 0
 }
@@ -196,28 +207,47 @@ dns_leak_watch(){
   fi
 }
 
+# ---------- heal cooldown (anti-thrash) ----------
+# A heal that can't fix the cause (a dead upstream tunnel) must NOT re-fire every poll — that
+# tight loop, each reloading/rolling-back shared state, IS the failover-lockout outage. heal_allowed
+# enforces a hard floor; evaluate() alerts-and-observes instead of re-healing inside the window.
+# Stamped per incident (mark_healed) so a light->full escalation within one incident still runs.
+heal_allowed(){
+  local now last
+  now=$(date +%s); last=$(cat "$RUN/last-heal" 2>/dev/null || echo 0)
+  [ $((now - last)) -ge "$HEAL_COOLDOWN" ]
+}
+mark_healed(){ date +%s > "$RUN/last-heal"; }
+
 # ---------- heals (graduated) ----------
-heal_light(){   # cheapest: atomic reload of the governing firewall's config (re-adds relay rules)
-  if nft list table inet edge >/dev/null 2>&1 || [ -f "$SNAP/fw-nftables-active" ]; then
-    # $NFT_CONF begins with a reset preamble (exclusive: `flush ruleset`; cooperative: a delete of
-    # bastion's own tables). A plain `nft -f $NFT_CONF` would therefore ALSO wipe two things the
-    # static file does not own: in EXCLUSIVE mode the live `inet bastion_recovery` table (severing
-    # emergency SSH at the worst possible moment — mid-recovery), and the managed blocklist sets
-    # (cs_block/blk_feed/ai_*), leaving the node unprotected until the next reconcile (≤ a full
-    # interval). Avoid both: if recovery is active, fold its current table definition into the SAME
-    # atomic transaction so it survives the flush; then immediately kick the reconciler to refill
-    # the managed sets rather than waiting for the timer.
+heal_light(){   # cheapest heal: refill managed sets if the table is LIVE; recreate it only if GONE
+  # INVARIANT — no flush in a hot path: if bastion's table is PRESENT, never reload $NFT_CONF. Its
+  # preamble (`flush ruleset` in exclusive scope) would drop ALL live NAT + conntrack for the reload
+  # window, and on a fast poll that drop IS the outage. A present table just needs its reconciler-
+  # managed sets (cs_block/blk_feed/ai_*) refilled — that is the reconciler's job (Commandment #7),
+  # not a ruleset reload. Only when the table is actually GONE do we recreate it from the static file
+  # (the preamble flush is then moot — nothing live to drop).
+  if nft list table inet edge >/dev/null 2>&1; then
+    systemctl start edge-reconciler.service >/dev/null 2>&1 \
+      || /usr/local/sbin/edge-reconciler >/dev/null 2>&1 || true
+    log "heal: edge table present — refilled managed sets via reconciler (no ruleset reload, no flush)"
+    return
+  fi
+  if [ -f "$SNAP/fw-nftables-active" ]; then
+    # The table is MISSING — recreate it from the static config. Fold the live `inet bastion_recovery`
+    # table (if a recovery window is open) into the SAME atomic transaction so the reload can't strand
+    # emergency SSH, then kick the reconciler to refill the managed sets rather than waiting for the timer.
     local script rec
     script=$(cat "$NFT_CONF" 2>/dev/null) || { log "heal: cannot read $NFT_CONF — reload skipped"; return; }
     if [ -e "$RECOVERY_RUN" ] && rec=$(nft -s list table inet bastion_recovery 2>/dev/null) && [ -n "$rec" ]; then
       script="$script"$'\n'"$rec"
     fi
     if printf '%s\n' "$script" | nft -f - 2>/dev/null; then
-      log "heal: reloaded edge nft config (recovery table preserved; repopulating managed sets)"
+      log "heal: edge table was MISSING — recreated from static config (recovery preserved; refilling sets)"
       systemctl start edge-reconciler.service >/dev/null 2>&1 \
         || /usr/local/sbin/edge-reconciler >/dev/null 2>&1 || true
-      # C1: the reload recreated the main table fresh, dropping recovery's main-table reachability
-      # accept. If a recovery window is open, re-punch it (the override table was folded back above).
+      # The fresh main table dropped recovery's main-table reachability accept; if a recovery window
+      # is open, re-punch it (the override table was folded back above).
       [ -e "$RECOVERY_RUN" ] && /usr/local/sbin/bastion-recovery reassert >/dev/null 2>&1 || true
     else
       log "heal: nft reload FAILED"
@@ -250,10 +280,15 @@ evaluate(){
       alert "WAN carrier/egress recovered (${WAN_IF:-wan} back up) — resuming normal watch"
     fi
     if lan_relay_broken; then
+      if ! heal_allowed; then
+        alert "LAN-client relay degraded but within ${HEAL_COOLDOWN}s heal cooldown — observing, not re-churning (a heal can't revive a dead far-end)"
+        return
+      fi
       alert "egress OK but LAN-client relay degraded (clients sending, zero replies) — light heal"
       [ "$DRYRUN" = 1 ] && { log "[DRYRUN] would heal_light (relay forward)"; return; }
       heal_light; sleep 3
       lan_relay_broken && alert "LAN relay STILL degraded after light heal — escalating to full rollback" && heal_full
+      mark_healed
       return
     fi
     dns_leak_watch
@@ -295,11 +330,16 @@ evaluate(){
   local cfg rc
   cfg=$(config_ok); rc=$?
   if [ "$rc" -ne 0 ]; then
+    if ! heal_allowed; then
+      alert "sustained egress loss + OUR config broken (${cfg}) but within ${HEAL_COOLDOWN}s heal cooldown — observing, NOT re-healing (anti-thrash: a heal that didn't fix it must not loop)"
+      fails=0; return
+    fi
     alert "sustained egress loss + OUR config broken (${cfg}) — self-healing"
     if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would heal_light, verify egress, then heal_full if still down"; fails=0; return; fi
     heal_light; sleep 5
-    if egress_ok; then alert "recovered after light heal"; fails=0; return; fi
+    if egress_ok; then alert "recovered after light heal"; mark_healed; fails=0; return; fi
     heal_full; sleep 5
+    mark_healed
     if egress_ok; then alert "recovered after full rollback"; else alert "STILL DOWN after full rollback — MANUAL intervention needed"; fi
     fails=0; return
   fi
@@ -310,9 +350,13 @@ evaluate(){
     fails=0; return
   fi
   if ! gateway_ok; then
+    if ! heal_allowed; then
+      alert "sustained egress loss + gateway UNREACHABLE but within ${HEAL_COOLDOWN}s heal cooldown — observing, no rollback (anti-thrash)"
+      fails=0; return
+    fi
     alert "sustained egress loss + gateway UNREACHABLE + config intact — full rollback (local recovery: addr/route/fw)"
     if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would heal_full (local recovery)"; fails=0; return; fi
-    heal_full; sleep 5; egress_ok && alert "recovered after rollback"
+    heal_full; sleep 5; mark_healed; egress_ok && alert "recovered after rollback"
     fails=0; return
   fi
   # gateway up, some external reachable via ICMP, but our HTTPS egress down: relay far-end / VPS / DNS.
