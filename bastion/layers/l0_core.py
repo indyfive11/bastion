@@ -45,6 +45,9 @@ class L0Core(Layer):
 
     # Edge IP-forwarding sysctl drop-in. Without it the forward chain (incl. the v6 rules) is inert.
     FORWARD_SYSCTL = "/etc/sysctl.d/99-bastion-forward.conf"
+    # F12: marker written ONLY when L0 enables a previously-DISABLED nftables.service, so uninstall
+    # disables it again (and leaves a box that never used the nft loader as it found it).
+    NFT_ENABLED_MARKER = "/etc/bastion/.nftables-enabled-by-bastion"
 
     @staticmethod
     def _nft_path(sys) -> str:
@@ -146,6 +149,12 @@ class L0Core(Layer):
             # to a direct (non-persistent) load only if the service can't be driven.
             conf = str(sys.path("/etc/nftables.conf"))
             if sys.run("nft", "-c", "-f", conf).returncode == 0:
+                if not sys.unit_enabled("nftables"):
+                    # nftables.service wasn't enabled before us — record that WE turned it on, so
+                    # uninstall can turn it back off (F12). If it was already enabled, leave that be.
+                    marker = sys.path(self.NFT_ENABLED_MARKER)
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("1\n")
                 enabled = sys.run("systemctl", "enable", "nftables").returncode == 0
                 loaded = sys.run("systemctl", "restart", "nftables").returncode == 0
                 if not (enabled and loaded):
@@ -169,11 +178,22 @@ class L0Core(Layer):
         if sys.is_live:
             sys.run("systemctl", "stop", "bastion-recovery")
             sys.run("systemctl", "disable", "--now", self.REAP_UNIT)
-            # Stop persisting our ruleset (install() enabled it) so the flushed table is not
-            # reloaded from /etc/nftables.conf on the next boot.
-            sys.run("systemctl", "disable", "nftables")
+            # F12: restore nftables.service to its pre-bastion enabled-state — disable it ONLY if WE
+            # enabled it (marker present). If it was already enabled before us, leave it enabled.
+            if sys.path(self.NFT_ENABLED_MARKER).exists():
+                sys.run("systemctl", "disable", "nftables")
+                sys.path(self.NFT_ENABLED_MARKER).unlink(missing_ok=True)
             family, table = self._nft_table(ctx)
             sys.run("nft", "delete", "table", family, table)
+        # Don't leave a dangling loader (F11/F12): restore a foreign /etc/nftables.conf we backed up
+        # (F4) so a still-enabled nftables.service reloads the operator's ruleset; else remove our own
+        # so the service doesn't fail at boot on a missing file.
+        nft_conf, backup = sys.path("/etc/nftables.conf"), sys.path("/etc/nftables.conf.pre-bastion")
+        if backup.exists():
+            nft_conf.write_text(backup.read_text())
+            backup.unlink(missing_ok=True)
+        else:
+            nft_conf.unlink(missing_ok=True)
         # Remove the forwarding sysctl drop-in so it doesn't persist across reboot. (The running
         # kernel keeps its current ip_forward value until a reboot or an explicit `sysctl -w`; we
         # don't force it off live, which could disrupt traffic mid-teardown.)

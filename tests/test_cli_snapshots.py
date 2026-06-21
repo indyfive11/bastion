@@ -56,14 +56,35 @@ def test_valid_snapshot_name():
 
 def test_snapshot_with_name_saves_named_copy(tmp_path, monkeypatch):
     _seed_sbin(tmp_path, "net-snapshot")
-    _seed_canonical(tmp_path, marker="canon-content")
+    canon = _seed_canonical(tmp_path, taken="2026-06-15T10:00:00+00:00", marker="auto-content")
     sys_ = _ctx(monkeypatch, RecordingSystem(tmp_path))
     args = cli.build_parser().parse_args(["snapshot", "--name", "before-ssh", "--root", str(tmp_path)])
     assert cli.cmd_snapshot(args) == 0
-    # net-snapshot was invoked, and the canonical slot was copied to the named location.
-    assert any(str(c[0]).endswith("/net-snapshot") for c in sys_.calls)
-    named = tmp_path / "var/lib/net-safe/snapshots/before-ssh"
-    assert (named / "marker").read_text() == "canon-content"
+    # F10: net-snapshot is invoked with the NAMED slot as its target ($1), and the AUTO slot is left
+    # untouched — a named snapshot must never clobber the rollback target.
+    call = next(c for c in sys_.calls if str(c[0]).endswith("/net-snapshot"))
+    assert call[1].endswith("/var/lib/net-safe/snapshots/before-ssh")
+    assert (canon / "taken-at").read_text() == "2026-06-15T10:00:00+00:00\n"   # auto slot unchanged
+    assert (canon / "marker").read_text() == "auto-content"
+
+
+def test_snapshot_rejects_reserved_name(tmp_path, monkeypatch, capsys):
+    _seed_sbin(tmp_path, "net-snapshot")
+    sys_ = _ctx(monkeypatch, RecordingSystem(tmp_path))
+    args = cli.build_parser().parse_args(["snapshot", "--name", "current", "--root", str(tmp_path)])
+    assert cli.cmd_snapshot(args) == 1
+    assert "reserved" in capsys.readouterr().err
+    assert sys_.calls == []                                   # never ran net-snapshot
+
+
+def test_rollback_current_restores_auto_slot(tmp_path, monkeypatch):
+    # F10 cosmetic: `bastion rollback current` restores the auto slot (no "no named snapshot" error).
+    _seed_sbin(tmp_path, "net-rollback")
+    _seed_canonical(tmp_path, marker="auto")
+    sys_ = _ctx(monkeypatch, RecordingSystem(tmp_path))
+    args = cli.build_parser().parse_args(["rollback", "current", "--root", str(tmp_path)])
+    assert cli.cmd_rollback(args) == 0
+    assert any(str(c[0]).endswith("/net-rollback") for c in sys_.calls)
 
 
 def test_snapshot_rejects_bad_name(tmp_path, monkeypatch, capsys):

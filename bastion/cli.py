@@ -687,24 +687,33 @@ def _snapshot_taken_at(d: Path) -> str:
     return f.read_text().strip() if f.exists() else "?"
 
 
+_RESERVED_SNAPSHOT_NAMES = ("current", "auto")   # labels for the auto slot — not nameable
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    """Capture known-good network/firewall state (net-snapshot). With --name, also save it as a
-    named snapshot you can roll back to later."""
+    """Capture known-good network/firewall state (net-snapshot). Without --name, refresh the AUTO
+    slot (the rollback target the watchdog maintains). With --name, capture straight into that named
+    slot — the auto slot is left untouched (F10: a named snapshot must never clobber the rollback
+    target)."""
     ctx = build_context(args)
     sys_ = ctx.system
     name = getattr(args, "name", None)
-    if name and not _valid_snapshot_name(name):
+    if not name:
+        return _run_sbin(ctx, "net-snapshot")        # auto slot (root-enforced)
+    if name in _RESERVED_SNAPSHOT_NAMES:
+        print(f"bastion snapshot: {name!r} is reserved for the auto slot — pick another name "
+              "(or `bastion snapshot` with no --name to refresh the auto slot)", file=sys.stderr)
+        return 1
+    if not _valid_snapshot_name(name):
         print(f"bastion snapshot: invalid name {name!r} (letters/digits/._- , up to 64 chars)",
               file=sys.stderr)
         return 1
-    rc = _run_sbin(ctx, "net-snapshot")          # refresh the canonical slot (root-enforced)
-    if rc != 0 or not name:
-        return rc
-    if not _save_named_snapshot(sys_, name):
-        print(f"bastion snapshot: net-snapshot produced no {_SNAP_CANON} to name", file=sys.stderr)
-        return 1
-    print(f"bastion snapshot: saved named snapshot '{name}' -> {_SNAP_NAMED}/{name}")
-    return 0
+    # Capture DIRECTLY into the named slot — net-snapshot takes the target dir as $1, so the auto
+    # slot (/var/lib/net-safe/snapshot) is never refreshed/overwritten by a named capture.
+    rc = _run_sbin(ctx, "net-snapshot", str(sys_.path(f"{_SNAP_NAMED}/{name}")))
+    if rc == 0:
+        print(f"bastion snapshot: saved named snapshot '{name}' -> {_SNAP_NAMED}/{name}")
+    return rc
 
 
 def cmd_snapshots(args: argparse.Namespace) -> int:
@@ -729,6 +738,10 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     sys_ = ctx.system
     name = getattr(args, "name", None)
     reason = getattr(args, "reason", None) or (f"rollback:{name}" if name else "manual")
+    # "current"/"auto" name the auto slot, which net-rollback already restores by default — accept
+    # them (instead of erroring "no named snapshot 'current'") and fall through to the plain path.
+    if name in _RESERVED_SNAPSHOT_NAMES:
+        name = None
     if name:
         if not _valid_snapshot_name(name):
             print(f"bastion rollback: invalid name {name!r}", file=sys.stderr)
@@ -742,6 +755,42 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         print(f"bastion rollback: restored named snapshot '{name}' to the active slot; "
               "running net-rollback...")
     return _run_sbin(ctx, "net-rollback", reason)
+
+
+def cmd_teardown(args: argparse.Namespace) -> int:
+    """Full teardown: uninstall every installed layer (reverse order, so dependents go before L0) and
+    remove bastion's runtime config (`/etc/bastion`, `/etc/edge-*`), with L0's uninstall restoring
+    nftables.service to its pre-bastion state. The clean counterpart to `bastion setup` — and what the
+    package's pre_remove hook runs, so `pacman -R` leaves no stale config/units behind (F11)."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    if sys_.is_live and not _require_root(sys_, "bastion teardown"):
+        return 1
+    installed = [lid for lid in layermod.REGISTRY
+                 if (ly := layermod.get(lid)) and ly.status(ctx).installed]
+    if not getattr(args, "yes", False):
+        print("bastion teardown will UNINSTALL all installed layers and remove /etc/bastion + "
+              "/etc/edge-* config.")
+        print(f"  installed layers: {', '.join(installed) or '(none)'}")
+        if input("  type 'teardown' to confirm: ").strip() != "teardown":
+            print("aborted — nothing changed.")
+            return 1
+    for lid in reversed(installed):
+        try:
+            print(f"  uninstalling {lid}...")
+            layermod.get(lid).uninstall(ctx)
+        except Exception as exc:                       # noqa: BLE001 — keep tearing down on error
+            print(f"  ! {lid} uninstall error: {exc} (continuing)")
+    if not getattr(args, "keep_config", False):
+        for d in ("/etc/bastion", "/etc/edge-reconciler", "/etc/edge-ai"):
+            p = sys_.path(d)
+            if p.exists():
+                shutil.rmtree(p, ignore_errors=True)
+                print(f"  removed {d}")
+    if sys_.is_live:
+        sys_.run("systemctl", "daemon-reload")
+    print("bastion teardown: complete.")
+    return 0
 
 
 # P4: deadman cutover. `bastion switch` applies the bastion ruleset behind an auto-reverting timer so
@@ -1376,6 +1425,15 @@ def build_parser() -> argparse.ArgumentParser:
     rb.add_argument("--conf", help="path to machine.conf")
     rb.add_argument("--root", help="operate under this base dir instead of /")
     rb.set_defaults(func=cmd_rollback)
+
+    td = sub.add_parser("teardown", help="full uninstall: remove all layers + bastion config "
+                        "(the clean counterpart to `setup`)")
+    td.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    td.add_argument("--keep-config", action="store_true", dest="keep_config",
+                    help="keep /etc/bastion + /etc/edge-* config dirs (remove only layers/units)")
+    td.add_argument("--conf", help="path to machine.conf")
+    td.add_argument("--root", help="operate under this base dir instead of /")
+    td.set_defaults(func=cmd_teardown)
 
     cf = sub.add_parser("confirm", help="confirm egress is stable, then disarm the watchdog (net-confirm)")
     cf.add_argument("--conf", help="path to machine.conf")

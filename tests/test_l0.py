@@ -344,12 +344,28 @@ def test_l0_uninstall_removes_loader_dropin(tmp_path):
     assert not drop.exists()
 
 
-def test_l0_uninstall_disables_nftables(tmp_path):
+def test_l0_uninstall_disables_nftables_only_if_bastion_enabled_it(tmp_path):
+    # F12: uninstall disables nftables.service ONLY when bastion enabled it (marker present), so a box
+    # that already used the nft loader is left enabled.
+    from bastion.layers.l0_core import L0Core
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    marker = sysobj.path(L0Core.NFT_ENABLED_MARKER)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("1\n")
+    layers.get("l0").uninstall(ctx)
+    assert ("systemctl", "disable", "nftables") in sysobj.calls       # we enabled it -> disable
+    assert not marker.exists()                                        # marker cleared
+
+
+def test_l0_uninstall_keeps_preexisting_nftables_enabled(tmp_path):
+    # No marker = nftables.service was already enabled before bastion -> leave it alone.
     sysobj = _FwSys(tmp_path, active_fw=None)
     ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
                   templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
     layers.get("l0").uninstall(ctx)
-    assert ("systemctl", "disable", "nftables") in sysobj.calls
+    assert ("systemctl", "disable", "nftables") not in sysobj.calls
 
 
 def test_nft_health_unknown_when_live_and_nonroot():
@@ -448,3 +464,50 @@ def test_warn_if_foreign_nftables_conf_noop_when_staged(tmp_path):
     (tmp_path / "etc/nftables.conf").write_text("table inet filter {}\n")
     assert base.warn_if_foreign_nftables_conf(System(root=tmp_path), "endpoint",
                                               out=lambda *_: None) is None
+
+
+# --- F11/F12: teardown + nftables.conf restore on uninstall ------------------------------------
+
+def test_l0_uninstall_restores_foreign_nftables_backup(tmp_path):
+    # F12: a foreign /etc/nftables.conf backed up by F4 is restored on uninstall (so a still-enabled
+    # nftables.service reloads the operator's ruleset, not a dangling/empty file).
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    (tmp_path / "etc").mkdir(exist_ok=True)
+    (tmp_path / "etc/nftables.conf").write_text("table inet bastion {}\n")
+    (tmp_path / "etc/nftables.conf.pre-bastion").write_text("table inet filter {}\n")
+    layers.get("l0").uninstall(ctx)
+    assert (tmp_path / "etc/nftables.conf").read_text() == "table inet filter {}\n"
+    assert not (tmp_path / "etc/nftables.conf.pre-bastion").exists()
+
+
+def test_l0_uninstall_removes_own_nftables_conf_when_no_backup(tmp_path):
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    ctx = Context(system=sysobj, config=state.load_conf(EXAMPLE),
+                  templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    (tmp_path / "etc").mkdir(exist_ok=True)
+    (tmp_path / "etc/nftables.conf").write_text("table inet bastion {}\n")
+    layers.get("l0").uninstall(ctx)
+    assert not (tmp_path / "etc/nftables.conf").exists()
+
+
+def test_teardown_removes_config_dirs(tmp_path):
+    # F11: `bastion teardown` removes the runtime config dirs `pacman -R` leaves behind. No layers are
+    # "installed" under this empty staged root, so only the config-dir cleanup runs.
+    for d in ("etc/bastion", "etc/edge-ai", "etc/edge-reconciler"):
+        (tmp_path / d).mkdir(parents=True)
+        (tmp_path / d / "f").write_text("x")
+    rc = cli.main(["teardown", "--yes", "--root", str(tmp_path), "--conf", str(tmp_path / "none.conf")])
+    assert rc == 0
+    assert not (tmp_path / "etc/bastion").exists()
+    assert not (tmp_path / "etc/edge-ai").exists()
+    assert not (tmp_path / "etc/edge-reconciler").exists()
+
+
+def test_teardown_keep_config(tmp_path):
+    (tmp_path / "etc/bastion").mkdir(parents=True)
+    rc = cli.main(["teardown", "--yes", "--keep-config", "--root", str(tmp_path),
+                   "--conf", str(tmp_path / "none.conf")])
+    assert rc == 0
+    assert (tmp_path / "etc/bastion").exists()                # --keep-config preserves it

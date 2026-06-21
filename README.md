@@ -310,6 +310,20 @@ bastion confirm                    # still have access? lock it in (cancels the 
 Use it for any risky cutover (turning a box into an edge router, applying synthesized zones, flipping
 ownership mode). `--dry-run` previews without applying or arming anything.
 
+> **`switch` reloads the firewall; it does not install layers.** It's for applying a *config change*
+> to an already-installed box. For a **first install**, use `bastion setup` — it installs and arms
+> every layer (feeds, watchdog, …) behind the same auto-reverting deadman. To review the rendered
+> ruleset before that first apply, run `sudo bastion setup --stage-only` (writes + generates config,
+> loads nothing), then re-run `sudo bastion setup` (without `--stage-only`) to apply. Don't reach for
+> `switch` as the first apply — it would load the base ruleset but leave the layer daemons unstarted.
+
+### Cleanly removing bastion
+
+`bastion teardown` is the counterpart to `setup`: it uninstalls every layer (restoring
+`nftables.service` to the state it was in before bastion enabled it) and removes `/etc/bastion` +
+`/etc/edge-*`. The AUR package runs it on `pacman -R`, so removal leaves no stale config or units
+behind. `--keep-config` removes the layers/units but preserves your `machine.conf`.
+
 ### DNS-leak guard (edge mode)
 
 When the hardened local resolver chain is expected (a loopback `dns_upstream`), the L6 watchdog
@@ -326,6 +340,7 @@ bastion never rewrites your resolver config.
 | `bastion status [--health]` | per-layer install / active / health |
 | `bastion tui` | live dashboard (layer health, set counts, AI state, audit tail) + a command palette for every operation, with confirmation gating — a single confirm for state changes and a typed confirmation for destructive ones (layer teardown, firewall reload, network rollback) |
 | `bastion layer <install\|uninstall\|status> <id>` | manage a single layer |
+| `bastion teardown` | full uninstall — remove all layers + config, restore `nftables.service` (counterpart to `setup`) |
 | `bastion firewall <reload\|status>` | reconcile / inspect the nft ruleset |
 | `bastion zones <list\|add\|remove>` | manage inbound `source → action` zones |
 | `bastion switch [--minutes N]` | apply a firewall change behind an auto-reverting deadman (cutover safety) |

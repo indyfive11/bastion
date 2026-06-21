@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.4] - 2026-06-20
+
+The second wave of the VPS dogfood: live re-validation of 1.5.3 on the production box **confirmed
+cooperative coexistence with UFW** (the WireGuard relay and every service stayed up while bastion's
+table loaded alongside) and surfaced a tier of lifecycle/hygiene gaps, fixed here.
+
+### Added
+
+- **`bastion teardown`** — the clean counterpart to `bastion setup`: uninstalls every layer (restoring
+  `nftables.service` to its pre-bastion state) and removes `/etc/bastion` + `/etc/edge-*`. The AUR
+  package runs it from a `pre_remove` hook, so `pacman -R bastionfw` leaves no stale config or units
+  behind. `--keep-config` removes layers/units but preserves `machine.conf`.
+
+### Fixed
+
+- **A named snapshot no longer destroys the rollback target.** `bastion snapshot --name X` used to
+  refresh the auto slot and then copy it, so it overwrote the pre-install auto-snapshot that
+  `bastion rollback` restores. Named snapshots now capture straight into their own slot; the auto slot
+  is never touched. `bastion rollback current` (and `auto`) is accepted as the auto slot instead of
+  erroring "no named snapshot".
+- **`nftables.service` is restored to its pre-bastion state on uninstall.** L0 records whether the
+  service was already enabled before it turned it on, and uninstall disables it *only* if bastion
+  enabled it — a box that already used the nft loader is left as it was. On uninstall a foreign
+  `/etc/nftables.conf` backed up at install (the v1.5.3 guard) is restored, and otherwise bastion's own
+  file is removed — so a still-enabled `nftables.service` never fails at boot on a missing ruleset.
+
+### Changed
+
+- **`setup --stage-only` now points at `bastion setup` (not `bastion switch`) for the full apply.**
+  `switch` reloads the firewall but does not install layers, so using it as a first apply left the
+  layer daemons (feeds, watchdog) unstarted. The message and the README now make the distinction
+  explicit: `--stage-only` previews; re-running `bastion setup` installs + arms everything behind the
+  deadman; `switch` is for a later config change on an already-installed box.
+
 ## [1.5.3] - 2026-06-20
 
 A dogfood-driven hardening release. Pointing `bastion setup` at a real, public, multi-service VPS

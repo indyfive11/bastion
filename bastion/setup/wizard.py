@@ -1007,11 +1007,15 @@ class Wizard:
         if self.stage_only:
             self.out("  --stage-only: machine.conf + configs written/generated; the firewall was NOT "
                      "loaded and no layers were installed.")
-            self.out("  Review, then apply behind the auto-reverting deadman:  "
-                     "sudo bastion switch --minutes 10")
+            self.out("  Review the rendered /etc/nftables.conf, then APPLY by re-running the full "
+                     "install (it installs + arms every layer behind the auto-reverting deadman):")
+            self.out("      sudo bastion setup           # (re-run without --stage-only)")
+            self.out("  (`bastion switch` only RELOADS the firewall for a later config change — it "
+                     "does NOT install layers, so don't use it as the first apply.)")
             return self._package_plan(config, mode), [
-                "staged only (--stage-only): nothing loaded live. Apply with `sudo bastion switch "
-                "--minutes 10`, then `bastion confirm` within the window."]
+                "staged only (--stage-only): nothing loaded live. APPLY with `sudo bastion setup` "
+                "(re-run without --stage-only) — it installs + arms all layers behind the deadman. "
+                "`bastion switch` is firewall-reload only, not a first install."]
 
         from .. import cli
         from .. import layers as layermod

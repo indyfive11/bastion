@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # net-snapshot — capture current known-good network state for net-rollback.
-# Runs as root (via net-snapshot.service). Writes to /var/lib/net-safe/snapshot.
-STATE=/var/lib/net-safe; SNAP="$STATE/snapshot"
+# Runs as root (via net-snapshot.service). Default target is /var/lib/net-safe/snapshot (the AUTO
+# slot net-rollback + the watchdog use); an optional $1 captures to a different dir instead, so a
+# NAMED snapshot is written straight to its own slot WITHOUT clobbering the auto slot (F10).
+STATE=/var/lib/net-safe; SNAP="${1:-$STATE/snapshot}"
 # NFT_TABLE (inet edge on edge, inet bastion on endpoint) — must match net-rollback's
 # edge_loaded() or the firewall-manager baseline inverts. Generic fallback keeps topology out
 # of the repo; the live node always has machine.env.
