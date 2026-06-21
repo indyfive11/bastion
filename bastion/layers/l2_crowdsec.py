@@ -77,8 +77,11 @@ class L2Crowdsec(Layer):
 
         # CrowdSec's local API defaults to 127.0.0.1:8080; if that port is already taken the daemon
         # FATALs 'address already in use' on start (a silent failure: enable succeeds, start dies).
-        # Warn (don't block) with the concrete fix before we try to start it.
-        if _lapi_port_conflict(sys, LAPI_DEFAULT_PORT):
+        # Warn (don't block) with the concrete fix before we try to start it. But if crowdsec is
+        # ALREADY active it legitimately owns that socket — a re-install/upgrade must NOT warn about
+        # crowdsec's OWN LAPI listener (F14: the self-collision false positive on the install path;
+        # dry-run never tripped it because it skips this live check entirely).
+        if not sys.unit_active(UNIT) and _lapi_port_conflict(sys, LAPI_DEFAULT_PORT):
             print(f"l2: WARNING — TCP :{LAPI_DEFAULT_PORT} is already in use. CrowdSec's local API "
                   f"(LAPI) defaults to 127.0.0.1:{LAPI_DEFAULT_PORT} and will FATAL 'address "
                   "already in use' on start. Move it to a free port in BOTH "

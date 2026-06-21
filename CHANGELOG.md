@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.5] - 2026-06-21
+
+The third VPS dogfood wave: an in-place 1.5.4 upgrade on the production box (fully armed cooperative,
+proven across a reboot **and** an unclean host-side suspension) surfaced two operator-clarity bugs on
+the *install/confirm* paths that the dry-run gate couldn't reach. Both fixed here.
+
+### Fixed
+
+- **F14 — false CrowdSec LAPI `:8080` collision warning on re-install/upgrade.** The L2 install path
+  warned that `127.0.0.1:8080` was busy even when the listener was CrowdSec's *own* already-running
+  LAPI (a self-collision). The address-specific check (F8) is correct; the gap was that an
+  already-active crowdsec legitimately owns the socket. L2 now suppresses the warning when
+  `crowdsec.service` is already active, so an upgrade no longer prints a spurious FATAL warning.
+- **F15 — `bastion confirm` stopped the standing L6 watchdog.** `net-confirm` issued
+  `systemctl stop edge-watchdog.service` — vestigial from before the transient cutover deadman
+  existed. `edge-watchdog` is now the *standing* L6 self-heal (`Restart=always`), so confirming an
+  apply silently left the box without ongoing self-heal until reboot. `net-confirm` no longer stops
+  it; `bastion confirm` disarms only the transient `bastion-switch-deadman` timer (Python-side).
+
 ## [1.5.4] - 2026-06-20
 
 The second wave of the VPS dogfood: live re-validation of 1.5.3 on the production box **confirmed

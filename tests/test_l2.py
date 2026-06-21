@@ -57,11 +57,13 @@ import subprocess
 class _LiveSys(System):
     """A live-claiming System for L2's install branch: scripts cscli presence + ss output and
     records every run() so we can assert whether crowdsec.service was (not) enabled."""
-    def __init__(self, root, *, have_cscli: bool, ss_text: str = "", enable_rc: int = 0):
+    def __init__(self, root, *, have_cscli: bool, ss_text: str = "", enable_rc: int = 0,
+                 cs_active: bool = False):
         super().__init__(root=root)
         self._have_cscli = have_cscli
         self._ss_text = ss_text
         self._enable_rc = enable_rc
+        self._cs_active = cs_active
         self.calls = []
 
     @property
@@ -75,6 +77,8 @@ class _LiveSys(System):
         self.calls.append(tuple(args))
         if args[:2] == ("ss", "-ltnH"):
             return subprocess.CompletedProcess(args, 0, self._ss_text, "")
+        if args[:2] == ("systemctl", "is-active"):
+            return subprocess.CompletedProcess(args, 0 if self._cs_active else 3, "", "")
         if args[:3] == ("systemctl", "enable", "--now"):
             return subprocess.CompletedProcess(args, self._enable_rc, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
@@ -147,3 +151,18 @@ def test_l2_install_no_false_warn_on_other_address(capsys):
     sysobj = _LiveSys(Path("/"), have_cscli=True, ss_text="LISTEN 0 4096 10.0.0.1:8080 0.0.0.0:*\n")
     layers.get("l2").install(_live_ctx(sysobj))
     assert "already in use" not in capsys.readouterr().out
+
+
+def test_l2_install_no_warn_when_crowdsec_already_active(capsys):
+    # F14: on a re-install/upgrade crowdsec is already running and legitimately owns 127.0.0.1:8080.
+    # That listener IS crowdsec's own LAPI — warning about it is a self-collision false positive
+    # (seen live on the VPS 1.5.4 setup path; dry-run was clean because it skips the live check).
+    # When the unit is already active, suppress the warning entirely.
+    ss = "LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:*\n"
+    sysobj = _LiveSys(Path("/"), have_cscli=True, ss_text=ss, cs_active=True)
+    layers.get("l2").install(_live_ctx(sysobj))
+    assert "already in use" not in capsys.readouterr().out
+    # ...but the SAME listener with crowdsec NOT yet active is a genuine conflict and must still warn.
+    sysobj2 = _LiveSys(Path("/"), have_cscli=True, ss_text=ss, cs_active=False)
+    layers.get("l2").install(_live_ctx(sysobj2))
+    assert "already in use" in capsys.readouterr().out

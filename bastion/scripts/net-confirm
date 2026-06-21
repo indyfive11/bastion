@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# net-confirm — confirm egress is genuinely up and STABLE (~45s), then disarm the watchdog
-# (accept the current config as the new baseline). If any check fails it does NOT disarm and
-# exits non-zero, leaving the watchdog armed (fail-safe: uncertainty keeps the rollback net).
-# This is the operator-side "confirm" half of the apply-then-canary pattern.
+# net-confirm — confirm egress is genuinely up and STABLE (~45s). Exit 0 means stable, so the
+# caller (`bastion confirm`) may disarm a pending cutover deadman and accept the current config as
+# the new baseline; any failed check exits non-zero so the caller leaves the rollback net armed
+# (fail-safe: uncertainty keeps the net). This is the operator-side "confirm" half of the
+# apply-then-canary pattern.
+#
+# F15: this does NOT stop edge-watchdog. That unit is the STANDING L6 self-heal (Restart=always,
+# "standing egress/relay self-heal") and must keep running after a confirm — stopping it here left
+# the box with no ongoing self-heal until reboot. The cutover deadman is a SEPARATE transient unit
+# (bastion-switch-deadman) that the caller disarms; this script only reports egress stability.
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
 EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
 PROBE_HOST=${EGRESS_PROBE#*://}; PROBE_HOST=${PROBE_HOST%%/*}
@@ -21,12 +27,11 @@ need(){ local b miss=''
 need curl
 check(){ getent hosts "$PROBE_HOST" >/dev/null 2>&1 && \
          curl -s -o /dev/null --max-time 6 "$EGRESS_PROBE"; }
-log "verifying stable egress before disarm..."
+log "verifying stable egress..."
 for i in 1 2 3 4; do
   if check; then log "egress check $i/4 OK"
   else log "egress check $i/4 FAILED — NOT disarming; watchdog stays armed"; exit 1; fi
   [ "$i" -lt 4 ] && sleep 15
 done
-systemctl stop edge-watchdog.service 2>/dev/null || true
-log "egress stable; watchdog DISARMED. Current config retained as the new baseline."
+log "egress stable; confirm OK. Current config retained as the new baseline."
 exit 0

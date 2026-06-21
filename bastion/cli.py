@@ -874,10 +874,11 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
-    """Confirm egress is genuinely up + stable, then disarm the watchdog (net-confirm). Also cancels
-    a `bastion switch` deadman if one is armed — the operator running this IS the 'I still have
-    access' signal a cutover waits for (P4). Disarm only on a clean net-confirm, so a confirm with
-    egress still down lets the deadman revert."""
+    """Confirm egress is genuinely up + stable (net-confirm), then cancel a `bastion switch`/setup
+    deadman if one is armed — the operator running this IS the 'I still have access' signal a cutover
+    waits for (P4). Cancel only on a clean net-confirm, so a confirm with egress still down lets the
+    deadman revert. Does NOT stop the standing L6 edge-watchdog — that self-heal keeps running (F15);
+    only the transient cutover deadman timer is disarmed."""
     ctx = build_context(args)
     rc = _run_sbin(ctx, "net-confirm")
     if rc == 0 and ctx.system.is_live and ctx.system.is_root:

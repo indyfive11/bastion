@@ -133,3 +133,14 @@ def test_confirm_keeps_deadman_when_egress_still_down(tmp_path, monkeypatch):
     _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
     assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 1
     assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)
+
+
+def test_net_confirm_does_not_stop_standing_watchdog():
+    # F15: `bastion confirm` -> net-confirm must NOT stop edge-watchdog.service. That unit is the
+    # STANDING L6 self-heal (Restart=always, "standing egress/relay self-heal"), not the cutover
+    # deadman — stopping it on confirm left the box with no ongoing self-heal until reboot. The
+    # deadman is a separate transient unit, disarmed Python-side in cmd_confirm. (The header comment
+    # legitimately names the unit to explain the fix, so check executable lines only.)
+    code = [ln for ln in (SCRIPTS / "net-confirm").read_text().splitlines()
+            if not ln.lstrip().startswith("#")]
+    assert not any("edge-watchdog" in ln for ln in code)
