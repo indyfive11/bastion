@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.7] - 2026-06-21
+
+A one-finding follow-up to the 1.5.6 watchdog hardening, surfaced while validating those changes
+live on an endpoint box: a deliberate operator or test-harness environment override of a
+`machine.env`-backed variable (`MODE`, `RELAY_IF`, …) was silently lost, because `edge-watchdog`
+sourced `/etc/bastion/machine.env` *after* applying its `${VAR:-default}` fallbacks — so the source
+overwrote the incoming env. This made `edge-watchdog`'s documented edge-path test seams inert on an
+endpoint host (`MODE` was always forced back to `endpoint`) and would have quietly dropped any
+intentional operator override. No topology values are hardcoded; the fix is generic.
+
+### Fixed
+
+- **Operator/test env overrides now win over `machine.env` in `edge-watchdog`.** Each
+  `machine.env`-backed variable is cached *before* the source and preferred *after*
+  (`VAR=${_OV_VAR:-${VAR:-default}}`), so an explicit `MODE=edge RELAY_IF=… edge-watchdog` override
+  takes effect while an un-overridden variable still takes its `machine.env` value. Variables that
+  `machine.env` never sets (`DRYRUN`, `EGRESS_FAIL_TRIPS`, …) were already safe. Scope is limited to
+  `edge-watchdog`, the only script with an operator-override contract.
+
 ## [1.5.6] - 2026-06-21
 
 Watchdog failover-resilience hardening, driven by a live incident: an upstream VPN far-end (an

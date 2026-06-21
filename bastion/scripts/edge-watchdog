@@ -46,17 +46,28 @@ DRYRUN=${DRYRUN:-0}
 # Machine-specific values are sourced from the bastion-generated env file
 # (`bastion generate` writes /etc/bastion/machine.env from machine.conf). Fallbacks
 # below are generic placeholders so the script never carries a real topology value.
+#
+# F16: a deliberate operator/test env override (e.g. `MODE=edge RELAY_IF=wg0 edge-watchdog`)
+# must WIN over the machine.env value — but `. machine.env` overwrites the incoming env, so a
+# plain `VAR=${VAR:-default}` AFTER the source loses the override. Cache each machine.env-backed
+# var BEFORE sourcing, then prefer the cached override AFTER. Without this the documented edge
+# test seams are inert on an endpoint box (MODE forced back to `endpoint`), and any operator
+# override of a machine.env-backed var is silently lost. Vars machine.env does NOT set (DRYRUN,
+# EGRESS_FAIL_TRIPS, EXT_PINGS, …) already survive — they're defaulted before the source.
+_OV_WAN_IF=${WAN_IF-}; _OV_GATEWAY=${GATEWAY-}; _OV_RELAY_IF=${RELAY_IF-}
+_OV_LAN_NET=${LAN_NET-}; _OV_LAN_IP=${LAN_IP-}; _OV_DNS_UPSTREAM=${DNS_UPSTREAM-}
+_OV_RELAY_DST=${RELAY_DST-}; _OV_MODE=${MODE-}
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
-WAN_IF=${WAN_IF:-}                             # WAN/uplink interface (edge mode; physical-carrier probe)
-GATEWAY=${GATEWAY:-}                           # LAN default gateway IP
-RELAY_IF=${RELAY_IF:-}                         # upstream relay/tunnel interface (optional)
-LAN_NET=${LAN_NET:-}                           # LAN CIDR
-LAN_IP=${LAN_IP:-}                             # this node's LAN IP (DNS-leak local-chain classifier)
-DNS_UPSTREAM=${DNS_UPSTREAM:-}                 # local stub resolver host#port (DNS-leak-watch gate)
-RELAY_DST=${RELAY_DST:-}                       # relay far-end probe target (optional)
+WAN_IF=${_OV_WAN_IF:-${WAN_IF:-}}                    # WAN/uplink interface (edge mode; physical-carrier probe)
+GATEWAY=${_OV_GATEWAY:-${GATEWAY:-}}                 # LAN default gateway IP
+RELAY_IF=${_OV_RELAY_IF:-${RELAY_IF:-}}              # upstream relay/tunnel interface (optional)
+LAN_NET=${_OV_LAN_NET:-${LAN_NET:-}}                 # LAN CIDR
+LAN_IP=${_OV_LAN_IP:-${LAN_IP:-}}                    # this node's LAN IP (DNS-leak local-chain classifier)
+DNS_UPSTREAM=${_OV_DNS_UPSTREAM:-${DNS_UPSTREAM:-}}  # local stub resolver host#port (DNS-leak-watch gate)
+RELAY_DST=${_OV_RELAY_DST:-${RELAY_DST:-}}           # relay far-end probe target (optional)
 EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints (ISP-up signal)
 EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
-MODE=${MODE:-edge}                            # edge | endpoint — endpoint never rolls back (no edge config to repair)
+MODE=${_OV_MODE:-${MODE:-edge}}                      # edge | endpoint — endpoint never rolls back (no edge config to repair)
 
 # need <bin>... — B4 preflight: exit early with a clear message naming any missing required
 # command, instead of failing obscurely mid-run. Reports to stderr + journal.

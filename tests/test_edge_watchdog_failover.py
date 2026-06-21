@@ -9,6 +9,7 @@ redefined as shell functions):
 
 (heal_light's no-flush invariant is guarded separately in test_edge_watchdog_heal.py.)
 """
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -21,6 +22,16 @@ def _func(name: str) -> str:
                          capture_output=True, text=True, check=True).stdout
     assert f"{name}()" in out, f"could not extract {name} from edge-watchdog"
     return out
+
+
+def _vars_block(machine_env: Path) -> str:
+    # Extract the F16 cache->source->restore preamble (the `_OV_*` lines through the MODE= line)
+    # and point its hardcoded source at our temp machine.env so the precedence can be exercised
+    # off-host.
+    block = subprocess.run(["sed", "-n", "/^_OV_WAN_IF=/,/^MODE=/p", str(SCRIPT)],
+                           capture_output=True, text=True, check=True).stdout
+    assert "_OV_MODE" in block and "MODE=" in block, "could not extract F16 vars preamble"
+    return block.replace("/etc/bastion/machine.env", str(machine_env))
 
 
 def test_config_ok_intact_when_only_relay_iface_is_down(tmp_path):
@@ -70,3 +81,31 @@ def test_heal_allowed_enforces_cooldown(tmp_path):
     r = subprocess.run(["bash", "-c", driver], capture_output=True, text=True, check=True)
     assert "fresh=allowed" in r.stdout      # no prior heal -> permitted
     assert "after=blocked" in r.stdout      # just healed -> within cooldown -> refused
+
+
+def test_operator_env_override_wins_over_machine_env(tmp_path):
+    # F16: a deliberate operator/test override (MODE=edge RELAY_IF=…) must survive the machine.env
+    # source. machine.env says endpoint/empty-relay; the operator overrides MODE+RELAY_IF on the
+    # command line and leaves WAN_IF to machine.env. After the preamble the overrides must WIN and
+    # the un-overridden var must still take its machine.env value.
+    env_file = tmp_path / "machine.env"
+    env_file.write_text("MODE='endpoint'\nRELAY_IF=''\nWAN_IF='enp0'\n")
+    driver = "set -u\n" + _vars_block(env_file) + '\necho "MODE=$MODE RELAY_IF=$RELAY_IF WAN_IF=$WAN_IF"\n'
+    r = subprocess.run(["bash", "-c", driver],
+                       env={**os.environ, "MODE": "edge", "RELAY_IF": "wg_test"},
+                       capture_output=True, text=True, check=True)
+    assert "MODE=edge" in r.stdout          # override beats machine.env's endpoint (the test seam works)
+    assert "RELAY_IF=wg_test" in r.stdout   # ditto, even though machine.env set it empty
+    assert "WAN_IF=enp0" in r.stdout        # no override -> machine.env value still used
+
+
+def test_machine_env_used_when_no_operator_override(tmp_path):
+    # No operator override -> the machine.env values must be honored (no regression: the preamble
+    # must not force defaults over a sourced value).
+    env_file = tmp_path / "machine.env"
+    env_file.write_text("MODE='endpoint'\nRELAY_IF='wg_vps'\n")
+    driver = "set -u\n" + _vars_block(env_file) + '\necho "MODE=$MODE RELAY_IF=$RELAY_IF"\n'
+    clean = {k: v for k, v in os.environ.items() if k not in ("MODE", "RELAY_IF")}
+    r = subprocess.run(["bash", "-c", driver], env=clean, capture_output=True, text=True, check=True)
+    assert "MODE=endpoint" in r.stdout      # sourced value wins when no override present
+    assert "RELAY_IF=wg_vps" in r.stdout

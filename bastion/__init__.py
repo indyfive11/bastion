@@ -1,3 +1,3 @@
 """bastion — modular, layered Linux firewall framework."""
 
-__version__ = "1.5.6"
+__version__ = "1.5.7"
