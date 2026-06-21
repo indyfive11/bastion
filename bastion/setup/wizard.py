@@ -43,7 +43,7 @@ DEFAULT_PROFILE = {"edge": "full-edge", "endpoint": "full-endpoint"}
 # any prompt default — the supported way to script/reproduce a setup (e.g. trusted_hosts, which
 # detection cannot know). An unknown key is a hard error, never silently ignored.
 SETTABLE_KEYS: tuple[str, ...] = (
-    "mode", "profile", "layers",
+    "mode", "profile", "layers", "firewall_scope",
     "lan_iface", "wan_iface", "lan_cidr", "lan_ip", "gateway",
     "dhcp_range_start", "dhcp_range_end", "trusted_hosts", "dns_upstream",
     "ssh_port", "ai_depth", "timer_interval", "ai_backend_cmd", "ai_model", "secrets_file",
@@ -320,11 +320,15 @@ class WizardResult:
 
 class Wizard:
     def __init__(self, sys: System, *, dry_run: bool = False, profile: str | None = None,
-                 no_ai: bool = True, inp=input, out=print, assume_defaults: bool | None = None,
+                 no_ai: bool = False, inp=input, out=print, assume_defaults: bool | None = None,
                  example_conf: str | None = None, secret_inp=getpass.getpass,
-                 overrides: dict[str, str] | None = None, bootstrap: bool = False):
+                 overrides: dict[str, str] | None = None, bootstrap: bool = False,
+                 stage_only: bool = False):
         self.sys = sys
         self.dry_run = dry_run
+        # F5: write config + generate, but do NOT load the firewall live (the operator reviews, then
+        # applies behind `bastion switch`'s deadman). The riskiest first-load never runs unattended.
+        self.stage_only = stage_only
         self.profile_arg = profile
         self.no_ai = no_ai
         # D5: soft-recovery. Distrust the existing machine.conf (don't overlay it as the base) and
@@ -451,6 +455,15 @@ class Wizard:
             answers.update(self.overrides)
             out("  applied --set: " + ", ".join(f"{k}={v}" for k, v in self.overrides.items()))
 
+        # F3: --no-ai must actually EXCLUDE the L3 AI layer (not just skip its key prompt). Strip l3
+        # from the resolved layer set — whether it came from a profile or a custom selection — so a
+        # server operator who doesn't want AI is never silently defaulted into it (or its key prompt).
+        if self.no_ai:
+            cur = answers.get("layers") or PROFILE_LAYERS.get(profile, "")
+            if "l3" in cur.split(","):
+                answers["layers"] = ",".join(l for l in cur.split(",") if l != "l3")
+                out("  --no-ai: excluding the L3 AI layer (no API key needed).")
+
         # 5. SECRETS — the L3 API key and the L6 alert sinks: both are operator/secret config written
         #    out-of-band (chmod 600), never into machine.conf.
         out("\n[5/8] Secrets")
@@ -475,6 +488,17 @@ class Wizard:
             self.out("  found an existing machine.conf — preserving settings you didn't change "
                      "(your answers + detection still take precedence).")
         config = build_machine_conf(d, profile, answers, base)
+
+        # F6: a PUBLIC lan_cidr (a VPS whose "local /24" is shared datacenter space) is not
+        # auto-trusted for SSH (the rule is dropped at render) — warn loudly so the operator pins an
+        # explicit admin source and doesn't assume LAN-SSH works.
+        _lc = str((config.get("network") or {}).get("lan_cidr") or "").strip()
+        if mode == "endpoint" and _lc and not templates._is_private_cidr(_lc):
+            _ssh = str((config.get("ports") or {}).get("ssh") or "<ssh-port>")
+            out(f"  !!! WARNING — local subnet {_lc} is PUBLIC (not RFC1918). bastion will NOT")
+            out("  !!! auto-trust SSH from it — that would expose SSH to every host on that subnet.")
+            out(f"  !!! Pin an explicit admin source: `bastion allow <your-ip>` or "
+                f"`bastion zones add admin <your-ip> {_ssh}`.")
 
         # C1: final review/confirm before ANYTHING is written or installed.
         if not self._confirm_step(config, mode, profile):
@@ -511,8 +535,14 @@ class Wizard:
         o = self.out
         o(f"  distro: {d.distro}  package-manager: {d.pkg_manager}")
         o(f"  proposed mode: {d.proposed_mode}")
-        for i in d.physical_ifaces():
-            o(f"  iface {i.name}: {i.kind}, {'up' if i.up else 'down'}, {i.addrs or 'no-addr'}")
+        # C3: enumerate ALL topology-relevant interfaces tagged with category (physical/overlay/
+        # bridge/virtual) — so overlays (wg0/zt*) and hypervisor bridges (virbr0/docker0) are visible
+        # and the ownership-mode/zone decisions are auditable. Skip only down, addr-less virtual noise.
+        for i in d.interfaces:
+            if i.category == "virtual" and i.name != "lo" and not i.up and not i.addrs:
+                continue
+            link = "up" + ("/carrier" if i.carrier else "") if i.up else "down"
+            o(f"  iface {i.name}: {i.kind}/{i.category}, {link}, {i.addrs or 'no-addr'}")
         o(f"  default route: {d.default_iface or '-'} via {d.gateway or '-'}")
         o(f"  ssh port: {d.ssh_port}")
         active = sorted(k for k, v in d.services.items() if v.active)
@@ -686,10 +716,26 @@ class Wizard:
                 who = "a co-resident manager"
             self.out(f"  detected a self-managing firewall ({who}) -> proposing firewall_scope = "
                      "cooperative (manage only bastion's table; leave theirs intact).")
+            # C4: name the co-resident tables bastion will leave alone, so the operator knows it SAW
+            # the existing forwarding/NAT (e.g. an `ip nat` MASQUERADE) and is deliberately not
+            # managing it — rather than assuming bastion missed it.
+            if d.nft_foreign_tables:
+                self.out("  cooperative scope leaves these co-resident nft tables — and any "
+                         "forwarding/NAT they own — intact:")
+                for f, n in d.nft_foreign_tables:
+                    self.out(f"    - {f} {n}")
         if d.proposed_zones:
             self.out("  synthesised inbound zones from the box's existing rules (source -> action):")
             for name, spec in d.proposed_zones.items():
                 self.out(f"    {name} = {spec}")
+            # F2: a `-> all` zone (trust the whole source/iface) is broader than the per-port rules it
+            # sits beside and can make them redundant — flag it so the operator tightens it on purpose
+            # rather than accepting an over-broad superset by default.
+            broad = [n for n, s in d.proposed_zones.items() if s.rstrip().endswith("-> all")]
+            if broad and len(d.proposed_zones) > len(broad):
+                self.out(f"  NOTE: zone(s) {', '.join(broad)} grant ALL ports — broader than the "
+                         "per-port rules above, which they may make redundant. Tighten to specific "
+                         "ports if the source isn't fully trusted.")
         if self._confirm("Apply the proposed firewall scope + zones?", default=True):
             a["firewall_scope"] = d.proposed_scope
             if d.proposed_zones:
@@ -705,7 +751,9 @@ class Wizard:
         reinstall; requests one only on a fresh install when the chosen backend needs it. Sets
         ai.backend_cmd / ai.model into ``answers`` (-> backend.conf); writes the secret separately
         into secrets.conf + the edge-ai EnvironmentFile, NEVER into machine.conf."""
-        layers = PROFILE_LAYERS.get(profile, "")
+        # Honor a --no-ai-stripped (or custom) layer set, not just the raw profile, so an excluded
+        # L3 never triggers the API-key prompt.
+        layers = answers.get("layers") or PROFILE_LAYERS.get(profile, "")
         if "l3" not in layers.split(","):
             self.out("  no AI layer selected — no API key needed.")
             return []
@@ -953,6 +1001,18 @@ class Wizard:
             return [], [f"install skipped: {fw} is active and would be flushed by bastion's ruleset "
                         f"— disable it (`sudo systemctl disable --now {fw}`) and re-run `sudo bastion setup`."]
 
+        # F5: --stage-only stops here — config is already written + generated (step 6), but the
+        # firewall is NOT loaded and no packages/layers are installed. The operator reviews the
+        # rendered ruleset, then applies it behind the auto-reverting deadman.
+        if self.stage_only:
+            self.out("  --stage-only: machine.conf + configs written/generated; the firewall was NOT "
+                     "loaded and no layers were installed.")
+            self.out("  Review, then apply behind the auto-reverting deadman:  "
+                     "sudo bastion switch --minutes 10")
+            return self._package_plan(config, mode), [
+                "staged only (--stage-only): nothing loaded live. Apply with `sudo bastion switch "
+                "--minutes 10`, then `bastion confirm` within the window."]
+
         from .. import cli
         from .. import layers as layermod
         notes: list[str] = []
@@ -997,7 +1057,32 @@ class Wizard:
 
         # 7d. ZeroTier join AFTER L5 started zerotier-one (the cli needs the daemon running).
         notes += self._zt_join_step(config)
+
+        # F5: the live ruleset is now loaded. Wrap this first-load in an auto-reverting deadman so a
+        # cutover that silently locks the operator out reverts itself — they run `bastion confirm`
+        # (same disarm as `bastion switch`) within the window to KEEP it. Only when we have a rollback
+        # snapshot and net-rollback is installed (L6); otherwise warn rather than arm a dud.
+        notes += self._arm_setup_deadman(ctx, snapped)
         return pkgs, notes
+
+    def _arm_setup_deadman(self, ctx, snapped: bool, minutes: int = 10) -> list[str]:
+        """F5: arm an auto-revert deadman around setup's first live firewall load (reusing the
+        `bastion switch` deadman unit, so `bastion confirm` disarms it). No-op with a clear note when
+        there's no rollback point or net-rollback isn't installed."""
+        from .. import cli
+        rollback_rel = f"{ctx.sbin_dir}/net-rollback"
+        if not snapped or not self.sys.exists(rollback_rel):
+            return ["firewall is LIVE but NO deadman was armed (no snapshot / net-rollback) — "
+                    "verify access NOW; `sudo bastion rollback` restores the previous state."]
+        rc = self.sys.run("systemd-run", f"--unit={cli._SWITCH_DEADMAN_UNIT}",
+                          f"--on-active={minutes}min", str(self.sys.path(rollback_rel)),
+                          "setup-deadman").returncode
+        if rc != 0:
+            return [f"WARNING — could not arm the setup deadman (rc={rc}); verify access NOW "
+                    "(`bastion confirm`), or `sudo bastion rollback` to undo."]
+        self.out(f"  !!! firewall is LIVE behind a {minutes}-min auto-revert deadman.")
+        self.out(f"  !!! run `bastion confirm` within {minutes} min to KEEP it — else it rolls back.")
+        return [f"firewall applied behind a {minutes}-min deadman — run `bastion confirm` to keep it."]
 
     def _pre_install_snapshot(self, ctx) -> bool:
         """B1 rollback point: capture a pre-install network snapshot with the net-snapshot script
@@ -1183,6 +1268,14 @@ class Wizard:
             return pkgs
         self.out(f"  package manager: {mgr.name}")
         self.out(f"  needed by selected layers: {', '.join(pkgs) or 'none'}")
+        # F1: split out packages this manager can't resolve (e.g. crowdsec is AUR-only on Arch).
+        # Handing an AUR name to `pacman -S` fails the whole transaction, so the preview must NOT
+        # put it on the install line — it goes in a separate "install yourself" hint instead, so the
+        # previewed command is actually copy-pasteable.
+        aur = [p for p in pkgs if p in getattr(mgr, "repo_unavailable", ())]
+        resolvable = [p for p in pkgs if p not in aur]
         self.out(f"  install command (preview): "
-                 f"{' '.join(mgr.install_command(pkgs)) if pkgs else '(nothing to install)'}")
+                 f"{' '.join(mgr.install_command(resolvable)) if resolvable else '(nothing to install)'}")
+        if aur:
+            self.out(f"  ! {mgr.unavailable_hint(aur)}")
         return pkgs

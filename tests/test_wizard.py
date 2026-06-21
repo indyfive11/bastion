@@ -90,6 +90,93 @@ def test_prereq_warn_silent_when_l2_not_selected():
     assert not any("crowdsec" in l for l in lines)
 
 
+def test_no_ai_excludes_l3(capsys):
+    # F3: --no-ai must actually drop L3 from the layer set (it used to be a silent no-op) and skip
+    # the API-key prompt — full-endpoint (l0,l1,l2,l3,l6) becomes l0,l1,l2,l6.
+    wiz = wizard.Wizard(edge_system(), dry_run=True, profile="full-endpoint", no_ai=True,
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    result = wiz.run()
+    assert "l3" not in result.config["machine"]["layers"].split(",")
+    out = capsys.readouterr().out
+    assert "--no-ai" in out and "no AI layer selected" in out
+
+
+def test_default_keeps_l3():
+    # The default (no --no-ai) still includes L3 — the flag is opt-out, not the default.
+    wiz = wizard.Wizard(edge_system(), dry_run=True, profile="full-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    assert "l3" in wiz.run().config["machine"]["layers"].split(",")
+
+
+def test_package_plan_splits_aur_crowdsec():
+    # F1: the dry-run install preview must NOT put AUR-only crowdsec on the `pacman -S` line
+    # (it'd fail `target not found`); it goes in a separate "install yourself" hint instead.
+    lines = []
+    wiz = wizard.Wizard(edge_system(), dry_run=True, out=lines.append, assume_defaults=True)
+    wiz._package_plan({"machine": {"distro": "arch", "layers": "l0,l1,l2,l6"}}, "endpoint")
+    preview = next(l for l in lines if "install command (preview)" in l)
+    assert "crowdsec" not in preview
+    assert any("crowdsec" in l and "AUR" in l for l in lines)
+
+
+def test_stage_only_skips_live_load():
+    # F5: --stage-only reaches the install step on a LIVE host but loads nothing — it returns the
+    # "staged only" note (the live layer.install loop is never entered).
+    wiz = wizard.Wizard(edge_system(live=True), stage_only=True, assume_defaults=True,
+                        example_conf=str(EXAMPLE))
+    config = {"machine": {"distro": "arch", "layers": "l0,l1,l6", "mode": "endpoint"}}
+    _pkgs, notes = wiz._install_step(config, "endpoint")
+    assert any("staged only" in n for n in notes)
+    assert any("bastion switch" in n for n in notes)
+
+
+class _RecSys(FakeSystem):
+    def __init__(self, *, have_rollback=True):
+        super().__init__({}, {}, set(), live=True)
+        self.calls: list[tuple] = []
+        self._have_rollback = have_rollback
+
+    def run(self, *args, capture=True):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def exists(self, p):
+        return self._have_rollback and "net-rollback" in str(p)
+
+
+def test_arm_setup_deadman_uses_switch_unit():
+    # F5: setup's first live load is wrapped in the `bastion switch` deadman, so `bastion confirm`
+    # disarms it. systemd-run is armed with that unit + the requested window.
+    from bastion import cli
+    from types import SimpleNamespace
+    sysd = _RecSys()
+    wiz = wizard.Wizard(sysd, assume_defaults=True, example_conf=str(EXAMPLE))
+    notes = wiz._arm_setup_deadman(SimpleNamespace(sbin_dir="/usr/local/sbin"), snapped=True, minutes=10)
+    armed = [a for a in sysd.calls if a and a[0] == "systemd-run"]
+    assert armed and f"--unit={cli._SWITCH_DEADMAN_UNIT}" in armed[0] and "--on-active=10min" in armed[0]
+    assert any("bastion confirm" in n for n in notes)
+
+
+def test_arm_setup_deadman_warns_without_rollback():
+    from types import SimpleNamespace
+    sysd = _RecSys(have_rollback=False)
+    wiz = wizard.Wizard(sysd, assume_defaults=True, example_conf=str(EXAMPLE))
+    notes = wiz._arm_setup_deadman(SimpleNamespace(sbin_dir="/usr/local/sbin"), snapped=True)
+    assert not any(a and a[0] == "systemd-run" for a in sysd.calls)    # nothing armed
+    assert any("NO deadman" in n for n in notes)
+
+
+def test_cooperative_dry_run_lists_foreign_tables(capsys):
+    # C4: cooperative scope names the co-resident nft tables it leaves intact (so the operator knows
+    # bastion SAW the existing forwarding/NAT and chose not to manage it).
+    wiz = wizard.Wizard(_libvirt_em_system(), dry_run=True, assume_defaults=True,
+                        example_conf=str(EXAMPLE))
+    d = detect.detect(_libvirt_em_system())
+    wiz._scope_zones_answers(d)
+    out = capsys.readouterr().out
+    assert "leaves these co-resident nft tables" in out and "libvirt_network" in out
+
+
 def test_build_machine_conf_edge_overlays_detection():
     base = state.load_conf(EXAMPLE)
     d = detect.detect(edge_system())
@@ -314,6 +401,8 @@ def test_current_timer_interval_falls_back_to_skeleton(tmp_path):
 def test_parse_overrides_valid_and_invalid():
     assert wizard.parse_overrides(["trusted_hosts=10.0.0.2", "ssh_port=1111"]) == {
         "trusted_hosts": "10.0.0.2", "ssh_port": "1111"}
+    # F7: firewall_scope (the most safety-critical choice) is pinnable non-interactively.
+    assert wizard.parse_overrides(["firewall_scope=cooperative"]) == {"firewall_scope": "cooperative"}
     assert wizard.parse_overrides(None) == {}
     # value may contain '=' (split on first only)
     assert wizard.parse_overrides(["ai_model=a=b"]) == {"ai_model": "a=b"}

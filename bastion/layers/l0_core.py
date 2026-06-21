@@ -4,7 +4,8 @@ bastion-recovery service. Foundation for every profile; prerequisite of all othe
 from __future__ import annotations
 
 from .base import (Layer, Context, LayerStatus, HealthCheck, nft_table_health,
-                   FirewallConflict, blocking_conflicting_firewall, warn_if_exclusive_flush)
+                   FirewallConflict, blocking_conflicting_firewall, warn_if_exclusive_flush,
+                   warn_if_foreign_nftables_conf)
 
 
 class L0Core(Layer):
@@ -93,6 +94,9 @@ class L0Core(Layer):
             # Hard-warn if exclusive scope will flush a co-resident manager's tables (the general
             # safety net — libvirt/Docker/k8s/Tailscale/hand-written; install proceeds).
             warn_if_exclusive_flush(sys, scope)
+            # F4: back up + warn before overwriting a foreign, actively-loaded /etc/nftables.conf
+            # (a hand-rolled nft firewall) — runs before render_to replaces the file below.
+            warn_if_foreign_nftables_conf(sys, ctx.mode)
 
         # Packages are checked, not installed, until pkg.py (Phase 5). Surface what's missing.
         missing = [p for p in ("nft", "sshd") if not sys.command_exists(p)]

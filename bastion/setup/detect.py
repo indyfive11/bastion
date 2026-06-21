@@ -326,12 +326,13 @@ def parse_listeners(ss_text: str) -> list[tuple[str, int]]:
     return sorted(out)
 
 
-def parse_ufw_show_added(text: str) -> list[tuple[str, str, str | None]]:
-    """Parse `ufw show added` into (source, port, proto) rule tuples — the box's EXISTING intent,
-    even when ufw is disabled (its saved rules still encode the source->ports policy). ``port`` is
+def parse_ufw_show_added(text: str) -> list[tuple[str, str | None, str, str | None]]:
+    """Parse `ufw show added` into (source, dest, port, proto) rule tuples — the box's EXISTING
+    intent, even when ufw is disabled (its saved rules still encode the policy). ``dest`` is the
+    destination IP/CIDR a rule pins (``to 10.0.0.1 …``), or None for ``to any``/absent. ``port`` is
     ``'all'`` for a source-only rule; ``proto`` is None unless the rule pins tcp/udp. source is
     ``'any'`` | an IP/CIDR | ``'iface:NAME'``. Only ALLOW rules synthesize (deny = default-drop)."""
-    rules: list[tuple[str, str, str | None]] = []
+    rules: list[tuple[str, str | None, str, str | None]] = []
     for line in text.splitlines():
         toks = line.strip().split()
         if len(toks) < 2 or toks[0].lower() != "ufw":
@@ -343,16 +344,28 @@ def parse_ufw_show_added(text: str) -> list[tuple[str, str, str | None]]:
             continue
         if verb != "allow":
             continue
-        # 'in on IFACE' / 'out on IFACE' -> an interface zone (trust the whole iface).
+        # 'in on IFACE' is interface-scoped. A BARE 'in on IFACE' (no from/to/port) trusts the whole
+        # iface (iface:X -> all). WITH from/to/port qualifiers the iface is just the SOURCE and we
+        # parse the rest — so 'in on wg0 to 10.0.0.1 port 8080' becomes 'iface:wg0 to 10.0.0.1 ->
+        # 8080', NOT an over-broad 'iface:wg0 -> all' superset that swallows the qualifiers (F9).
+        iface_src = None
         if len(toks) >= 3 and toks[0] in ("in", "out") and toks[1] == "on":
-            rules.append((f"iface:{toks[2]}", "all", None))
-            continue
+            iface_src = f"iface:{toks[2]}"
+            toks = toks[3:]
+            if not any(t in toks for t in ("from", "to", "port", "proto")):
+                rules.append((iface_src, None, "all", None))
+                continue
         toks = [t for t in toks if t not in ("in", "out")]
-        source = "any"
-        if "from" in toks:
+        source = iface_src or "any"
+        if "from" in toks:                      # an explicit 'from' CIDR is narrower -> it wins
             i = toks.index("from")
             if i + 1 < len(toks):
                 source = toks[i + 1]
+        dest = None
+        if "to" in toks:
+            i = toks.index("to")
+            if i + 1 < len(toks) and toks[i + 1] != "any":
+                dest = toks[i + 1]      # a destination-pinned rule (e.g. `to 10.0.0.1 port 8080`)
         proto = None
         if "proto" in toks:
             i = toks.index("proto")
@@ -363,40 +376,46 @@ def parse_ufw_show_added(text: str) -> list[tuple[str, str, str | None]]:
             ports = toks[i + 1].split(",") if i + 1 < len(toks) else []
             for p in ports:
                 pp, _, pr = p.partition("/")
-                rules.append((source, pp, (pr or proto) or None))
-        elif source != "any":
-            # 'ufw allow from SRC' (no port) -> trust the whole source.
-            rules.append((source, "all", None))
+                rules.append((source, dest, pp, (pr or proto) or None))
+        elif source != "any" or dest:
+            # 'ufw allow from SRC' (no port) -> trust the whole source (optionally to a dest).
+            rules.append((source, dest, "all", None))
         else:
             # 'ufw allow 9993' / 'ufw allow 9993/tcp' -> any-source port.
             p = toks[0] if toks else ""
             pp, _, pr = p.partition("/")
             if pp.isdigit():
-                rules.append(("any", pp, (pr or proto) or None))
+                rules.append(("any", None, pp, (pr or proto) or None))
     return rules
 
 
 # --- P3 synthesis (facts -> proposed conf the operator confirms) ------------------------------
 
-def _zone_name(source: str) -> str:
-    """A deterministic, INI-key-safe [zones] name for a source (so re-synthesis is idempotent)."""
+def _zone_name(source: str, dest: str | None = None) -> str:
+    """A deterministic, INI-key-safe [zones] name for a (source, dest) pair (so re-synthesis is
+    idempotent and a destination-pinned rule gets its own zone key, not a collision)."""
     if source == "any":
-        return "anyports"
-    if source.startswith("iface:"):
-        return "iface_" + re.sub(r"[^0-9A-Za-z]", "_", source[len("iface:"):])
-    return "net_" + re.sub(r"[^0-9A-Za-z]", "_", source)
+        base = "anyports"
+    elif source.startswith("iface:"):
+        base = "iface_" + re.sub(r"[^0-9A-Za-z]", "_", source[len("iface:"):])
+    else:
+        base = "net_" + re.sub(r"[^0-9A-Za-z]", "_", source)
+    if dest:
+        base += "_to_" + re.sub(r"[^0-9A-Za-z]", "_", dest)
+    return base
 
 
 def synthesize_zones(ufw_text: str) -> dict[str, str]:
     """Turn a box's existing ufw policy (even disabled) into a proposed ``[zones]`` mapping
-    ``name -> 'source -> action'``. Rules are grouped by source: ports merge into one zone, and a
-    source-only ('all') rule wins for that source. A PROPOSAL only — the wizard makes the operator
-    confirm. Empty when there's nothing to synthesise. (firewalld/listener synthesis can extend this
-    later; ufw covers the reference fixture + the common case.)"""
+    ``name -> '<source>[ to <dest>] -> <action>'``. Rules are grouped by (source, destination) so a
+    destination-pinned rule (e.g. ``to 10.0.0.1 port 8080``) becomes its own precise zone rather than
+    being flattened into an over-broad source-wide one: ports merge into one zone, and a source-only
+    ('all') rule wins for that (source, dest). A PROPOSAL only — the wizard makes the operator confirm.
+    Empty when there's nothing to synthesise."""
     from collections import OrderedDict
-    by_source: "OrderedDict[str, dict]" = OrderedDict()
-    for source, port, proto in parse_ufw_show_added(ufw_text):
-        ent = by_source.setdefault(source, {"all": False, "ports": []})
+    by_key: "OrderedDict[tuple[str, str | None], dict]" = OrderedDict()
+    for source, dest, port, proto in parse_ufw_show_added(ufw_text):
+        ent = by_key.setdefault((source, dest), {"all": False, "ports": []})
         if port == "all":
             ent["all"] = True
         else:
@@ -404,10 +423,12 @@ def synthesize_zones(ufw_text: str) -> dict[str, str]:
             if tok not in ent["ports"]:
                 ent["ports"].append(tok)
     zones: dict[str, str] = {}
-    for source, ent in by_source.items():
+    for (source, dest), ent in by_key.items():
         action = "all" if ent["all"] else ", ".join(ent["ports"])
-        if action:
-            zones[_zone_name(source)] = f"{source} -> {action}"
+        if not action:
+            continue
+        match = f"{source} to {dest}" if dest else source
+        zones[_zone_name(source, dest)] = f"{match} -> {action}"
     return zones
 
 

@@ -1,4 +1,4 @@
-.PHONY: leak-check test lint install-hook generate-check
+.PHONY: leak-check test test-deps lint install-hook generate-check
 
 # generate-check — Phase 2 gate: every template placeholder resolves against the example.
 generate-check:
@@ -34,7 +34,18 @@ install-hook:
 	@echo "Installed .git/hooks/pre-push -> make leak-check"
 
 test:
-	@command -v pytest >/dev/null 2>&1 && pytest -q || echo "pytest not installed / no tests yet"
+	@command -v pytest >/dev/null 2>&1 && pytest -q || \
+	 echo "pytest not installed — run 'make test-deps' (or install python-pytest yourself)."
+
+# test-deps — install the bench-suite dev dependency (pytest) that the runtime package omits.
+# pytest is a DEV dep, not a runtime one, so a fresh `yay -S bastionfw` + repo clone won't have it;
+# this is the one-shot to make `make test` runnable. Best-effort across the supported managers.
+test-deps:
+	@echo "Installing bench-suite dev deps (pytest)..."
+	@if command -v pacman >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm python-pytest; \
+	 elif command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y python3-pytest; \
+	 elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y python3-pytest; \
+	 else python -m pip install --user pytest || echo "Install pytest manually (e.g. python-pytest)."; fi
 
 lint:
 	@command -v ruff >/dev/null 2>&1 && ruff check bastion || echo "ruff not installed"

@@ -88,6 +88,8 @@ def test_validate_conf_accepts_good_zones():
         "vms": "iface:virbr0 -> all",
         "ztctl": "any -> 9993",
         "v6": "fd00::/8 -> 22",
+        "api": "10.0.0.0/24 to 10.0.0.1 -> 8080",   # destination-pinned zone
+        "any_to_dest": "any to 10.0.0.1 -> 8080",
     }
     errs, _ = state.validate_conf(c)
     assert errs == []
@@ -101,10 +103,13 @@ def test_validate_conf_rejects_bad_zones():
         "badport": "any -> 70000",
         "badproto": "any -> 53/sctp",
         "badiface": "iface:this-name-is-way-too-long -> all",
+        "baddest": "10.0.0.0/24 to not-an-ip -> 8080",       # destination not an IP/CIDR
+        "famsplit": "192.168.1.0/24 to fd00::1 -> 8080",     # v4 source, v6 dest -> rejected
     }
     errs, _ = state.validate_conf(c)
     blob = " ".join(errs)
-    assert all(t in blob for t in ("noarrow", "not-an-ip", "70000", "53/sctp", "badiface"))
+    assert all(t in blob for t in ("noarrow", "not-an-ip", "70000", "53/sctp", "badiface",
+                                   "baddest", "famsplit"))
 
 
 def test_validate_conf_warns_on_default_route():

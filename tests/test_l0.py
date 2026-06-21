@@ -402,3 +402,49 @@ def test_recovery_traps_signals_during_start():
     set_trap = body.index("do_stop quiet; exit 1' INT TERM")
     clear_trap = body.index("trap - INT TERM")
     assert clear_trap > set_trap
+
+
+# --- F4: foreign /etc/nftables.conf guard (warn + recovery backup before overwrite) -------------
+
+class _LiveSys(System):
+    """A System that reports live + nftables.service enabled, for the foreign-nftables guard."""
+    @property
+    def is_live(self) -> bool:
+        return True
+
+    def unit_enabled(self, unit: str) -> bool:
+        return True
+
+    def unit_active(self, unit: str) -> bool:
+        return False
+
+
+def test_warn_if_foreign_nftables_conf_backs_up_and_warns(tmp_path):
+    from bastion.layers import base
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc/nftables.conf").write_text(
+        "table inet filter { chain input { type filter hook input priority 0; policy drop; } }\n")
+    lines: list[str] = []
+    bak = base.warn_if_foreign_nftables_conf(_LiveSys(root=tmp_path), "endpoint", out=lines.append)
+    assert bak == "/etc/nftables.conf.pre-bastion"
+    saved = (tmp_path / "etc/nftables.conf.pre-bastion").read_text()
+    assert saved.startswith("table inet filter")
+    assert any("WARNING" in l for l in lines)
+
+
+def test_warn_if_foreign_nftables_conf_noop_on_bastion_file(tmp_path):
+    from bastion.layers import base
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc/nftables.conf").write_text("flush ruleset\ntable inet bastion {\n}\n")
+    out = base.warn_if_foreign_nftables_conf(_LiveSys(root=tmp_path), "endpoint", out=lambda *_: None)
+    assert out is None                                            # already ours -> safe reinstall
+    assert not (tmp_path / "etc/nftables.conf.pre-bastion").exists()
+
+
+def test_warn_if_foreign_nftables_conf_noop_when_staged(tmp_path):
+    # A staged (--root, non-live) install loads no ruleset, so the guard must never fire.
+    from bastion.layers import base
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc/nftables.conf").write_text("table inet filter {}\n")
+    assert base.warn_if_foreign_nftables_conf(System(root=tmp_path), "endpoint",
+                                              out=lambda *_: None) is None

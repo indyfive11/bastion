@@ -62,8 +62,9 @@ table inet bastion {
         icmpv6 type echo-request limit rate 10/second accept
         icmpv6 type echo-reply accept
 
-        # Management access from the local subnet + explicitly trusted hosts only.
-        ip saddr {{ network.lan_cidr }} tcp dport {{ ports.ssh }} accept
+        # Management access from the local subnet (PRIVATE subnets only — a public lan_cidr is not
+        # auto-trusted; see templates._lan_ssh_accept / F6) + explicitly trusted hosts.
+        {{ network.lan_ssh_accept }}
         ip saddr @trusted_hosts accept
         ip6 saddr @trusted_hosts6 accept
 

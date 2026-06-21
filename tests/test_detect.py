@@ -257,10 +257,42 @@ ufw allow 9993/udp
 
 def test_parse_ufw_show_added():
     rules = detect.parse_ufw_show_added(EM_UFW)
-    assert ("192.168.1.0/24", "8096", None) in rules
-    assert ("192.168.192.0/24", "1111", "tcp") in rules       # proto carried onto each port
-    assert ("iface:virbr0", "all", None) in rules
-    assert ("any", "9993", None) in rules and ("any", "9993", "udp") in rules
+    assert ("192.168.1.0/24", None, "8096", None) in rules     # (source, dest, port, proto)
+    assert ("192.168.192.0/24", None, "1111", "tcp") in rules  # proto carried onto each port
+    assert ("iface:virbr0", None, "all", None) in rules
+    assert ("any", None, "9993", None) in rules and ("any", None, "9993", "udp") in rules
+
+
+VPS_UFW = """\
+Added user rules (see 'ufw status' for running firewall):
+ufw allow from 10.0.0.0/24 to any port 1111 proto tcp
+ufw allow from 10.0.0.0/24 to 10.0.0.1 port 8080 proto tcp
+"""
+
+
+def test_parse_ufw_captures_destination():
+    rules = detect.parse_ufw_show_added(VPS_UFW)
+    # the dest-pinned 8080 rule keeps its destination; the 1111 'to any' rule does not.
+    assert ("10.0.0.0/24", "10.0.0.1", "8080", "tcp") in rules
+    assert ("10.0.0.0/24", None, "1111", "tcp") in rules
+
+
+def test_synthesize_zones_keeps_destination_pin():
+    zones = detect.synthesize_zones(VPS_UFW)
+    # the dest-pinned rule becomes its OWN precise zone, not flattened into the source-wide one.
+    assert zones["net_10_0_0_0_24"] == "10.0.0.0/24 -> 1111/tcp"
+    assert zones["net_10_0_0_0_24_to_10_0_0_1"] == "10.0.0.0/24 to 10.0.0.1 -> 8080/tcp"
+
+
+def test_qualified_in_on_iface_not_flattened_to_all():
+    # F9: 'in on wg0 to 10.0.0.1 port 8080' must NOT become the over-broad 'iface:wg0 -> all' — the
+    # iface is the source and the to/port are kept. A BARE 'in on virbr0' still trusts the whole iface.
+    ufw = ("ufw allow in on wg0 to 10.0.0.1 port 8080 proto tcp\n"
+           "ufw allow in on virbr0\n")
+    zones = detect.synthesize_zones(ufw)
+    assert "iface_wg0" not in zones                                    # no over-broad superset
+    assert zones["iface_wg0_to_10_0_0_1"] == "iface:wg0 to 10.0.0.1 -> 8080/tcp"
+    assert zones["iface_virbr0"] == "iface:virbr0 -> all"              # bare rule still trusts iface
 
 
 def test_synthesize_zones_from_em_ufw():

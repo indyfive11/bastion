@@ -221,25 +221,38 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         elif sep and proto.lower() not in ("tcp", "udp"):
             errors.append(f"[network] service_ports entry {tok!r} — proto must be tcp or udp")
 
-    # [zones]: name = <source> -> <action>. source ∈ {any, IP/CIDR, iface:NAME}; action ∈ {all,
-    # service_ports-style port list}. The general source->action input-accept primitive — rendered
-    # inline (templates._render_zones), so a CIDR source needs no named set (sidesteps the
-    # trusted_hosts `flags interval` bug). Malformed entries block generate.
+    # [zones]: name = <source>[ to <dest>] -> <action>. source ∈ {any, IP/CIDR, iface:NAME}; an
+    # optional `to <dest>` (IP/CIDR) pins the destination; action ∈ {all, service_ports-style port
+    # list}. The general source->action input-accept primitive — rendered inline
+    # (templates._render_zones), so a CIDR source needs no named set (sidesteps the trusted_hosts
+    # `flags interval` bug). Malformed entries block generate.
     for name, raw in (config.get("zones") or {}).items():
         src_raw, sep, act_raw = str(raw).partition("->")
         source, action = src_raw.strip(), act_raw.strip()
         if not sep or not source or not action:
             errors.append(f"[zones] {name}={raw!r} — must be '<source> -> <action>'")
             continue
-        if source.startswith("iface:"):
-            iface = source[len("iface:"):].strip()
+        src, _, dst = source.partition(" to ")
+        src, dst = src.strip(), dst.strip()
+        src_fam = None
+        if src.startswith("iface:"):
+            iface = src[len("iface:"):].strip()
             if not iface or len(iface) > 15 or not _IFACE_RE.fullmatch(iface):
-                errors.append(f"[zones] {name} source {source!r} — not a valid interface name (<=15 chars)")
-        elif source != "any":
+                errors.append(f"[zones] {name} source {src!r} — not a valid interface name (<=15 chars)")
+        elif src != "any":
             try:
-                ipaddress.ip_network(source, strict=False)
+                src_fam = ipaddress.ip_network(src, strict=False).version
             except ValueError:
-                errors.append(f"[zones] {name} source {source!r} — must be 'any', an IP/CIDR, or 'iface:NAME'")
+                errors.append(f"[zones] {name} source {src!r} — must be 'any', an IP/CIDR, or 'iface:NAME'")
+        if dst:
+            try:
+                dst_fam = ipaddress.ip_network(dst, strict=False).version
+            except ValueError:
+                errors.append(f"[zones] {name} destination {dst!r} — must be an IP/CIDR")
+            else:
+                if src_fam is not None and src_fam != dst_fam:
+                    errors.append(f"[zones] {name} — source and destination must be the same IP "
+                                  "family (both v4 or both v6)")
         if action != "all":
             toks = action.replace(",", " ").split()
             if not toks:

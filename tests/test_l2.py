@@ -123,9 +123,27 @@ def test_l2_install_warns_when_enable_fails(capsys):
     assert "enabled + started" not in out
 
 
-def test_port_listening_parses_ss():
+def test_lapi_port_conflict_parses_ss():
     from bastion.layers import l2_crowdsec
     sysobj = _LiveSys(Path("/"), have_cscli=True,
                       ss_text="LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\n")
-    assert l2_crowdsec._port_listening(sysobj, 8080) is True
-    assert l2_crowdsec._port_listening(sysobj, 9090) is False
+    assert l2_crowdsec._lapi_port_conflict(sysobj, 8080) is True       # wildcard clashes
+    assert l2_crowdsec._lapi_port_conflict(sysobj, 9090) is False
+
+
+def test_lapi_port_conflict_ignores_other_address():
+    # F8: a service on a DIFFERENT specific address (10.0.0.1:8080) does NOT clash with the LAPI's
+    # 127.0.0.1:8080 — they're separate sockets. The old port-only check warned here (false positive).
+    from bastion.layers import l2_crowdsec
+    sysobj = _LiveSys(Path("/"), have_cscli=True, ss_text="LISTEN 0 128 10.0.0.1:8080 0.0.0.0:*\n")
+    assert l2_crowdsec._lapi_port_conflict(sysobj, 8080) is False
+    # but the LAPI's own address IS a clash
+    sysobj2 = _LiveSys(Path("/"), have_cscli=True, ss_text="LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\n")
+    assert l2_crowdsec._lapi_port_conflict(sysobj2, 8080) is True
+
+
+def test_l2_install_no_false_warn_on_other_address(capsys):
+    # F8 end-to-end: another service on 10.0.0.1:8080 must NOT trigger the LAPI warning.
+    sysobj = _LiveSys(Path("/"), have_cscli=True, ss_text="LISTEN 0 4096 10.0.0.1:8080 0.0.0.0:*\n")
+    layers.get("l2").install(_live_ctx(sysobj))
+    assert "already in use" not in capsys.readouterr().out

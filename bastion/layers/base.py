@@ -40,6 +40,7 @@ from .. import templates as tmpl
 # and the two would then fight — the live ruleset load (L0) must gate on this.
 CONFLICTING_FIREWALLS = ("ufw", "firewalld")
 FIREWALL_TAKEOVER_ENV = "BASTION_ALLOW_FIREWALL_TAKEOVER"
+NFTABLES_LOADER_UNIT = "nftables.service"
 
 
 def firewall_conflict_message(fw: str) -> str:
@@ -138,6 +139,37 @@ def warn_if_exclusive_flush(system: System, scope: str, out=print) -> list[tuple
     return foreign
 
 
+def warn_if_foreign_nftables_conf(system: System, mode: str, out=print) -> str | None:
+    """If an existing ``/etc/nftables.conf`` is loaded by an enabled/active ``nftables.service`` but
+    is NOT a bastion ruleset, save a recovery copy to ``/etc/nftables.conf.pre-bastion`` and warn
+    loudly before L0 overwrites it — so a hand-rolled nft firewall the operator relies on is never
+    silently replaced with no way back. Returns the backup path, or None when there's nothing foreign
+    to guard: the file is absent, the loader unit is inert (e.g. ufw-via-iptables boxes that don't use
+    it), bastion already owns the file (a reinstall), or this is a staged ``--root``/non-live run.
+    Fail-soft — a probe failure must never block an install."""
+    if not getattr(system, "is_live", False) or not system.exists("/etc/nftables.conf"):
+        return None
+    if not (system.unit_enabled(NFTABLES_LOADER_UNIT) or system.unit_active(NFTABLES_LOADER_UNIT)):
+        return None
+    try:
+        body = system.path("/etc/nftables.conf").read_text(errors="replace")
+    except OSError:
+        return None
+    if "table inet edge" in body or "table inet bastion" in body:
+        return None   # already bastion's ruleset -> reinstall, safe to overwrite
+    bak = system.path("/etc/nftables.conf.pre-bastion")
+    try:
+        if not bak.exists():
+            bak.write_text(body)
+    except OSError:
+        pass
+    out("  !!! WARNING — /etc/nftables.conf already exists, is loaded by an enabled/active")
+    out("  !!! nftables.service, and is NOT a bastion ruleset. L0 is about to overwrite it.")
+    out("  !!! A recovery copy was saved to /etc/nftables.conf.pre-bastion — if a hand-rolled")
+    out("  !!! nftables firewall owns this file, restore from that copy before re-running L0.")
+    return "/etc/nftables.conf.pre-bastion"
+
+
 def blocking_conflicting_firewall(system: System, scope: str = "exclusive") -> str | None:
     """The active conflicting firewall that should BLOCK a live ruleset load, or None.
 
@@ -166,7 +198,9 @@ class Context:
 
     @property
     def mode(self) -> str:
-        return self.config.get("machine", {}).get("mode", "edge")
+        # "unset" when no machine.conf has been written yet (a fresh box) — never silently claim
+        # "edge", which misleads `status`/`doctor` into reporting a mode the operator never chose.
+        return self.config.get("machine", {}).get("mode", "unset")
 
 
 @dataclass

@@ -170,6 +170,31 @@ def test_zones_v6_source_uses_ip6_saddr():
     assert _zones({"v6": "fd00::/8 -> 22"}) == "ip6 saddr fd00::/8 tcp dport { 22 } accept"
 
 
+def test_zones_destination_pin_emits_daddr():
+    # `<source> to <dest>` -> ip saddr ... ip daddr ... (a service bound to one local address).
+    assert _zones({"api": "10.0.0.0/24 to 10.0.0.1 -> 8080"}) == \
+        "ip saddr 10.0.0.0/24 ip daddr 10.0.0.1 tcp dport { 8080 } accept"
+
+
+def test_zones_destination_pin_any_source():
+    assert _zones({"api": "any to 10.0.0.1 -> 8080"}) == \
+        "ip daddr 10.0.0.1 tcp dport { 8080 } accept"
+
+
+def test_zones_destination_pin_iface_source():
+    assert _zones({"api": "iface:wg0 to 10.0.0.1 -> 8080"}) == \
+        'iifname "wg0" ip daddr 10.0.0.1 tcp dport { 8080 } accept'
+
+
+def test_lan_ssh_accept_only_for_private_subnet():
+    # F6: auto-trust SSH from a PRIVATE lan_cidr, but NOT a public one (a VPS's datacenter /24).
+    assert templates._lan_ssh_accept({"network": {"lan_cidr": "192.168.1.0/24"}, "ports": {"ssh": "1111"}}) \
+        == "ip saddr 192.168.1.0/24 tcp dport 1111 accept"
+    assert templates._lan_ssh_accept({"network": {"lan_cidr": "8.8.8.0/24"}, "ports": {"ssh": "1111"}}) == ""
+    assert templates._lan_ssh_accept({"network": {"lan_cidr": ""}, "ports": {"ssh": "1111"}}) == ""
+    assert templates._is_private_cidr("10.0.0.0/24") and not templates._is_private_cidr("8.8.8.0/24")
+
+
 def test_zones_dedupes_identical_rules():
     out = _zones({"a": "any -> 9993", "b": "any -> 9993"})
     assert out == "tcp dport { 9993 } accept"

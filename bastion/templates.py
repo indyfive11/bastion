@@ -95,9 +95,36 @@ def _derived(config: dict) -> dict:
     net["service_ports_udp_accept"] = (
         f"udp dport {{ {', '.join(str(p) for p in udp_ports)} }} accept" if udp_ports else "")
     net["zones_input_rules"] = _render_zones(config)
+    net["lan_ssh_accept"] = _lan_ssh_accept(config)
     mach = dict(config.get("machine") or {})
     mach["firewall_preamble"] = _firewall_preamble(config)
     return {**config, "network": net, "machine": mach}
+
+
+def _is_private_cidr(cidr: str) -> bool:
+    """True if an IP/CIDR is RFC1918 / link-local / ULA — i.e. a real private LAN where trusting the
+    whole subnet is reasonable. A PUBLIC subnet (e.g. a VPS's datacenter /24) returns False. F6."""
+    import ipaddress
+    try:
+        return ipaddress.ip_network(str(cidr).strip(), strict=False).is_private
+    except ValueError:
+        return False
+
+
+def _lan_ssh_accept(config: dict) -> str:
+    """The endpoint 'accept SSH from the local subnet' rule, or '' when it must NOT be emitted.
+
+    Auto-trusting the whole ``lan_cidr`` for SSH is convenient on a private LAN — but a PUBLIC
+    ``lan_cidr`` (a VPS whose 'local /24' is full of unknown datacenter tenants) would silently expose
+    SSH to all of them the moment bastion is the sole input gate. So for a non-private subnet the rule
+    is dropped: the operator pins an explicit admin source via a zone / ``trusted_hosts`` instead (the
+    wizard warns loudly). Blank/absent ``lan_cidr`` or ssh port also renders ''. F6."""
+    net = config.get("network") or {}
+    lan_cidr = str(net.get("lan_cidr") or "").strip()
+    ssh = str((config.get("ports") or {}).get("ssh") or "").strip()
+    if not lan_cidr or not ssh or not _is_private_cidr(lan_cidr):
+        return ""
+    return f"ip saddr {lan_cidr} tcp dport {ssh} accept"
 
 
 def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
@@ -123,23 +150,38 @@ def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
     return tcp, udp
 
 
-def _zone_prefix(source: str) -> str:
-    """Map a zone source token to its nft rule prefix (with trailing space, or '' for any).
+def _zone_prefix(match: str) -> str:
+    """Map a zone match token to its nft rule prefix (with trailing space, or '' for any).
 
-    ``any`` -> '' (no saddr/iif match — applies to every source); ``iface:NAME`` -> ``iifname
-    "NAME" ``; an IP/CIDR -> ``ip saddr <s> `` (v4) or ``ip6 saddr <s> `` (v6). An unparseable
-    address falls back to ``ip saddr`` so a genuinely bad token surfaces as an nft load error the
-    same way trusted_hosts does, rather than being silently dropped (validate_conf blocks it first)."""
+    ``match`` is ``<source>`` or ``<source> to <dest>``. The source: ``any`` -> '' (no saddr/iif —
+    every source); ``iface:NAME`` -> ``iifname "NAME"``; an IP/CIDR -> ``ip saddr <s>`` (v4) /
+    ``ip6 saddr <s>`` (v6). An optional ``to <dest>`` (IP/CIDR) appends ``ip[6] daddr <dest>`` — so a
+    zone can pin the DESTINATION (e.g. a service bound to one of several local addresses, like a UFW
+    ``to 10.0.0.1 port 8080`` rule). Family comes from whichever side is an IP (source and dest must
+    agree — validate_conf enforces it). An unparseable address falls back to ``ip`` so a genuinely
+    bad token surfaces as an nft load error rather than being silently dropped."""
     import ipaddress
-    if source == "any":
-        return ""
+
+    def _fam(addr: str) -> str:
+        try:
+            return "ip6" if ipaddress.ip_network(addr, strict=False).version == 6 else "ip"
+        except ValueError:
+            return "ip"
+
+    source, _, dest = match.partition(" to ")
+    source, dest = source.strip(), dest.strip()
+    src_is_ip = source != "any" and not source.startswith("iface:")
+    fam = _fam(source) if src_is_ip else (_fam(dest) if dest else "ip")
+
+    parts: list[str] = []
     if source.startswith("iface:"):
-        return f'iifname "{source[len("iface:"):].strip()}" '
-    try:
-        fam = "ip6" if ipaddress.ip_network(source, strict=False).version == 6 else "ip"
-    except ValueError:
-        fam = "ip"
-    return f"{fam} saddr {source} "
+        parts.append(f'iifname "{source[len("iface:"):].strip()}"')
+    elif src_is_ip:
+        parts.append(f"{fam} saddr {source}")
+    if dest:
+        parts.append(f"{fam} daddr {dest}")
+    prefix = " ".join(parts)
+    return prefix + " " if prefix else ""
 
 
 def _render_zones(config: dict) -> str:

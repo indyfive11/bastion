@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.3] - 2026-06-20
+
+A dogfood-driven hardening release. Pointing `bastion setup` at a real, public, multi-service VPS
+(WireGuard relay + mail + DNS behind an active UFW) and at a libvirt workstation surfaced a cluster of
+safety and correctness gaps — all addressed here. Cooperative coexistence with UFW was validated live
+on the production VPS (the relay and every service stayed up while bastion's table loaded alongside).
+
+### Added
+
+- **`bastion --version` / `-V`** prints the version and exits 0 (previously argparse errored).
+- **`bastion setup --stage-only`** writes and generates the config but does *not* load the firewall or
+  install layers — review the rendered ruleset, then apply it behind `bastion switch`'s deadman. The
+  riskiest first-load never runs unattended.
+- **Destination-pinned zones** — a zone may now express a destination: `name = <source> to <dest> ->
+  <ports>` renders `ip saddr … ip daddr …`, so a policy like "from the WG subnet *to* this one local
+  service IP" is expressible (it wasn't before). UFW synthesis emits these precisely.
+- **`bastion setup --set firewall_scope=…`** — the ownership mode (the most safety-critical choice) is
+  now pinnable non-interactively.
+
+### Changed
+
+- **`bastion setup` wraps its first live firewall-load in an auto-reverting deadman** (the same unit
+  `bastion switch` uses, so `bastion confirm` keeps it; otherwise it rolls back). The guided install no
+  longer loads a drop-policy ruleset on a remote box with no safety net.
+- **Endpoint SSH-from-LAN auto-trust is now private-subnet only.** A public `lan_cidr` (a VPS whose
+  "local /24" is shared datacenter space) is *not* auto-trusted for SSH — the rule is dropped and the
+  wizard warns loudly to pin an explicit admin source. Previously a public /24 silently became an SSH
+  accept for every neighbor on it.
+- **`--no-ai` now actually excludes the L3 AI layer** (it was defined but inert — a silent no-op).
+- **Zone synthesis no longer fabricates an over-broad `iface:NAME -> all`** from a *qualified* UFW rule.
+  A bare `ufw allow in on wg0` still trusts the whole interface; `ufw allow in on wg0 to 10.0.0.1 port
+  8080` now yields the precise `iface:wg0 to 10.0.0.1 -> 8080`. The wizard also flags any `-> all` zone
+  that sits beside narrower ones.
+- **`status` / `doctor` report `mode=unset` on a fresh box** instead of a misleading default of `edge`.
+- The **setup dry-run** now lists *all* interfaces tagged by category (physical/overlay/bridge), and in
+  cooperative mode names the co-resident nft tables (and their forwarding/NAT) it will leave intact.
+- **`make test-deps`** installs the bench-suite dependency (pytest) the runtime package omits.
+
+### Fixed
+
+- **L0 backs up a foreign, actively-loaded `/etc/nftables.conf`** to `…pre-bastion` and warns before
+  overwriting it (a hand-rolled nftables firewall is no longer silently replaced). Only fires on a
+  genuinely non-bastion ruleset, so reinstalls and UFW-via-iptables hosts are unaffected.
+- **The dry-run install preview no longer puts AUR-only `crowdsec` on the `pacman -S` line** (it would
+  fail `target not found`); it is listed as a separate manual step, keeping the previewed command
+  copy-pasteable.
+- **The L2/CrowdSec `:8080` LAPI check is address-specific** — another service on a *different* address
+  (e.g. `10.0.0.1:8080`) no longer false-warns against the LAPI's `127.0.0.1:8080`.
+
 ## [1.5.2] - 2026-06-19
 
 ### Fixed

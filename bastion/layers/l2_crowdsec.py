@@ -17,10 +17,13 @@ UNIT = "crowdsec.service"
 LAPI_DEFAULT_PORT = 8080          # CrowdSec's local API default (127.0.0.1:8080)
 
 
-def _port_listening(sys, port: int) -> bool:
-    """True if a TCP socket is already LISTENing on ``port`` (any local address). Fail-soft: if
-    ``ss`` is missing or unparseable, return False — never block an install on a check we couldn't
-    run. Used to spot a LAPI port clash before crowdsec FATALs 'address already in use' on start."""
+def _lapi_port_conflict(sys, port: int, bind: str = "127.0.0.1") -> bool:
+    """True if a LISTENing socket would actually CLASH with binding ``bind:port`` (crowdsec's LAPI
+    default 127.0.0.1:8080). A clash needs a listener on ``bind`` itself OR a wildcard listener
+    (0.0.0.0 / :: / *) on ``port`` — those share the address. A listener on a DIFFERENT specific
+    address (e.g. another service on 10.0.0.1:8080) does NOT clash: separate sockets coexist (this is
+    the F8 false-positive fix — the old check matched the port on any address). Fail-soft: ss missing
+    or unparseable -> False, so an install is never blocked on a check we couldn't run."""
     res = sys.run("ss", "-ltnH")
     if res.returncode != 0:
         return False
@@ -28,8 +31,11 @@ def _port_listening(sys, port: int) -> bool:
         fields = line.split()
         if len(fields) < 4:
             continue
-        _, _, p = fields[3].rpartition(":")   # Local Address:Port column
-        if p == str(port):
+        addr, _, p = fields[3].rpartition(":")   # Local Address:Port column
+        if p != str(port):
+            continue
+        addr = addr.strip("[]")                  # "[::]" -> "::"
+        if addr == bind or addr in ("0.0.0.0", "::", "*"):
             return True
     return False
 
@@ -72,7 +78,7 @@ class L2Crowdsec(Layer):
         # CrowdSec's local API defaults to 127.0.0.1:8080; if that port is already taken the daemon
         # FATALs 'address already in use' on start (a silent failure: enable succeeds, start dies).
         # Warn (don't block) with the concrete fix before we try to start it.
-        if _port_listening(sys, LAPI_DEFAULT_PORT):
+        if _lapi_port_conflict(sys, LAPI_DEFAULT_PORT):
             print(f"l2: WARNING — TCP :{LAPI_DEFAULT_PORT} is already in use. CrowdSec's local API "
                   f"(LAPI) defaults to 127.0.0.1:{LAPI_DEFAULT_PORT} and will FATAL 'address "
                   "already in use' on start. Move it to a free port in BOTH "

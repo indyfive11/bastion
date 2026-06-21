@@ -13,6 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import __version__
 from . import templates, state
 from . import layers as layermod
 from .layers.base import Context, FirewallConflict
@@ -263,7 +264,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         import json as _json
         print(_json.dumps({k: doc[k] for k in _STATUS_KEYS}, indent=2, default=str))
         return 0
-    print(f"bastion status (mode={doc['mode']}, root={doc['root']})")
+    _hint = " — run `bastion setup` to configure" if doc["mode"] == "unset" else ""
+    print(f"bastion status (mode={doc['mode']}, root={doc['root']}){_hint}")
     any_installed = False
     for ly in doc["layers"]:
         any_installed = any_installed or ly["installed"]
@@ -1084,7 +1086,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "summary": {"fail": fails, "warn": warns, "ok": oks},
         }, indent=2))
         return 1 if fails else 0
-    print(f"bastion doctor (mode={ctx.mode}, root={sys_.root})")
+    _hint = " — run `bastion setup` to configure" if ctx.mode == "unset" else ""
+    print(f"bastion doctor (mode={ctx.mode}, root={sys_.root}){_hint}")
     for level, name, detail in results:
         print(f"  [{level:<4}] {name}" + (f" — {detail}" if detail else ""))
     print(f"  {fails} fail, {warns} warn, {oks} ok")
@@ -1204,7 +1207,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"bastion setup: {e}", file=sys.stderr)
         return 1
     wiz = Wizard(System(root=root), dry_run=args.dry_run, profile=args.profile, no_ai=args.no_ai,
-                 overrides=overrides, bootstrap=getattr(args, "bootstrap", False))
+                 overrides=overrides, bootstrap=getattr(args, "bootstrap", False),
+                 stage_only=getattr(args, "stage_only", False))
     result = wiz.run()
     if result.notes:
         print("\nnotes:")
@@ -1215,6 +1219,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bastion", description="Layered Linux firewall framework.")
+    parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     setup = sub.add_parser("setup", help="interactive setup wizard (detect, configure, install)")
@@ -1223,7 +1228,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--profile", help="skip profile selection (full-edge|basic-edge|full-endpoint|"
                        "minimal-endpoint|custom)")
     setup.add_argument("--no-ai", action="store_true",
-                       help="skip AI-assisted setup (Phase 5 is always rule-based; flag reserved)")
+                       help="exclude the L3 AI layer from the install (no API key prompt, no edge-ai "
+                            "units) — the rest of the profile is unaffected")
+    setup.add_argument("--stage-only", action="store_true", dest="stage_only",
+                       help="write + generate the config but do NOT load the firewall or install "
+                            "layers; review it, then apply behind `bastion switch`'s deadman")
     setup.add_argument("--bootstrap", action="store_true",
                        help="soft recovery: re-detect from scratch, do NOT trust the existing "
                             "machine.conf for detected values, and show where it disagrees with the "
