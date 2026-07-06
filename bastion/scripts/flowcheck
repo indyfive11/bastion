@@ -31,6 +31,14 @@ pass=0; fail=0
 ck(){ local desc="$1"; shift
   if "$@" >/dev/null 2>&1; then echo "  PASS  $desc"; pass=$((pass+1)); else echo "  FAIL  $desc"; fail=$((fail+1)); fi
 }
+# ck_need <bin> <desc> <cmd...> — like ck, but if <bin> is absent print SKIP (counted as neither
+# pass nor fail) naming the missing tool, instead of a misleading FAIL. For conditional checks whose
+# tool bastion does not install itself: wg (relay/WG-server checks), ss (local-DNS listener). B4: a
+# missing tool must read as "not checked", never as "broken".
+ck_need(){ local bin="$1" desc="$2"; shift 2
+  if command -v "$bin" >/dev/null 2>&1; then ck "$desc" "$@"
+  else echo "  SKIP  $desc — $bin not installed"; fi
+}
 _ck_cloudflare(){ curl -s -o /dev/null --max-time 8 https://www.cloudflare.com; }
 _ck_getent(){ getent hosts github.com; }
 _ck_dns_stub(){ dns_q "$stub_host" "$stub_port" cloudflare.com | grep -E '^[0-9]+\.'; }
@@ -132,9 +140,9 @@ case "$stub_host" in
     fi
     ;;
 esac
-[ -n "$RELAY_IF" ] && ck "relay handshake fresh (<180s)" _ck_relay_fresh
-[ -n "$WG_SERVER_IF" ] && ck "WireGuard server iface present" _ck_wg_present
-[ -n "$LAN_IP" ] && ck "local DNS listening ${LAN_IP}:53" _ck_lan_dns
+[ -n "$RELAY_IF" ] && ck_need wg "relay handshake fresh (<180s)" _ck_relay_fresh
+[ -n "$WG_SERVER_IF" ] && ck_need wg "WireGuard server iface present" _ck_wg_present
+[ -n "$LAN_IP" ] && ck_need ss "local DNS listening ${LAN_IP}:53" _ck_lan_dns
 fi
 
 echo "== summary: $pass pass / $fail fail =="

@@ -149,6 +149,17 @@ config_ok(){
   else echo "no-firewall"; return 1; fi
   if [ "$fw" = edge ]; then
     nft list table ip edge_nat 2>/dev/null | grep -qE "${RELAY_IF}.*masquerade" || { echo "relay-masq-missing(edge)"; return 1; }
+  elif ! command -v iptables >/dev/null 2>&1; then
+    # ufw governs but the iptables binary is absent, so the relay masquerade CANNOT be verified. A
+    # missing tool is not evidence of a broken config: returning config-broken here would drive a
+    # heal/rollback loop that can never fix a missing binary (the B4 "confusing broken output ->
+    # wrong action" class). Skip the check, warn ONCE (persistent daemon — same once-only sentinel
+    # idiom as the conntrack source below), and let forward health be judged by the evidence-based
+    # lan_relay_broken/egress checks instead.
+    [ -f "$RUN/iptables-missing-warned" ] || {
+      log "config_ok: ufw governs but iptables is missing — relay-masq check skipped (install iptables to enable it); NOT flagging config-broken"
+      : > "$RUN/iptables-missing-warned"
+    }
   else
     iptables -t nat -C POSTROUTING -s "$LAN_NET" -o "$RELAY_IF" -j MASQUERADE 2>/dev/null || { echo "relay-masq-missing(ufw)"; return 1; }
   fi

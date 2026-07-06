@@ -84,6 +84,33 @@ def test_config_ok_intact_when_only_relay_iface_is_down(tmp_path):
     assert "relay-iface-down" not in r.stdout
 
 
+def test_config_ok_ufw_governed_missing_iptables_is_not_config_broken(tmp_path):
+    # B4: ufw governs (no edge table, ufw active) but the iptables binary is absent, so the relay
+    # masquerade cannot be verified. A missing tool must NOT read as "our config broken" — that would
+    # drive a heal/rollback loop that can never fix a missing binary. config_ok must report INTACT
+    # (rc 0), emit no relay-masq-missing verdict, and warn exactly once via the $RUN sentinel.
+    run = tmp_path / "run"
+    driver = textwrap.dedent(f"""
+        set -u
+        RUN="{run}"; mkdir -p "$RUN"
+        LAN_NET="192.168.1.0/24"; RELAY_IF="wg0"
+        # Simulate iptables being absent WITHOUT PATH surgery: intercept only `command -v iptables`.
+        command(){{ if [ "$1" = -v ] && [ "$2" = iptables ]; then return 1; fi; builtin command "$@"; }}
+        log(){{ echo "LOG: $*"; }}
+        nft(){{ return 1; }}                                # no edge table -> fw is not edge
+        systemctl(){{ return 0; }}                          # ufw is-active -> fw=ufw
+        ip(){{ echo "default via 1.2.3.4 dev wan"; }}       # default route present
+    """) + _func("config_ok") + textwrap.dedent("""
+        if config_ok; then echo "RESULT=intact"; else echo "RESULT=broken:$(config_ok)"; fi
+        [ -f "$RUN/iptables-missing-warned" ] && echo "SENTINEL=set"
+    """)
+    r = subprocess.run(["bash", "-c", driver], capture_output=True, text=True, check=True)
+    assert "RESULT=intact" in r.stdout                      # missing tool != broken config -> no heal churn
+    assert "relay-masq-missing(ufw)" not in r.stdout        # did NOT emit the false verdict
+    assert "SENTINEL=set" in r.stdout                       # warned exactly once (sentinel dropped)
+    assert "iptables is missing" in r.stdout                # the diagnostic named the gap
+
+
 def test_heal_allowed_enforces_cooldown(tmp_path):
     # A fresh node (no prior heal) may heal; immediately after a heal it is within the cooldown and
     # must be blocked — this is the anti-thrash floor that stops a dead-upstream heal loop.
