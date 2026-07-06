@@ -192,6 +192,18 @@ if printf '%s' "$LAYERS" | grep -qw l6; then
   if grep -qiE 'roll.?back|net-rollback' /tmp/watchdog.out; then
     fail "watchdog tried to roll back a healthy node (churn)"; else pass "watchdog did not churn on a healthy node"; fi
 
+  # Walk the edge HEAL branch deterministically via the SIMULATE seam (self-contained: seeds the
+  # egress-dead hook for ONE run, auto-clears on exit). On a healthy VM a bare `once` short-circuits
+  # on the egress-OK green path and never exercises the heal path; SIMULATE forces it so we prove the
+  # branch is reachable and the DRYRUN gate holds (the live coverage gap the VPS T4 hit, 2026-06-21).
+  SIMULATE=egress-dead MODE=edge EGRESS_FAIL_TRIPS=1 DRYRUN=1 \
+    timeout 30 /usr/local/sbin/edge-watchdog once >/tmp/watchdog-sim.out 2>&1
+  rc=$?; [ $rc -eq 0 ] && pass "edge-watchdog SIMULATE=egress-dead once (dry) rc0" || note "watchdog sim rc=$rc (see /tmp/watchdog-sim.out)"
+  if grep -qiE 'self-healing|would heal' /tmp/watchdog-sim.out; then
+    pass "watchdog walked the edge heal branch under SIMULATE"; else fail "watchdog did not reach the heal branch under SIMULATE (see /tmp/watchdog-sim.out)"; fi
+  check_rc "SIMULATE seam auto-cleared on exit" test ! -e /run/edge-watchdog/simulate-egress-dead
+  check_rc "table $FAM $TABLE intact after DRYRUN heal walk" nft list table $FAM $TABLE
+
   # flowcheck — informational: egress probe to api.anthropic.com may fail behind slirp, so don't hard-fail.
   /usr/local/sbin/flowcheck >/tmp/flowcheck.out 2>&1; rc=$?
   note "flowcheck rc=$rc (output in /tmp/flowcheck.out)"

@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.8] - 2026-07-05
+
+A testability release for `edge-watchdog`, closing a live-coverage gap found during VPS
+validation: the documented `edge-watchdog once` testing entrypoint short-circuits on the
+egress-OK green path on a healthy host, so it never exercised the self-heal branch — the exact
+code path a failover test needs to walk. There is no change to the daemon's runtime behavior; this
+adds a self-contained way to drive the heal path deterministically, plus first-class help.
+
+### Added
+
+- **`SIMULATE=<scenario>` seam on `edge-watchdog`.** Seeds the matching `$RUN/simulate-<scenario>`
+  test hook for a single invocation and auto-clears it on exit (`trap … EXIT`), so
+  `SIMULATE=egress-dead MODE=edge EGRESS_FAIL_TRIPS=1 edge-watchdog once` walks the heal branch
+  end-to-end with no manual touch/rm of magic files and no risk of a stray seam outliving the run.
+  Valid scenarios: `egress-dead isp-down config-broken lan-broken wan-carrier-down`; an unknown name
+  fails fast (exit 2) rather than silently creating a no-op file.
+- **`edge-watchdog -h|--help` usage.** Dispatched right after `set -u`, ahead of the dependency and
+  root preflight, so it prints and exits 0 on any box. Documents the run modes, env knobs, the
+  `SIMULATE` seam, and the pause files.
+
+### Tests
+
+- Three unit tests (`test_edge_watchdog_failover.py`) cover the seam walking the edge heal branch and
+  self-cleaning, the fail-fast reject on an unknown scenario, and the dependency-free help dispatch.
+- The VM integration harness (`vm_edge_integration.sh`) now walks the edge HEAL branch via
+  `SIMULATE=egress-dead` under `DRYRUN`, asserting the seam auto-clears and the nft table survives.
+
 ## [1.5.7] - 2026-06-21
 
 A one-finding follow-up to the 1.5.6 watchdog hardening, surfaced while validating those changes

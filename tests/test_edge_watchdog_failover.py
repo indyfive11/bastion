@@ -24,6 +24,25 @@ def _func(name: str) -> str:
     return out
 
 
+_STUBS = (
+    "nft(){ return 0; }\nip(){ return 0; }\ncurl(){ return 1; }\nping(){ return 1; }\n"
+    "iptables(){ return 0; }\nconntrack(){ return 0; }\nsystemctl(){ return 0; }\n"
+    'logger(){ echo "LOG: $*"; }\n'
+)
+
+
+def _runnable(tmp_path) -> Path:
+    # A whole-script copy with $RUN redirected into the tmp tree and every external command the
+    # script touches redefined as a shell function (the project's no-PATH-stub idiom — sandbox /tmp
+    # is noexec). Lets us exercise the main-section SIMULATE seam + the `once` dispatch off-host.
+    run = tmp_path / "run"; run.mkdir()
+    src = SCRIPT.read_text().replace("RUN=/run/edge-watchdog", f"RUN={run}", 1)
+    # inject the stubs right after the first `set -u` so need()/probes never touch the real system
+    src = src.replace("set -u\n", "set -u\n" + _STUBS, 1)
+    dst = tmp_path / "wd"; dst.write_text(src)
+    return dst
+
+
 def _vars_block(machine_env: Path) -> str:
     # Extract the F16 cache->source->restore preamble (the `_OV_*` lines through the MODE= line)
     # and point its hardcoded source at our temp machine.env so the precedence can be exercised
@@ -109,3 +128,41 @@ def test_machine_env_used_when_no_operator_override(tmp_path):
     r = subprocess.run(["bash", "-c", driver], env=clean, capture_output=True, text=True, check=True)
     assert "MODE=endpoint" in r.stdout      # sourced value wins when no override present
     assert "RELAY_IF=wg_vps" in r.stdout
+
+
+def test_simulate_seam_walks_edge_branch_and_self_cleans(tmp_path):
+    # SIMULATE=<scenario> must make the documented `once` testing entrypoint self-contained: seed the
+    # matching test hook for ONE run so the edge heal branch is actually reached on a healthy box, then
+    # auto-remove the seam on exit (no manual touch/rm, no stray file outliving the test). Without this,
+    # `once` short-circuits on the egress-OK green path and emits nothing (the VPS T4 gap, 2026-06-21).
+    wd = _runnable(tmp_path)
+    r = subprocess.run(["bash", str(wd), "once"],
+                       env={**os.environ, "SIMULATE": "egress-dead", "MODE": "edge",
+                            "EGRESS_FAIL_TRIPS": "1", "DRYRUN": "1"},
+                       capture_output=True, text=True, check=True)
+    assert "SIMULATE=egress-dead active" in r.stdout       # seam announced
+    assert "egress check failed (1/1)" in r.stdout         # reached the failing path, not the green short-circuit
+    assert "self-healing" in r.stdout                      # edge branch entered (MODE=edge, not endpoint ALERT-ONLY)
+    assert "[DRYRUN] would heal_light" in r.stdout         # heal would fire (dry)
+    assert not list((tmp_path / "run").glob("simulate-*"))  # seam auto-cleared on exit (trap)
+
+
+def test_simulate_unknown_scenario_fails_fast(tmp_path):
+    # A typo'd scenario must abort with a clear message rather than silently creating a no-op file
+    # that never matches any hook (which would read as "test ran, found nothing").
+    wd = _runnable(tmp_path)
+    r = subprocess.run(["bash", str(wd), "once"],
+                       env={**os.environ, "SIMULATE": "bogus", "DRYRUN": "1"},
+                       capture_output=True, text=True)
+    assert r.returncode == 2
+    assert "unknown SIMULATE scenario" in r.stderr
+    assert not list((tmp_path / "run").glob("simulate-*"))  # nothing seeded on the reject path
+
+
+def test_help_flag_exits_zero_without_deps(tmp_path):
+    # `-h/--help` must print usage and exit 0 BEFORE the need()/root paths, so it works on any box
+    # (the help dispatch sits right after `set -u`, ahead of the dependency preflight).
+    for flag in ("-h", "--help", "help"):
+        r = subprocess.run(["bash", str(SCRIPT), flag], capture_output=True, text=True)
+        assert r.returncode == 0, flag
+        assert "Usage:" in r.stdout and "SIMULATE=<scenario>" in r.stdout

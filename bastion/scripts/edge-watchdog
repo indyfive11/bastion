@@ -23,11 +23,32 @@
 #
 # Modes:  edge-watchdog          -> daemon loop
 #         edge-watchdog once     -> single evaluation (testing)
+#         edge-watchdog -h|--help-> usage
 # Env:    POLL, EGRESS_FAIL_TRIPS, REFRESH_AFTER, WAN_DOWN_BACKOFF, HEAL_COOLDOWN, DRYRUN=1 (log, don't act)
 # Test hooks (in $RUN): simulate-egress-dead, simulate-isp-down,
 #         simulate-config-broken, simulate-lan-broken, simulate-wan-carrier-down
+#         SIMULATE=<scenario> seeds the matching hook for ONE run + auto-clears on exit, so the
+#         `once` testing entrypoint is self-contained (e.g. SIMULATE=egress-dead ... once) — without
+#         it, `once` on a healthy box short-circuits green, emits nothing, and never walks the heal branch.
 # Pause:  touch /run/edge-watchdog/pause   (or /etc/edge-watchdog/disabled)
 set -u
+
+usage(){ cat <<'EOF'
+edge-watchdog — standing egress/relay self-heal for a bastion edge node.
+
+Usage:
+  edge-watchdog            run the daemon poll loop
+  edge-watchdog once       run a single evaluation (testing) and exit
+  edge-watchdog -h|--help  show this help
+
+Env knobs:  POLL EGRESS_FAIL_TRIPS REFRESH_AFTER WAN_DOWN_BACKOFF HEAL_COOLDOWN DRYRUN=1
+Test seam:  SIMULATE=<scenario> seeds a test hook for ONE run (auto-cleared on exit).
+            scenarios: egress-dead isp-down config-broken lan-broken wan-carrier-down
+            e.g.  SIMULATE=egress-dead DRYRUN=1 MODE=edge EGRESS_FAIL_TRIPS=1 edge-watchdog once
+Pause:      touch /run/edge-watchdog/pause   (or /etc/edge-watchdog/disabled)
+EOF
+}
+case "${1:-}" in -h|--help|help) usage; exit 0;; esac
 
 RUN=/run/edge-watchdog
 CONF=/etc/edge-watchdog
@@ -376,6 +397,22 @@ evaluate(){
 }
 
 # ---------- main ----------
+# SIMULATE=<scenario> seeds the matching `$RUN/simulate-<scenario>` hook for THIS invocation only and
+# removes it on exit (trap), so the documented `once` testing entrypoint is self-contained — no manual
+# touch/rm of magic files, and no risk of a stray seam outliving the test. Names match the Test hooks
+# in the header. Reaching the heal branch in `once` also needs EGRESS_FAIL_TRIPS=1 (a single eval can't
+# accumulate consecutive fails). Invalid scenario fails fast rather than silently creating a no-op file.
+SIMULATE=${SIMULATE:-}
+if [ -n "$SIMULATE" ]; then
+  case "$SIMULATE" in
+    egress-dead|isp-down|config-broken|lan-broken|wan-carrier-down) ;;
+    *) printf 'bastion %s: unknown SIMULATE scenario "%s" — valid: egress-dead isp-down config-broken lan-broken wan-carrier-down\n' "${0##*/}" "$SIMULATE" >&2; exit 2 ;;
+  esac
+  touch "$RUN/simulate-$SIMULATE"
+  trap 'rm -f "$RUN/simulate-$SIMULATE"' EXIT
+  log "SIMULATE=$SIMULATE active (test seam seeded; auto-cleared on exit)"
+fi
+
 fails=0
 echo "$(date +%s)" > "$RUN/last-good-snapshot"   # seed so first auto-refresh is REFRESH_AFTER out
 if [ "${1:-}" = "once" ]; then evaluate; exit 0; fi
