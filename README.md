@@ -356,7 +356,11 @@ bastion never rewrites your resolver config.
 | `bastion check [--full\|--lan]` | read-only flow & LAN verification |
 
 Full per-command reference: **[docs/commands.md](docs/commands.md)**. When something goes wrong:
-**[docs/troubleshooting.md](docs/troubleshooting.md)**.
+**[docs/troubleshooting.md](docs/troubleshooting.md)**. For end-to-end recipes (stand up an
+edge router, coexist with libvirt, recover from a lockout) see **[docs/use-cases.md](docs/use-cases.md)**,
+and **[docs/faq.md](docs/faq.md)** for quick answers. The full doc set is indexed in
+**[docs/](docs/README.md)** — including [architecture](docs/architecture.md) and the
+[layers reference](docs/layers.md).
 
 ## Design principles
 

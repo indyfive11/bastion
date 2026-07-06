@@ -19,6 +19,10 @@ Anything that loads nft rules, installs units, or installs packages needs **root
 | `bastion setup --no-ai` | Skip AI-assisted setup (setup is always rule-based today; flag reserved). |
 | `bastion generate` | Re-render every active layer's templates from `machine.conf` → `/etc/bastion/machine.env` + config files. Run after editing `machine.conf`. |
 | `bastion generate --check` | Validate that every template placeholder resolves. Writes nothing, no network — the config gate used in CI. |
+| `bastion config list` | The control room: list settings + current values (Everyday by default; `--advanced` also shows gated ones; `--group <section>` to scope; `--json`). |
+| `bastion config get <key>` | Print one setting's current value (e.g. `network.dns_upstream`). |
+| `bastion config describe <key>` | Explain a setting and what changing it does. |
+| `bastion config set <key> <value>` | Change a setting: validate → write `machine.conf` → scoped reload. `--advanced` acknowledges a dangerous change; `--yes` skips the confirm; `--dry-run` previews only. |
 
 ## Inspection
 
@@ -85,4 +89,5 @@ goes to a human-review queue. These verbs are the controls.
 | `bastion update feeds` | Refresh the threat-intel feeds now (runs the timer's oneshot). |
 | `bastion update dnsblock` | Rebuild the DNS sinkhole now (L4). |
 
-See **[troubleshooting.md](troubleshooting.md)** when a command reports a failure.
+See **[troubleshooting.md](troubleshooting.md)** when a command reports a failure, the
+**[use-cases](use-cases.md)** for end-to-end recipes, and the **[FAQ](faq.md)** for quick answers.
