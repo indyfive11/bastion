@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.9] - 2026-07-06
+
+A robustness-and-docs release. Two operational scripts stop *misreporting* when a conditional
+tool is missing or a snapshot is partial, and the `docs/` tree is built out to the reference set
+the project promised — an architecture overview, a per-layer reference, end-to-end use-case
+recipes, and an FAQ. No change to normal-path runtime behavior.
+
+### Fixed
+
+- **B4 — name missing conditional tools instead of misreporting.** On a `ufw`-governed box that
+  lacks `iptables`, `edge-watchdog`'s `config_ok` masq check could not be verified and was read as
+  "config broken" → heal/rollback churn and false manual-intervention alerts. It now warns **once**
+  (via a `$RUN/iptables-missing-warned` sentinel, the same persistent-daemon idiom as `conntrack`),
+  skips the unverifiable check, and does **not** flag the config broken — forward health is still
+  judged evidence-based. `flowcheck` likewise now emits `SKIP … <bin> not installed` (counting
+  neither pass nor fail) for its `wg`/`ss` checks when those tools are absent, instead of a
+  misleading `FAIL`. The pre-existing hard `need <bin>` preflight in the other scripts is unchanged.
+- **C7 — flag a partial network snapshot instead of restoring it as known-good.** An empty or
+  interrupted capture was indistinguishable from a good one, so `net-rollback` would no-op and log
+  "restore complete" — a false success. `net-snapshot` now clears its `taken-at` completion marker
+  at the start of a capture and rewrites it as its final act (after every restore-relevant file), so
+  a torn or in-flight capture is detectable; `net-rollback` treats a slot with no `taken-at` as
+  incomplete — it still restores best-effort but **exits 1** and logs the restore as unverified,
+  never a clean rollback. A firewall-less box (which legitimately writes no firewall marker) is not
+  affected; the gate keys only on `taken-at`.
+
+### Documentation
+
+- **C4 — `docs/` buildout.** New `docs/architecture.md` (the render spine, the sole-writer
+  reconciler, the safety-net triad, ownership modes, and the privacy/security model),
+  `docs/layers.md` (per-layer packages/units/scripts/dependencies/health + the profile map),
+  `docs/use-cases.md` (ten end-to-end recipes — edge router, endpoint, LAN-only zones, libvirt
+  coexistence, safe cutover, lockout recovery, feeds, AI, preview, teardown), `docs/faq.md`, and a
+  `docs/README.md` index. The command reference gains the `bastion config list/get/describe/set`
+  verbs, and the README + command reference cross-link the new pages.
+
+### Tests
+
+- 549 passing. B4 adds a `config_ok` case in `test_edge_watchdog_failover.py` (hermetic
+  missing-binary fake via a `command` builtin override) and a new `test_flowcheck_optional_tools.py`;
+  C7 adds `test_net_rollback_completeness.py` (five cases, including a mid-script probe stub proving
+  `taken-at` is cleared first and rewritten last). Both were live-validated on the edge KVM VM.
+
 ## [1.5.8] - 2026-07-05
 
 A testability release for `edge-watchdog`, closing a live-coverage gap found during VPS
