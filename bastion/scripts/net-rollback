@@ -33,6 +33,20 @@ log(){ logger -t net-safe "net-rollback[$REASON]: $*"; }
 changed=0
 log "starting restore"
 
+# C7: net-snapshot clears `taken-at` at capture start and rewrites it as its final act (after every
+# restore-relevant file), so its ABSENCE means the slot is empty or a capture was interrupted — a
+# partial that must NOT be mistaken for known-good. Still restore best-effort (machine.env alone can
+# re-add the LAN addr / gateway / reload the nftables.conf), but report FAILURE at the end so no caller
+# logs a clean rollback. NB presence is not an integrity check: a disk-full capture can leave truncated
+# files that still pass here — a fully torn-write-proof slot needs an atomic temp-dir swap (tracked
+# separately). We deliberately do NOT gate on the fw-*-active marker: a firewall-less box legitimately
+# has neither, so its absence is not evidence of a partial capture.
+snap_incomplete=0
+if [ ! -f "$SNAP/taken-at" ]; then
+  snap_incomplete=1
+  log "WARNING: snapshot at $SNAP is INCOMPLETE (no completion marker) — a capture was interrupted; restoring best-effort from partial data and reporting FAILURE"
+fi
+
 # 1) LAN address present? (re-add only if missing — never bounce a working link)
 if [ -n "$LAN_IP_CIDR" ] && ! ip -4 addr show dev "$LAN_IF" 2>/dev/null | grep -q "$LAN_IP_CIDR"; then
   ip addr add "$LAN_IP_CIDR" dev "$LAN_IF" 2>/dev/null && { log "re-added LAN addr $LAN_IP_CIDR"; changed=1; }
@@ -114,6 +128,10 @@ if [ -f "$SNAP/dnsmasq-was-inactive" ] && systemctl is-active --quiet dnsmasq; t
   systemctl stop dnsmasq 2>/dev/null && { log "stopped dnsmasq (was inactive at snapshot)"; changed=1; }
 fi
 
+if [ "$snap_incomplete" -eq 1 ]; then
+  log "restore FINISHED on an INCOMPLETE snapshot — best-effort only; exit 1 (NOT a verified rollback)"
+  exit 1
+fi
 if [ "$changed" -eq 0 ]; then log "restore complete — state already matched known-good (no-op)"
 else log "restore complete — applied changes"; fi
 exit 0

@@ -11,6 +11,14 @@ STATE=/var/lib/net-safe; SNAP="${1:-$STATE/snapshot}"
 log(){ logger -t net-safe "net-snapshot: $*"; }
 mkdir -p "$SNAP/nm-system-connections" /run/net-safe
 
+# C7: this capture rewrites the slot IN PLACE (fw markers rm'd + routes truncated below), so clear the
+# completion witness first. `taken-at` is written LAST (bottom of file), after every restore-relevant
+# file — so its ABSENCE means a capture is in-flight or was interrupted, and net-rollback then treats
+# the slot as INCOMPLETE instead of restoring a torn half-overwrite as known-good. A run that reaches
+# the end rewrites it. (A slot from an older bastion is never touched until its first refresh, so it
+# keeps its taken-at and is still read as complete.)
+rm -f "$SNAP/taken-at"
+
 # Authoritative static config (IP / gateway / DNS live in the NM profiles)
 cp -a /etc/NetworkManager/system-connections/. "$SNAP/nm-system-connections/" 2>/dev/null || true
 # DNS resolver file
