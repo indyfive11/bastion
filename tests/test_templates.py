@@ -186,6 +186,28 @@ def test_zones_destination_pin_iface_source():
         'iifname "wg0" ip daddr 10.0.0.1 tcp dport { 8080 } accept'
 
 
+def test_zones_iface_plus_cidr_pins_iface_and_saddr():
+    # B9: 'iface:NAME+<CIDR>' emits BOTH iifname and ip[6] saddr — a network pinned to one interface.
+    assert _zones({"lan": "iface:eth0+192.168.1.0/24 -> all"}) == \
+        'iifname "eth0" ip saddr 192.168.1.0/24 accept'
+    assert _zones({"lan": "iface:eth0+192.168.1.0/24 -> 8096"}) == \
+        'iifname "eth0" ip saddr 192.168.1.0/24 tcp dport { 8096 } accept'
+    # family comes from the CIDR side
+    assert _zones({"v6": "iface:eth0+fd00::/8 -> 22"}) == \
+        'iifname "eth0" ip6 saddr fd00::/8 tcp dport { 22 } accept'
+    # composes with a destination pin (iifname + saddr + daddr)
+    assert _zones({"api": "iface:eth0+192.168.1.0/24 to 192.168.1.1 -> 8080"}) == \
+        'iifname "eth0" ip saddr 192.168.1.0/24 ip daddr 192.168.1.1 tcp dport { 8080 } accept'
+
+
+def test_zones_degenerate_iface_source_fails_closed():
+    # A malformed iface: source (validate_conf blocks it upstream) must NOT render a bare accept-all;
+    # it keeps the iifname clause so an empty name -> `iifname ""` -> nft REJECTS (fail-closed).
+    assert _zones({"bad": "iface: -> all"}) == 'iifname "" accept'
+    assert _zones({"bad": "iface:+192.168.1.0/24 -> 8096"}) == \
+        'iifname "" ip saddr 192.168.1.0/24 tcp dport { 8096 } accept'
+
+
 def test_lan_ssh_accept_only_for_private_subnet():
     # F6: auto-trust SSH from a PRIVATE lan_cidr, but NOT a public one (a VPS's datacenter /24).
     assert templates._lan_ssh_accept({"network": {"lan_cidr": "192.168.1.0/24"}, "ports": {"ssh": "1111"}}) \

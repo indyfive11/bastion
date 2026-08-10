@@ -90,6 +90,9 @@ def test_validate_conf_accepts_good_zones():
         "v6": "fd00::/8 -> 22",
         "api": "10.0.0.0/24 to 10.0.0.1 -> 8080",   # destination-pinned zone
         "any_to_dest": "any to 10.0.0.1 -> 8080",
+        "pinned": "iface:eth0+192.168.1.0/24 -> 8096",   # B9: iface+CIDR combined source
+        "pinned6": "iface:eth0+fd00::/8 -> 22",          # B9: v6 combined source
+        "pinned_dest": "iface:eth0+192.168.1.0/24 to 192.168.1.1 -> 8080",  # combined + dest, same family
     }
     errs, _ = state.validate_conf(c)
     assert errs == []
@@ -105,11 +108,16 @@ def test_validate_conf_rejects_bad_zones():
         "badiface": "iface:this-name-is-way-too-long -> all",
         "baddest": "10.0.0.0/24 to not-an-ip -> 8080",       # destination not an IP/CIDR
         "famsplit": "192.168.1.0/24 to fd00::1 -> 8080",     # v4 source, v6 dest -> rejected
+        "emptycidr": "iface:eth0+ -> 8080",                  # B9: '+' with no CIDR
+        "badcidr": "iface:eth0+not-an-ip -> 8080",           # B9: part after '+' not an IP/CIDR
+        "combofam": "iface:eth0+192.168.1.0/24 to fd00::1 -> 8080",  # B9: v4 combined src, v6 dest
     }
     errs, _ = state.validate_conf(c)
     blob = " ".join(errs)
     assert all(t in blob for t in ("noarrow", "not-an-ip", "70000", "53/sctp", "badiface",
                                    "baddest", "famsplit"))
+    # each B9-combined bad form is reported under its own zone name
+    assert all(t in blob for t in ("emptycidr", "badcidr", "combofam"))
 
 
 def test_validate_conf_warns_on_default_route():

@@ -295,6 +295,37 @@ def test_qualified_in_on_iface_not_flattened_to_all():
     assert zones["iface_virbr0"] == "iface:virbr0 -> all"              # bare rule still trusts iface
 
 
+def test_in_on_iface_with_from_cidr_keeps_both():
+    # B9: 'in on IFACE ... from CIDR' pins BOTH the arrival iface and the source network (anti-spoof).
+    # Old behaviour dropped the iface (the CIDR overwrote it); now both survive as 'iface:NAME+CIDR'.
+    rules = detect.parse_ufw_show_added("ufw allow in on eth0 from 192.168.1.0/24 port 8080 proto tcp\n")
+    assert ("iface:eth0+192.168.1.0/24", None, "8080", "tcp") in rules
+    zones = detect.synthesize_zones("ufw allow in on eth0 from 192.168.1.0/24 port 8080 proto tcp\n")
+    assert zones["iface_eth0_192_168_1_0_24"] == "iface:eth0+192.168.1.0/24 -> 8080/tcp"
+
+
+def test_in_on_iface_with_from_any_keeps_iface():
+    # 'from any' adds no source constraint -> keep just the iface, don't fabricate 'iface:eth0+any'.
+    rules = detect.parse_ufw_show_added("ufw allow in on eth0 from any port 8080\n")
+    assert ("iface:eth0", None, "8080", None) in rules
+
+
+def test_in_on_iface_from_cidr_to_dest_round_trip():
+    # A combined-source + destination-pin rule must survive synthesize -> validate_conf -> render.
+    from bastion import state, templates
+    ufw = "ufw allow in on eth0 from 192.168.1.0/24 to 192.168.1.10 port 8080 proto tcp\n"
+    zones = detect.synthesize_zones(ufw)
+    spec = zones["iface_eth0_192_168_1_0_24_to_192_168_1_10"]
+    assert spec == "iface:eth0+192.168.1.0/24 to 192.168.1.10 -> 8080/tcp"
+    # validate accepts it (families agree)...
+    errs, _ = state.validate_conf({"zones": {"z": spec}})
+    assert errs == []
+    # ...and it renders to a valid combined nft rule.
+    src = spec.split(" -> ")[0]
+    assert templates._zone_prefix(src) == \
+        'iifname "eth0" ip saddr 192.168.1.0/24 ip daddr 192.168.1.10 '
+
+
 def test_synthesize_zones_from_em_ufw():
     zones = detect.synthesize_zones(EM_UFW)
     assert zones["net_192_168_1_0_24"] == "192.168.1.0/24 -> 8096, 8080, 8989, 7878, 9117"

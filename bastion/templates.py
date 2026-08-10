@@ -155,11 +155,13 @@ def _zone_prefix(match: str) -> str:
 
     ``match`` is ``<source>`` or ``<source> to <dest>``. The source: ``any`` -> '' (no saddr/iif —
     every source); ``iface:NAME`` -> ``iifname "NAME"``; an IP/CIDR -> ``ip saddr <s>`` (v4) /
-    ``ip6 saddr <s>`` (v6). An optional ``to <dest>`` (IP/CIDR) appends ``ip[6] daddr <dest>`` — so a
-    zone can pin the DESTINATION (e.g. a service bound to one of several local addresses, like a UFW
-    ``to 10.0.0.1 port 8080`` rule). Family comes from whichever side is an IP (source and dest must
-    agree — validate_conf enforces it). An unparseable address falls back to ``ip`` so a genuinely
-    bad token surfaces as an nft load error rather than being silently dropped."""
+    ``ip6 saddr <s>`` (v6); ``iface:NAME+<CIDR>`` -> BOTH ``iifname "NAME" ip[6] saddr <CIDR>`` (B9 —
+    lets a zone restrict a source network to arrivals on one interface). An optional ``to <dest>``
+    (IP/CIDR) appends ``ip[6] daddr <dest>`` — so a zone can pin the DESTINATION (e.g. a service
+    bound to one of several local addresses, like a UFW ``to 10.0.0.1 port 8080`` rule). Family comes
+    from whichever side is an IP (source and dest must agree — validate_conf enforces it). An
+    unparseable address falls back to ``ip`` so a genuinely bad token surfaces as an nft load error
+    rather than being silently dropped."""
     import ipaddress
 
     def _fam(addr: str) -> str:
@@ -170,14 +172,25 @@ def _zone_prefix(match: str) -> str:
 
     source, _, dest = match.partition(" to ")
     source, dest = source.strip(), dest.strip()
-    src_is_ip = source != "any" and not source.startswith("iface:")
-    fam = _fam(source) if src_is_ip else (_fam(dest) if dest else "ip")
+
+    is_iface = source.startswith("iface:")
+    iface = ""
+    src_ip = ""
+    if is_iface:
+        iface, _, cidr = source[len("iface:"):].partition("+")   # optional +<CIDR> (B9)
+        iface, src_ip = iface.strip(), cidr.strip()
+    elif source != "any":
+        src_ip = source
+    fam = _fam(src_ip) if src_ip else (_fam(dest) if dest else "ip")
 
     parts: list[str] = []
-    if source.startswith("iface:"):
-        parts.append(f'iifname "{source[len("iface:"):].strip()}"')
-    elif src_is_ip:
-        parts.append(f"{fam} saddr {source}")
+    if is_iface:
+        # Always emit the iifname clause for an iface: source — an empty name (malformed; validate_conf
+        # blocks it upstream) yields `iifname ""`, which nft REJECTS, so a validation-bypassing caller
+        # fails CLOSED rather than rendering a bare accept-all.
+        parts.append(f'iifname "{iface}"')
+    if src_ip:
+        parts.append(f"{fam} saddr {src_ip}")
     if dest:
         parts.append(f"{fam} daddr {dest}")
     prefix = " ".join(parts)

@@ -331,7 +331,8 @@ def parse_ufw_show_added(text: str) -> list[tuple[str, str | None, str, str | No
     intent, even when ufw is disabled (its saved rules still encode the policy). ``dest`` is the
     destination IP/CIDR a rule pins (``to 10.0.0.1 …``), or None for ``to any``/absent. ``port`` is
     ``'all'`` for a source-only rule; ``proto`` is None unless the rule pins tcp/udp. source is
-    ``'any'`` | an IP/CIDR | ``'iface:NAME'``. Only ALLOW rules synthesize (deny = default-drop)."""
+    ``'any'`` | an IP/CIDR | ``'iface:NAME'`` | ``'iface:NAME+CIDR'`` (B9 — a rule that pins BOTH an
+    ``in on IFACE`` and a ``from CIDR`` keeps both). Only ALLOW rules synthesize (deny = default-drop)."""
     rules: list[tuple[str, str | None, str, str | None]] = []
     for line in text.splitlines():
         toks = line.strip().split()
@@ -357,10 +358,14 @@ def parse_ufw_show_added(text: str) -> list[tuple[str, str | None, str, str | No
                 continue
         toks = [t for t in toks if t not in ("in", "out")]
         source = iface_src or "any"
-        if "from" in toks:                      # an explicit 'from' CIDR is narrower -> it wins
+        if "from" in toks:                      # an explicit 'from' CIDR narrows the source
             i = toks.index("from")
-            if i + 1 < len(toks):
-                source = toks[i + 1]
+            if i + 1 < len(toks) and toks[i + 1] != "any":
+                from_cidr = toks[i + 1]
+                # B9: 'in on IFACE ... from CIDR' pins BOTH the arrival iface and the source network
+                # (anti-spoof). Preserve both as the combined 'iface:NAME+CIDR' source rather than
+                # letting the CIDR drop the iface. Without an iface it's just the CIDR (as before).
+                source = f"{iface_src}+{from_cidr}" if iface_src else from_cidr
         dest = None
         if "to" in toks:
             i = toks.index("to")

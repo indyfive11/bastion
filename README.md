@@ -259,15 +259,16 @@ The AI layer is opt-in and provider-agnostic. Two knobs in `machine.conf [ai]` s
 ### Firewall zones & ownership mode
 
 **Zones** are bastion's unified inbound-access policy — one rule per `source → action`, where the
-source is `any`, an IP/CIDR, or a whole interface (`iface:NAME`), and the action is `all` or a port
-list. They render as inline nftables accepts; on edge boxes they apply to LAN/overlay traffic (the
-WAN drop fires first).
+source is `any`, an IP/CIDR, a whole interface (`iface:NAME`), or a network pinned to one interface
+(`iface:NAME+<CIDR>`), and the action is `all` or a port list. They render as inline nftables accepts;
+on edge boxes they apply to LAN/overlay traffic (the WAN drop fires first).
 
 ```sh
 bastion zones list
-bastion zones add lan 192.168.1.0/24 8096 8989     # LAN reaches media ports (not SSH)
-bastion zones add wg  10.0.0.0/24 22               # a WireGuard subnet reaches SSH
-bastion zones add vms iface:virbr0 all             # trust the libvirt bridge entirely
+bastion zones add lan 192.168.1.0/24 8096 8989          # LAN reaches media ports (not SSH)
+bastion zones add wg  10.0.0.0/24 22                    # a WireGuard subnet reaches SSH
+bastion zones add vms iface:virbr0 all                  # trust the libvirt bridge entirely
+bastion zones add media "iface:eth0+192.168.1.0/24" 8096  # a port for the LAN — but only over eth0
 bastion zones remove lan
 ```
 

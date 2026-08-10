@@ -26,7 +26,7 @@ A **zone** is one inbound-access rule:
 
 | Field | Values |
 |---|---|
-| `source` | `any` · an IP or CIDR (`192.168.1.0/24`, `10.0.0.5`, `fd00::/8`) · `iface:NAME` (a whole interface, e.g. `iface:virbr0`) |
+| `source` | `any` · an IP or CIDR (`192.168.1.0/24`, `10.0.0.5`, `fd00::/8`) · `iface:NAME` (a whole interface, e.g. `iface:virbr0`) · `iface:NAME+<CIDR>` (a network **and** the interface it must arrive on, e.g. `iface:eth0+192.168.1.0/24`) |
 | `action` | `all` (full inbound access from that source) · a port list (`8096`, `8096, 8989`, `53/udp`, `22/tcp 9993/udp`) |
 
 Zones live in a `[zones]` section of `machine.conf` and render as **inline nftables accept rules**
@@ -64,6 +64,30 @@ bastion zones remove lan                            # drop a zone
 
 On an **edge** box the WAN-facing drop fires first, so zones apply to LAN/overlay traffic only. A bad
 zone (malformed source, out-of-range port) is rejected before anything is written.
+
+### Pinning a network to one interface (`iface:NAME+<CIDR>`)
+
+`iface:NAME+<CIDR>` renders `iifname "NAME" ip[6] saddr <CIDR>` — the accept fires **only** for that
+source network **and** only when the packet arrived on that interface:
+
+```sh
+bastion zones add media "iface:eth0+192.168.1.0/24" 8096   # 8096 for the LAN — but only over eth0
+```
+
+Use it to keep a subnet-scoped rule from being reached by a spoofed source address arriving over some
+other link (a WireGuard/ZeroTier tunnel that can carry a forged `192.168.1.x` packet).
+
+**Scope of the guarantee — read this before relying on it:**
+
+- It **narrows an accept**; it is not a standalone anti-spoof *drop*. A spoofed packet simply fails to
+  match this rule and falls through to the default-drop policy — **provided nothing earlier accepted
+  it.**
+- Zones render **last** in the input chain, *after* the built-in saddr-only accepts (`ssh` from
+  `lan_cidr`, DNS, `trusted_hosts`, `service_ports`). So `iface:NAME+<CIDR>` **cannot** retroactively
+  interface-lock a port that one of those rules already opens for that source — it only bites for
+  ports opened *by the zone itself*. To interface-lock SSH/DNS, scope those upstream settings instead.
+- Input chain only: zones never touch **forwarded** traffic, so this does not filter transit on an
+  edge router — only host-local input.
 
 ### Relationship to `trusted_hosts` and `service_ports`
 

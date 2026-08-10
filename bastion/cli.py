@@ -428,7 +428,8 @@ def cmd_feeds(args: argparse.Namespace) -> int:
 def cmd_zones(args: argparse.Namespace) -> int:
     """`bastion zones list|add <name> <source> <all|ports...>|remove <name>` — manage the dynamic
     [zones] source->action input-accept primitive. A zone is `name = <source> -> <action>` where
-    source is `any` / an IP-or-CIDR / `iface:NAME` and action is `all` or a port list. Edits the
+    source is `any` / an IP-or-CIDR / `iface:NAME` / `iface:NAME+<CIDR>` (pin a network to one NIC)
+    and action is `all` or a port list. Edits the
     whole [zones] section (not a single registry Setting), so it validates + writes the conf then
     runs the shared generate->firewall-reload tail (configspec.apply_firewall_change)."""
     from . import configspec as cfg
@@ -1372,7 +1373,7 @@ def build_parser() -> argparse.ArgumentParser:
     zon = sub.add_parser("zones", help="manage [zones] source->action input-accept rules")
     zon.add_argument("op", choices=["list", "add", "remove"])
     zon.add_argument("name", nargs="?", help="zone name (add/remove)")
-    zon.add_argument("source", nargs="?", help="any | <IP/CIDR> | iface:NAME (add)")
+    zon.add_argument("source", nargs="?", help="any | <IP/CIDR> | iface:NAME | iface:NAME+<CIDR> (add)")
     zon.add_argument("action", nargs="*", help="all | a port list e.g. 8096 53/udp (add)")
     zon.add_argument("--conf"); zon.add_argument("--root")
     zon.set_defaults(func=cmd_zones)

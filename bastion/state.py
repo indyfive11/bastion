@@ -221,11 +221,12 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         elif sep and proto.lower() not in ("tcp", "udp"):
             errors.append(f"[network] service_ports entry {tok!r} — proto must be tcp or udp")
 
-    # [zones]: name = <source>[ to <dest>] -> <action>. source ∈ {any, IP/CIDR, iface:NAME}; an
-    # optional `to <dest>` (IP/CIDR) pins the destination; action ∈ {all, service_ports-style port
-    # list}. The general source->action input-accept primitive — rendered inline
-    # (templates._render_zones), so a CIDR source needs no named set (sidesteps the trusted_hosts
-    # `flags interval` bug). Malformed entries block generate.
+    # [zones]: name = <source>[ to <dest>] -> <action>. source ∈ {any, IP/CIDR, iface:NAME,
+    # iface:NAME+<CIDR>}; the `iface:NAME+<CIDR>` form (B9) pins BOTH the arrival interface and the
+    # source network (restrict a network to one NIC). An optional `to <dest>` (IP/CIDR) pins the
+    # destination; action ∈ {all, service_ports-style port list}. The general source->action
+    # input-accept primitive — rendered inline (templates._render_zones), so a CIDR source needs no
+    # named set (sidesteps the trusted_hosts `flags interval` bug). Malformed entries block generate.
     for name, raw in (config.get("zones") or {}).items():
         src_raw, sep, act_raw = str(raw).partition("->")
         source, action = src_raw.strip(), act_raw.strip()
@@ -236,9 +237,19 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         src, dst = src.strip(), dst.strip()
         src_fam = None
         if src.startswith("iface:"):
-            iface = src[len("iface:"):].strip()
+            ifpart = src[len("iface:"):].strip()
+            iface, plus, cidrpart = ifpart.partition("+")   # optional +<CIDR> (B9)
+            iface, cidrpart = iface.strip(), cidrpart.strip()
             if not iface or len(iface) > 15 or not _IFACE_RE.fullmatch(iface):
                 errors.append(f"[zones] {name} source {src!r} — not a valid interface name (<=15 chars)")
+            if plus:                                         # combined 'iface:NAME+<CIDR>' — CIDR must be valid
+                if not cidrpart:
+                    errors.append(f"[zones] {name} source {src!r} — 'iface:NAME+<CIDR>' needs an IP/CIDR after '+'")
+                else:
+                    try:
+                        src_fam = ipaddress.ip_network(cidrpart, strict=False).version
+                    except ValueError:
+                        errors.append(f"[zones] {name} source {src!r} — the part after '+' must be an IP/CIDR")
         elif src != "any":
             try:
                 src_fam = ipaddress.ip_network(src, strict=False).version
