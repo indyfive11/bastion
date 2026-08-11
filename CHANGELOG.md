@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.13] - 2026-08-11
+
+A cross-distro install-guidance fix: on Debian/Ubuntu and Fedora/RHEL, `full-edge` pulls packages that
+live only in a vendor repository, and the installer now names them up front with the exact command to get
+them instead of a generic "install manually." No change to the install's success path (unresolvable
+packages were already split off so the batch never hard-failed) — this is about telling the operator how.
+
+### Fixed
+
+- **M4 — multi-distro package gaps: actionable vendor hints + up-front warning.** `full-edge` installs
+  crowdsec (L2) and wireguard-tools + zerotier-one (L5). Only pacman declared which of these are outside
+  its stock repos, so apt/dnf operators got no layer-selection warning and only a bare "install manually"
+  hint at install time. Verified the real gaps (apt live on Ubuntu 24.04; dnf via official/vendor docs):
+  `zerotier-one` is vendor-repo-only across apt/dnf; `crowdsec` is in Debian/Ubuntu stock (older) but
+  vendor-only on Fedora/RHEL; `wireguard-tools` is in stock everywhere including Rocky AppStream (not EPEL).
+  So `Apt` now flags `zerotier-one` and `Dnf` flags `crowdsec`+`zerotier-one`, each with a per-package
+  vendor one-liner (ZeroTier install script, CrowdSec packagecloud) — bastion adds no vendor repo itself.
+  No EPEL handling or per-distro branching is needed (Fedora and Rocky share the same gap set).
+
+### Tests
+
+- 599 passing (+1 for the per-manager repo_unavailable facts and the vendor-hint output).
+
 ## [1.5.12] - 2026-08-11
 
 Three HIGH-priority safety fixes: the recovery net's honesty and completeness, plus an install-time
