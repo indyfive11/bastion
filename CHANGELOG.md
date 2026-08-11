@@ -4,6 +4,43 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.12] - 2026-08-11
+
+Three HIGH-priority safety fixes: the recovery net's honesty and completeness, plus an install-time
+SSH-detection lockout guard. No change to normal-path runtime behavior on a correctly-detected box.
+
+### Fixed
+
+- **H1 — socket-activated SSH port detection (install-time lockout guard).** `bastion setup` derived the
+  SSH port from `sshd -T`/`sshd_config` then defaulted to 22, with no cross-check against the live
+  listener. On socket-activated sshd (Ubuntu/Debian `ssh.socket`, where the port lives in the socket
+  unit's `ListenStream`, not `sshd_config`) that returns 22 while the box actually listens elsewhere, so
+  the generated firewall opens the wrong port and drops real SSH — operator lockout, worst on the
+  non-interactive path that ships the detected port with no human to catch it. Detection now reads the
+  ssh socket unit authoritatively (`systemctl show <unit> -p Listen`, effective/merged; gated on the
+  socket being ACTIVE so a stale socket can't override a real traditional sshd; tries both `ssh.socket`
+  and `sshd.socket`), correcting `[ports] ssh` at the source so both edge and endpoint are covered. The
+  `ss` listener set carries no process identity, so it is only a disagreement tripwire that WARNS — it
+  never auto-selects a port. Falls back to the prior behavior on a normally configured box.
+
+- **H2 — net-snapshot content-completeness gate.** The known-good snapshot is stamped only after the
+  restore-relevant captures actually landed, so a disk-pressure/EIO failure that still lets the tiny
+  `taken-at` witness write through can no longer swap in a content-incomplete slot that `net-rollback`
+  would later restore. Each check skips cleanly when its source is legitimately absent (NM-less endpoint,
+  no resolver) so a sparse host never false-fails and self-disables its own safety net.
+
+- **H3 — recovery self-destruct arms honestly.** `bastion-recovery` no longer announces a false
+  "auto-stop in Ns" when the self-destruct timer failed to arm. Preflight fails CLOSED (requires
+  `systemctl`/`systemd-run` before building any recovery surface); at runtime an arm failure fails OPEN —
+  the last-resort session stays up (the kill switch is always present) but announces "NOT ARMED — manual
+  stop required". Both transient units are stopped + `reset-failed` before arming, so a stale failed unit
+  can't strand every future session un-timed.
+
+### Tests
+
+- 598 passing (+6 for H1 socket-port detection: pure `parse_socket_listen_ports`/`reconcile_ssh_port`
+  plus `detect()` integration; H2's completeness suite and H3's arm-rc suite added earlier in the cycle).
+
 ## [1.5.11] - 2026-08-10
 
 Two scripts-layer robustness fixes. The edge watchdog's known-good snapshot auto-refresh — advertised
