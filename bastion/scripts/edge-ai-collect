@@ -21,6 +21,12 @@ OUT         = "/var/lib/edge-ai/signals.json"
 WINDOW_HOURS = 24
 AI_SETS     = ["ai_block", "ai_ratelimit", "ai_tarpit",
                "ai_block6", "ai_ratelimit6", "ai_tarpit6"]   # report what we've done in BOTH families
+# H5: hard cap on emitted observations. Unbounded, one row per distinct public attacker over a 24h
+# window, this payload is piped verbatim to a PAID AI backend EVERY analyzer cycle (edge-ai-analyze),
+# so a heavily-scanned box burns cost+latency in normal operation. 200 » the backend's own
+# MAX_INTENTS=32 action ceiling, so the action path loses nothing; observations_total keeps the
+# truncation honest so the AI never reads a capped list as the whole picture.
+MAX_OBSERVATIONS = 200
 
 
 def _nft_table():
@@ -221,13 +227,22 @@ def main():
         o["scenarios"] = sorted(o.get("scenarios", []))
         o["total_events"] = sum(o.get("events", {}).values())
         observations.append(o)
-    observations.sort(key=lambda x: x["total_events"], reverse=True)
+    # Composite rank (all descending) so the H5 top-N cap keeps the RIGHT rows and keeps them
+    # DETERMINISTICALLY: (1) crowdsec-active-decision first — a confirmed-and-banned IP outranks raw
+    # sshd noise and, created with an empty events dict, would otherwise sort to total_events=0 and be
+    # truncated first; (2) then event volume; (3) then ip as a stable tiebreak — without it, ties at the
+    # cut are decided by PYTHONHASHSEED-randomized set-iteration order (active-decision IPs, line ~162),
+    # so byte-identical input would emit a different top-N run to run.
+    observations.sort(key=lambda x: (x.get("crowdsec_active_decision", False),
+                                     x["total_events"], x["ip"]), reverse=True)
     doc = {
         "version": 1,
         "generated_epoch": int(time.time()),
         "window_hours": WINDOW_HOURS,
         "note": ("External-safe: PUBLIC source IPs + event types + counts only. "
-                 "No internal/LAN/host/arch detail (fleet no-arch-leak HARD RULE)."),
+                 "No internal/LAN/host/arch detail (fleet no-arch-leak HARD RULE). "
+                 f"Observations are ranked (crowdsec-active, then event volume) and capped at the top "
+                 f"{MAX_OBSERVATIONS}; observations_total is the full pre-cap count (capped=true => more existed)."),
         "observations": observations,
         "already_acted": current_ai_sets(),
     }
@@ -235,6 +250,15 @@ def main():
     # (an is_global edge case, a new field, a poisoned label), refuse to emit it: drop to an empty
     # observation set rather than leak topology on the external channel.
     doc = scrub_doc(doc, allow)
+    # H5 — cap AFTER scrub (so observations_total counts only EMITTABLE attackers and the top-N is a
+    # prefix of the already-scrubbed, rank-sorted list) and BEFORE serialize (so the tripwire below
+    # scans exactly what gets written). Truncation is removal-only, so it can never introduce a leak.
+    doc["observations_total"] = len(doc["observations"])
+    doc["capped"] = doc["observations_total"] > MAX_OBSERVATIONS
+    if doc["capped"]:
+        doc["observations"] = doc["observations"][:MAX_OBSERVATIONS]
+        log(f"capped observations {doc['observations_total']} -> {MAX_OBSERVATIONS} "
+            f"(top by crowdsec-active, then event volume)")
     serialized = json.dumps(doc, separators=(",", ":"))
     leaks = find_ip_leaks(serialized, allow)
     if leaks:
@@ -243,6 +267,10 @@ def main():
         doc["observations"] = []
         doc["already_acted"] = {k: [] for k in (doc.get("already_acted") or {})}
         doc["scrubbed"] = True
+        # fail CLOSED completely: the count fields were derived from the now-discarded leaky data,
+        # so zero them too rather than ship a count alongside an empty observation set.
+        doc["observations_total"] = 0
+        doc["capped"] = False
         serialized = json.dumps(doc, separators=(",", ":"))
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     tmp = OUT + ".tmp"
@@ -263,6 +291,8 @@ def main():
             pass
     log(f"wrote {len(doc['observations'])} observations -> {OUT}")
     print(json.dumps({"observations": len(doc["observations"]),
+                      "observations_total": doc.get("observations_total", len(doc["observations"])),
+                      "capped": doc.get("capped", False),
                       "already_acted": {k: len(v) for k, v in doc["already_acted"].items()},
                       "scrubbed": doc.get("scrubbed", False)}))
     return 0
