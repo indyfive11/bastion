@@ -35,11 +35,18 @@ class PackageManager:
     name = "auto"
 
     # Packages known NOT to live in this manager's standard repositories, so `install()` can never
-    # resolve them (e.g. crowdsec is AUR-only on Arch). Declared statically so the wizard can warn
-    # at LAYER-SELECTION time — before a live probe — that the operator must install them out of
-    # band; bastion never builds them itself (Commandment #5). A live `is_available()` probe stays
-    # the authority at install time; this is the up-front, db-sync-independent heads-up.
+    # resolve them (e.g. crowdsec is AUR-only on Arch; zerotier-one is vendor-repo-only on apt/dnf).
+    # Declared statically so the wizard can warn at LAYER-SELECTION time — before a live probe — that
+    # the operator must install them out of band; bastion never adds vendor repos itself (Commandment
+    # #5). A live `is_available()` probe stays the authority at install time; this is the up-front,
+    # db-sync-independent heads-up. NOTE: list Arch-CANONICAL names here (the layers declare canonical
+    # names, and `_prereq_warn`/`install()` compare canonical) — a distro-specific name (e.g.
+    # `openssh-server`) would silently never match and the warning would vanish.
     repo_unavailable: tuple[str, ...] = ()
+
+    # Per-package vendor install one-liner for repo_unavailable packages, used by `_vendor_hint`
+    # (apt/dnf). Empty on the base; pacman keeps its own AUR-specific hint instead.
+    _VENDOR_INSTALL: dict[str, str] = {}
 
     # Per-distro package-name overrides: generic (Arch-canonical) name -> this distro's name. The
     # layer declarations use Arch names, so non-pacman managers remap the few that differ (e.g.
@@ -70,6 +77,23 @@ class PackageManager:
         """Operator instruction for packages this manager cannot resolve. Overridden per distro."""
         return (f"not available via {self.name}: {', '.join(pkgs)} — install these manually, "
                 "then re-run.")
+
+    def _vendor_hint(self, pkgs: list[str]) -> str:
+        """Vendor-repo instruction per package from `_VENDOR_INSTALL`, plus a generic fallback for any
+        without a known one-liner. Used by the apt/dnf `unavailable_hint` overrides so a missing
+        crowdsec/zerotier-one tells the operator EXACTLY how to get it (bastion adds no vendor repo
+        itself — Commandment #5)."""
+        known = [p for p in pkgs if p in self._VENDOR_INSTALL]
+        other = [p for p in pkgs if p not in self._VENDOR_INSTALL]
+        parts = []
+        if known:
+            body = "; ".join(f"{p} -> `{self._VENDOR_INSTALL[p]}`" for p in known)
+            parts.append(f"not in the {self.name} repositories (vendor-provided) — install, then "
+                         f"re-run: {body}")
+        if other:
+            parts.append(f"not available via {self.name}: {', '.join(other)} — install manually, "
+                         "then re-run.")
+        return " | ".join(parts)
 
     # --- shared behaviour ---
     def is_installed(self, sys: System, pkg: str) -> bool:
@@ -158,12 +182,22 @@ class Pacman(PackageManager):
 
 class Apt(PackageManager):
     name = "apt"
+    # zerotier-one is NOT in the Debian/Ubuntu archives (ZeroTier ships its own apt repo); crowdsec
+    # IS in universe/main (though older) and wireguard-tools is in main, so neither is flagged —
+    # verified live on Ubuntu 24.04 (crowdsec 1.4.6, wireguard-tools 1.0.x present; zerotier-one none).
+    repo_unavailable = ("zerotier-one",)
+    _VENDOR_INSTALL = {
+        "zerotier-one": "curl -s https://install.zerotier.com | sudo bash",
+    }
     # Debian/Ubuntu names that differ from the Arch-canonical ones the layers declare.
     _NAME_MAP = {
         "python": "python3",            # Arch `python` is py3; Debian splits it as python3
         "openssh": "openssh-server",    # Arch `openssh` bundles client+server; Debian splits them
         "conntrack-tools": "conntrack", # the `conntrack` CLI ships in Debian's `conntrack` package
     }
+
+    def unavailable_hint(self, pkgs: list[str]) -> str:
+        return self._vendor_hint(pkgs)
 
     def _refresh_argv(self) -> list[str]:
         return ["apt-get", "update"]
@@ -187,12 +221,25 @@ class Apt(PackageManager):
 
 class Dnf(PackageManager):
     name = "dnf"
+    # crowdsec (Fedora: unpackaged; RHEL/Rocky: not in base/AppStream/EPEL) and zerotier-one are
+    # vendor-repo-only on the whole dnf family; wireguard-tools IS available (Fedora base, Rocky/RHEL
+    # AppStream — NOT EPEL), so it is not flagged. Same gap set on Fedora and Rocky, so no per-distro
+    # branch is needed. (nftables/dnsmasq/unbound are BaseOS/AppStream.)
+    repo_unavailable = ("crowdsec", "zerotier-one")
+    _VENDOR_INSTALL = {
+        "crowdsec": ("curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/"
+                     "script.rpm.sh | sudo bash"),
+        "zerotier-one": "curl -s https://install.zerotier.com | sudo bash",
+    }
     # Fedora/RHEL-family names that differ from the Arch-canonical ones (conntrack-tools,
     # wireguard-tools, dnsmasq, unbound, nftables, curl all keep their names on Fedora).
     _NAME_MAP = {
         "python": "python3",            # Fedora ships the interpreter as python3
         "openssh": "openssh-server",    # Fedora splits client (openssh-clients) / server
     }
+
+    def unavailable_hint(self, pkgs: list[str]) -> str:
+        return self._vendor_hint(pkgs)
 
     def _refresh_argv(self) -> list[str]:
         return ["dnf", "-q", "makecache"]

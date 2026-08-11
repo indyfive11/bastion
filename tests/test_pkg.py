@@ -226,8 +226,22 @@ def test_refresh_argv_per_manager():
     assert pkg.Dnf()._refresh_argv()[:2] == ["dnf", "-q"]
 
 
-def test_pacman_declares_crowdsec_repo_unavailable():
-    # C5: pacman statically flags crowdsec as not-in-repos (AUR-only) so the wizard can warn at
-    # layer-selection time. apt makes no such claim (crowdsec IS packaged on Debian/Ubuntu).
+def test_managers_declare_repo_unavailable_per_facts():
+    # C5/M4: each manager statically flags packages NOT in its stock repos so the wizard warns at
+    # layer-selection time (all verified — apt live on Ubuntu 24.04, dnf via vendor docs).
+    #   pacman: crowdsec (AUR-only).
+    #   apt:    zerotier-one only — crowdsec IS in universe (old 1.4.6) + wireguard-tools in main.
+    #   dnf:    crowdsec + zerotier-one (vendor-repo-only); wireguard-tools is AppStream, not flagged.
     assert "crowdsec" in pkg.Pacman().repo_unavailable
-    assert pkg.Apt().repo_unavailable == ()
+    assert pkg.Apt().repo_unavailable == ("zerotier-one",)
+    assert "crowdsec" not in pkg.Apt().repo_unavailable          # crowdsec IS packaged on Debian/Ubuntu
+    assert set(pkg.Dnf().repo_unavailable) == {"crowdsec", "zerotier-one"}
+
+
+def test_apt_dnf_unavailable_hint_gives_vendor_command():
+    # M4: the hint must tell the operator EXACTLY how to get the vendor package, not a bare
+    # "install manually" (bastion adds no vendor repo itself — Commandment #5).
+    ha = pkg.Apt().unavailable_hint(["zerotier-one"])
+    assert "install.zerotier.com" in ha
+    hd = pkg.Dnf().unavailable_hint(["crowdsec", "zerotier-one"])
+    assert "packagecloud" in hd and "crowdsec" in hd and "install.zerotier.com" in hd
