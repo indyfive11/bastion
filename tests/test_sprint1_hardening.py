@@ -311,7 +311,7 @@ def test_recovery_serializes_start_and_guards_active():
     body = (SCRIPTS / "bastion-recovery").read_text()
     assert "flock -n 9" in body                              # C2: concurrent-start lock
     assert "ALREADY ACTIVE" in body                          # C2: refuse over a live session
-    assert "need sshd useradd chpasswd nft ss flock" in body  # flock preflighted
+    assert "need sshd useradd chpasswd nft ss flock systemctl systemd-run" in body  # flock + systemd preflighted (H3)
 
 
 def test_recovery_otp_is_console_only():

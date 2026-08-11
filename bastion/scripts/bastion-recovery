@@ -81,11 +81,17 @@ ensure_main_accept() {   # $1 = comma-separated portset
     || log "WARN: could not punch recovery accept into '$t input' (override table only)"
 }
 
+# Arm the self-destruct timer; RETURNS nonzero if it could not be armed — the caller decides (start and
+# extend keep the live session but announce honestly; they never silently promise an auto-stop that
+# won't happen). Clear BOTH transient units (.timer AND .service), including a lingering FAILED one,
+# first: systemd-run refuses a --unit name that still exists, so a stale bastion-recovery-destruct
+# .service tombstone would otherwise make every future arm fail (and, once arm-failure is honored,
+# strand every session un-timed). reset-failed drops that tombstone.
 arm_destruct() {
-  systemctl stop "${DESTRUCT_UNIT}.timer" 2>/dev/null || true
+  systemctl stop "${DESTRUCT_UNIT}.timer" "${DESTRUCT_UNIT}.service" 2>/dev/null || true
+  systemctl reset-failed "${DESTRUCT_UNIT}.timer" "${DESTRUCT_UNIT}.service" 2>/dev/null || true
   systemd-run --quiet --unit="$DESTRUCT_UNIT" --on-active="${WINDOW_SECONDS}s" \
-    /usr/bin/systemctl stop bastion-recovery 2>/dev/null \
-    || log "WARN: could not arm self-destruct timer (manual stop required)"
+    /usr/bin/systemctl stop bastion-recovery 2>/dev/null
 }
 
 # ---- start ----------------------------------------------------------------
@@ -93,7 +99,7 @@ do_start() {
   [ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 1; }
   # Preflight the tools the recovery surface is built from, BEFORE we create any of it — a missing
   # one mid-flow would leave a half-built privileged surface for the cleanup trap to tear down.
-  need sshd useradd chpasswd nft ss flock
+  need sshd useradd chpasswd nft ss flock systemctl systemd-run
   # C2: serialize starts + refuse to start over a LIVE session. Without this, a 2nd `start` races
   # the 1st: it sees the in-use ports, its sshd bind hits EADDRINUSE, and its failure path calls
   # do_stop — dismantling the FIRST session's live recovery. flock makes concurrent starts mutually
@@ -177,20 +183,29 @@ NFT
   local sshd; sshd=$(command -v sshd)
   "$sshd" -f "$cfg" || { log "FATAL: recovery sshd failed to start"; do_stop quiet; exit 1; }
 
-  arm_destruct
-  trap - INT TERM   # recovery surface is up and the self-destruct is armed — hand off teardown to it
+  local armed=1; arm_destruct || armed=0
+  trap - INT TERM   # recovery surface is up — hand off; a late signal must not tear down the live session
 
   # Announce — the console is the source of truth.
   local ips; ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')
   # Journal gets a non-secret breadcrumb; the OTP + connect details go to the CONSOLE ONLY (C3).
-  log "recovery ACTIVE: bound port(s) $bind, ${WINDOW_SECONDS}s window (login details shown on console only)"
+  log "recovery ACTIVE: bound port(s) $bind, $([ "$armed" = 1 ] && echo "${WINDOW_SECONDS}s window" || echo "UN-TIMED (self-destruct NOT armed)") (login details shown on console only)"
   announce "================ RECOVERY ACTIVE ================"
   announce "  bound port(s) : $bind"
   announce "  reachable IP(s): ${ips:-<none detected — check console/IPMI link>}"
   announce "  login user     : $RECOVERY_USER (sudo enabled)"
   announce "  one-time pass  : $otp"
   announce "  connect, e.g.  : ssh -p ${bind%% *} ${RECOVERY_USER}@${ips%% *}"
-  announce "  auto-stop in   : ${WINDOW_SECONDS}s  (extend: bastion recovery extend | stop: systemctl stop bastion-recovery)"
+  if [ "$armed" = 1 ]; then
+    announce "  auto-stop in   : ${WINDOW_SECONDS}s  (extend: bastion recovery extend | stop: systemctl stop bastion-recovery)"
+  else
+    # Fail-OPEN (§15c: never deny a locked-out operator the session), but NEVER promise an auto-stop
+    # that isn't armed. Tell the truth so the operator stops manually; the account-expiry (chage) + boot
+    # reaper still backstop the orphan window.
+    log "WARN: self-destruct timer could NOT be armed — recovery session is UN-TIMED (manual stop required)"
+    announce "  auto-stop      : ⚠ NOT ARMED — self-destruct failed; you MUST stop manually:"
+    announce "                     systemctl stop bastion-recovery   (backstops: account expires tomorrow; boot reaper)"
+  fi
   announce "================================================"
 }
 
@@ -239,8 +254,16 @@ do_reassert() {
 # ---- extend / status ------------------------------------------------------
 do_extend() {
   [ -d "$RUN" ] || { log "recovery is not active"; exit 1; }
-  arm_destruct
-  log "recovery window extended by ${WINDOW_SECONDS}s"
+  if arm_destruct; then
+    log "recovery window extended by ${WINDOW_SECONDS}s"
+  else
+    # arm_destruct stopped the old timer before failing to set the new one, so the session is now
+    # UN-TIMED — but it is live and in use, so we must NOT tear it down (that would be a mid-recovery
+    # lockout). Warn honestly + require a manual stop; the account-expiry + boot reaper still backstop.
+    log "WARN: could NOT re-arm self-destruct on extend — session is now UN-TIMED; stop manually with 'systemctl stop bastion-recovery' (backstops: account expires tomorrow; boot reaper)"
+    announce "bastion-recovery: ⚠ extend FAILED to re-arm auto-stop — session is UN-TIMED; stop manually: systemctl stop bastion-recovery"
+    exit 1
+  fi
 }
 do_status() {
   if [ -d "$RUN" ] && [ -f "$RUN/ports" ]; then
