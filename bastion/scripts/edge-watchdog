@@ -307,8 +307,25 @@ maybe_refresh(){
   now=$(date +%s)
   last=$(cat "$RUN/last-good-snapshot" 2>/dev/null || echo 0)
   if config_ok >/dev/null && ! lan_relay_broken && [ $((now - last)) -ge "$REFRESH_AFTER" ]; then
+    # Don't bake a detected host-resolver leak into the known-good slot: net-snapshot captures
+    # /etc/resolv.conf, so refreshing during a leak would make a later net-rollback RESTORE the
+    # ISP-DNS leak, defeating the hardened dnsmasq->unbound->VPS chain. Same applicability guard as
+    # dns_leak_watch (edge mode + a loopback stub chain expected); dns_leak_watch already alerts.
+    if [ "$MODE" != endpoint ]; then
+      case "${DNS_UPSTREAM%%#*}" in
+        127.*|::1) if resolv_leak >/dev/null; then
+                     # Latch the HELD notice once per leak episode (the daemon polls every ~POLLs and
+                     # dns_leak_watch already alerts); cleared when a clean refresh lands (below).
+                     [ -f "$RUN/refresh-held-leak" ] || { log "known-good refresh HELD — host resolver leak present (not snapshotting a leaked resolv.conf)"; : > "$RUN/refresh-held-leak"; }
+                     return
+                   fi ;;
+      esac
+    fi
     if [ "$DRYRUN" = 1 ]; then log "[DRYRUN] would refresh known-good snapshot (stable ${REFRESH_AFTER}s)"; return; fi
-    systemctl start net-snapshot.service 2>/dev/null && { echo "$now" > "$RUN/last-good-snapshot"; log "known-good snapshot refreshed (stable ${REFRESH_AFTER}s)"; }
+    # Capture directly — the idiom every other net-snapshot caller uses (bastion snapshot/switch, the
+    # wizard). There is no net-snapshot.service; the old `systemctl start` here was a silent no-op.
+    # net-snapshot exits 0 only after a complete capture, so the && stamps last-good ONLY on success.
+    /usr/local/sbin/net-snapshot >/dev/null 2>&1 && { echo "$now" > "$RUN/last-good-snapshot"; rm -f "$RUN/refresh-held-leak"; log "known-good snapshot refreshed (stable ${REFRESH_AFTER}s)"; }
   fi
 }
 
