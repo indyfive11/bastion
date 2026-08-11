@@ -135,6 +135,91 @@ def test_confirm_keeps_deadman_when_egress_still_down(tmp_path, monkeypatch):
     assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)
 
 
+class DeadmanSystem(LiveRecordingSystem):
+    """Models the deadman timer lifecycle so `bastion confirm --force` is testable: `systemctl
+    is-active` reflects whether the timer is armed, and `systemctl stop <unit>.timer` disarms it
+    (unless stop_works=False, simulating a stop that doesn't take → the timer stays active)."""
+    def __init__(self, root: Path, armed: bool = True, stop_works: bool = True, fail=()):
+        super().__init__(root=root, fail=fail)
+        self._armed = armed
+        self._stop_works = stop_works
+
+    def run(self, *args, capture=True):
+        self.calls.append(args)
+        if args[:2] == ("systemctl", "stop") and str(args[-1]).endswith(".timer"):
+            if self._stop_works:
+                self._armed = False
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ("systemctl", "is-active"):
+            return subprocess.CompletedProcess(args, 0 if self._armed else 1, "", "")
+        rc = 1 if Path(str(args[0])).name in self._fail else 0
+        return subprocess.CompletedProcess(args, rc, "", "")
+
+
+def test_confirm_force_disarms_without_probing(tmp_path, monkeypatch, capsys):
+    # --force disarms an armed deadman immediately and does NOT run the 45s net-confirm probe.
+    _seed_sbin(tmp_path, "net-confirm")
+    sys_ = DeadmanSystem(tmp_path, armed=True)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm", "--force"])) == 0
+    assert ("systemctl", "stop", "bastion-switch-deadman.timer") in sys_.calls
+    assert not any(Path(str(c[0])).name == "net-confirm" for c in sys_.calls)   # no probe
+    assert "operator override" in capsys.readouterr().out
+
+
+def test_confirm_force_fails_if_stop_does_not_take(tmp_path, monkeypatch, capsys):
+    # If the timer is STILL active after stop, --force must report failure (not a false "kept it").
+    _seed_sbin(tmp_path, "net-confirm")
+    sys_ = DeadmanSystem(tmp_path, armed=True, stop_works=False)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm", "--force"])) == 1
+    assert "FAILED to disarm" in capsys.readouterr().err
+
+
+def test_confirm_force_no_deadman_armed(tmp_path, monkeypatch, capsys):
+    # Nothing armed → honest "may have already reverted" note, rc 0 (idempotent).
+    _seed_sbin(tmp_path, "net-confirm")
+    sys_ = DeadmanSystem(tmp_path, armed=False)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm", "--force"])) == 0
+    assert "no active deadman" in capsys.readouterr().out
+
+
+class StagedRecordingSystem(System):
+    """Records run() calls but is NOT live (root != /), so live-gated paths must refuse."""
+    def __init__(self, root: Path):
+        super().__init__(root=root)
+        self.calls: list[tuple] = []
+
+    def exists(self, p: str) -> bool:
+        return True
+
+    def run(self, *args, capture=True):
+        self.calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def test_confirm_force_needs_root(tmp_path, monkeypatch, capsys):
+    # Staged --root => not live => --force refuses rather than pretending to disarm.
+    sys_ = StagedRecordingSystem(Path("/staged"))
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(
+        ["confirm", "--force", "--root", "/staged"])) == 1
+    assert "need root" in capsys.readouterr().err
+    assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)
+
+
+def test_confirm_hint_points_at_force_when_egress_down(tmp_path, monkeypatch, capsys):
+    # Default confirm with egress down keeps the deadman AND teaches the --force escape hatch.
+    _seed_sbin(tmp_path, "net-confirm")
+    sys_ = LiveRecordingSystem(tmp_path, fail=("net-confirm",))
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 1
+    err = capsys.readouterr().err
+    assert "bastion confirm --force" in err
+    assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)
+
+
 def test_net_confirm_does_not_stop_standing_watchdog():
     # F15: `bastion confirm` -> net-confirm must NOT stop edge-watchdog.service. That unit is the
     # STANDING L6 self-heal (Restart=always, "standing egress/relay self-heal"), not the cutover

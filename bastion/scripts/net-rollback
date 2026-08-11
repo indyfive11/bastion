@@ -29,18 +29,28 @@ clear_bastion_nft(){
   fi
 }
 log(){ logger -t net-safe "net-rollback[$REASON]: $*"; }
+# Reconcile a snapshot orphaned by a crash mid-swap in net-snapshot (or a non-durable rename after a
+# power loss): net-snapshot moves the live slot aside to `.<base>.prev` and swaps the fresh capture in
+# with two renames — a crash between them leaves the slot absent but the prior good copy in `.prev`.
+# Promote it before the no-snapshot gate so recovery never sees a false "cannot roll back".
+PARENT=${SNAP%/*}; BASE=${SNAP##*/}
+if [ ! -e "$SNAP" ] && [ -e "$PARENT/.$BASE.prev" ]; then
+  mv -T "$PARENT/.$BASE.prev" "$SNAP" 2>/dev/null && log "recovered snapshot from an interrupted swap (.prev)"
+fi
 [ -d "$SNAP" ] || { log "NO SNAPSHOT at $SNAP — cannot roll back"; exit 1; }
 changed=0
 log "starting restore"
 
-# C7: net-snapshot clears `taken-at` at capture start and rewrites it as its final act (after every
-# restore-relevant file), so its ABSENCE means the slot is empty or a capture was interrupted — a
-# partial that must NOT be mistaken for known-good. Still restore best-effort (machine.env alone can
-# re-add the LAN addr / gateway / reload the nftables.conf), but report FAILURE at the end so no caller
-# logs a clean rollback. NB presence is not an integrity check: a disk-full capture can leave truncated
-# files that still pass here — a fully torn-write-proof slot needs an atomic temp-dir swap (tracked
-# separately). We deliberately do NOT gate on the fw-*-active marker: a firewall-less box legitimately
-# has neither, so its absence is not evidence of a partial capture.
+# C7: net-snapshot writes `taken-at` as the final act of a capture, after every restore-relevant file.
+# Its ABSENCE means the slot is empty or an interrupted legacy in-place capture — a partial that must
+# NOT be mistaken for known-good. (A `.prev` promoted by the reconcile above always carries taken-at —
+# it was a previously-complete slot — so it passes this gate as known-good, correctly.) (net-snapshot now builds each
+# capture in a temp dir and atomically swaps it in only once taken-at is written, so the LIVE slot
+# normally always has it; this gate is belt-and-braces for the reconcile/legacy cases.) Still restore
+# best-effort (machine.env alone can re-add the LAN addr / gateway / reload the nftables.conf), but
+# report FAILURE at the end so no caller logs a clean rollback. NB presence is not an integrity check.
+# We deliberately do NOT gate on the fw-*-active marker: a firewall-less box legitimately has neither,
+# so its absence is not evidence of a partial capture.
 snap_incomplete=0
 if [ ! -f "$SNAP/taken-at" ]; then
   snap_incomplete=1

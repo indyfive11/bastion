@@ -76,7 +76,7 @@ goes to a human-review queue. These verbs are the controls.
 | `bastion snapshot --name <n>` | …and also save it as a named snapshot. |
 | `bastion snapshots` | List the auto snapshot + any named ones. |
 | `bastion rollback [name]` | Restore a snapshot (`net-rollback`). Omit the name for the auto slot; `--reason "..."` is logged. |
-| `bastion confirm` | Confirm egress is stable (~45 s), then disarm the watchdog and accept the current config as the new baseline (`net-confirm`). Also cancels a pending `bastion switch` deadman. |
+| `bastion confirm` | Confirm egress is stable (~45 s), then disarm the watchdog and accept the current config as the new baseline (`net-confirm`). Also cancels a pending `bastion switch` deadman. `--force` disarms **without** the egress check — for a present operator whose egress is down for a reason unrelated to the change (fresh install before egress is up, an ISP/probe-host outage); egress is not verified and rc 0 no longer implies it was. |
 | `bastion recovery start` | Stand up the emergency console-initiated rescue SSH (ephemeral user + one-time password on a free port; self-destructs after the window). Run from the **console**. |
 | `bastion recovery stop` / `extend` / `status` | Tear down / extend the window / report state. |
 

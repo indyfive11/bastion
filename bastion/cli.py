@@ -724,7 +724,10 @@ def cmd_snapshots(args: argparse.Namespace) -> int:
     print("bastion snapshots:")
     print(f"  {'current (auto)':<18} {_snapshot_taken_at(canon) if canon.exists() else '(none — run `bastion snapshot`)'}")
     base = sys_.path(_SNAP_NAMED)
-    named = sorted(d for d in base.iterdir() if d.is_dir()) if base.exists() else []
+    # Only list real named snapshots — skip net-snapshot's hidden swap temps (`.<name>.new.<pid>`,
+    # `.<name>.prev`), which a valid snapshot name (no leading dot) can never match.
+    named = (sorted(d for d in base.iterdir() if d.is_dir() and _valid_snapshot_name(d.name))
+             if base.exists() else [])
     for d in named:
         print(f"  {d.name:<18} {_snapshot_taken_at(d)}")
     if not named:
@@ -879,12 +882,57 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     deadman if one is armed — the operator running this IS the 'I still have access' signal a cutover
     waits for (P4). Cancel only on a clean net-confirm, so a confirm with egress still down lets the
     deadman revert. Does NOT stop the standing L6 edge-watchdog — that self-heal keeps running (F15);
-    only the transient cutover deadman timer is disarmed."""
+    only the transient cutover deadman timer is disarmed.
+
+    `--force` is the present-operator override: the egress probe gates the DEFAULT disarm, but a
+    present operator whose egress is down for a reason unrelated to the change (fresh install before
+    egress is up, an ISP/probe-host outage) would otherwise be forced into an auto-revert they don't
+    want. `--force` disarms the deadman on the operator's explicit assertion, WITHOUT waiting on the
+    45s probe (so the deadman can't fire mid-probe), and verifies the timer is actually gone before
+    reporting success. Egress is NOT verified under --force — the warning says so."""
     ctx = build_context(args)
+    sys_ = ctx.system
+    unit = f"{_SWITCH_DEADMAN_UNIT}.timer"
+
+    if getattr(args, "force", False):
+        # Operator-present override. Disarm needs a live root system (systemctl); refuse clearly
+        # rather than silently no-op and let the operator think they're safe.
+        if not (sys_.is_live and sys_.is_root):
+            print("bastion confirm --force: need root on a live system to disarm the deadman.",
+                  file=sys.stderr)
+            return 1
+        was_armed = sys_.unit_active(unit)
+        # Disarm FIRST and DON'T run the 45s net-confirm probe: the whole point of --force is not to
+        # wait on egress, and a probe ahead of the disarm could let the deadman fire mid-probe and
+        # revert the very config we're keeping.
+        sys_.run("systemctl", "stop", unit)
+        if sys_.unit_active(unit):                     # verify the stop actually took
+            print(f"bastion confirm --force: FAILED to disarm the deadman ({unit} still active) — "
+                  f"your config may auto-revert. Retry, or `sudo systemctl stop {unit}` by hand.",
+                  file=sys.stderr)
+            return 1
+        if was_armed:
+            print("bastion confirm: WARNING — egress was NOT verified and remote access paths other "
+                  "than this session were NOT checked; deadman DISARMED on operator override.")
+            sys_.run("logger", "-t", "bastion",
+                     "confirm --force: deadman disarmed on operator override (egress unverified)")
+        else:
+            print("bastion confirm --force: no active deadman timer to disarm. If you just applied a "
+                  "change, it may have ALREADY auto-reverted — re-apply and confirm sooner.")
+        return 0
+
     rc = _run_sbin(ctx, "net-confirm")
-    if rc == 0 and ctx.system.is_live and ctx.system.is_root:
+    if rc == 0 and sys_.is_live and sys_.is_root:
         # Stop the transient timer (no-op if none armed); cancels the pending net-rollback.
-        ctx.system.run("systemctl", "stop", f"{_SWITCH_DEADMAN_UNIT}.timer")
+        sys_.run("systemctl", "stop", unit)
+    elif (rc != 0 and sys_.is_live and sys_.is_root
+          and sys_.exists(f"{ctx.sbin_dir}/net-confirm")):
+        # net-confirm actually ran (installed + root + live) and reported egress down → teach the
+        # escape hatch. Gate on the script existing so a "not installed" rc=1 doesn't misfire the hint.
+        print("bastion confirm: egress not verified, so the deadman stays armed (it will auto-"
+              "revert). If you are PRESENT with admin access and want to KEEP this config anyway — "
+              "e.g. a fresh install, or an ISP/probe-host outage unrelated to your change — re-run: "
+              "bastion confirm --force", file=sys.stderr)
     return rc
 
 
@@ -1438,6 +1486,9 @@ def build_parser() -> argparse.ArgumentParser:
     td.set_defaults(func=cmd_teardown)
 
     cf = sub.add_parser("confirm", help="confirm egress is stable, then disarm the watchdog (net-confirm)")
+    cf.add_argument("--force", action="store_true",
+                    help="disarm the deadman even if the egress probe fails — you assert you are "
+                         "present and want to KEEP this config (egress is NOT verified)")
     cf.add_argument("--conf", help="path to machine.conf")
     cf.add_argument("--root", help="operate under this base dir instead of /")
     cf.set_defaults(func=cmd_confirm)

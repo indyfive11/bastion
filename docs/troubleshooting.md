@@ -133,6 +133,21 @@ it's usually a stale known-good snapshot.
 sudo bastion confirm      # verifies ~45s of stable egress, then disarms the watchdog
 ```
 
+### `bastion confirm` fails / the install auto-reverts, but I'm right here and egress is down
+**Cause.** `bastion confirm` gates the disarm on a stable-egress probe (`net-confirm`). That's the
+safe default — a cutover that broke egress *should* revert. But if egress is down for a reason
+**unrelated** to your change (a fresh install before egress is even up, an ISP outage, the probe host
+specifically unreachable), a present operator would otherwise be forced into an auto-revert of a
+config they want — and the revert can't restore egress anyway.
+**Fix.** If you are present, still have admin access, and want to keep the config despite the egress
+probe failing, override the gate:
+```sh
+sudo bastion confirm --force   # disarms the deadman WITHOUT the egress check
+```
+Egress is **not** verified under `--force` (the command says so and logs the override). It only
+disarms the transient cutover deadman; the standing L6 watchdog self-heal keeps running. Use it only
+when you've judged the egress failure is not your config's fault.
+
 ### DNS resolves but a leak is reported (`host resolver leak …`)
 **Cause.** The host's `/etc/resolv.conf` points at a public/ISP resolver (often after a DHCP renew),
 bypassing the hardened local DNS chain (dnsmasq → unbound). bastion **alerts only** — it never

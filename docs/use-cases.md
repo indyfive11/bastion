@@ -120,6 +120,8 @@ auto-reverting deadman.
 ```sh
 sudo bastion switch --minutes 10   # print the manual-rollback line → snapshot → apply → arm timer
 bastion confirm                    # still have access? lock it in (cancels the deadman)
+# If egress is down for a reason unrelated to your change (fresh install, ISP outage) but you
+# ARE present, `bastion confirm --force` disarms anyway — egress is not verified.
 # ...do nothing and the timer runs net-rollback at the deadline, restoring the previous firewall
 ```
 

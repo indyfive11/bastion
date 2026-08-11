@@ -95,25 +95,52 @@ def test_missing_dir_still_hard_refuses(tmp_path):
     assert "NO SNAPSHOT" in log
 
 
-# ---------- net-snapshot: clear-first, write-last ----------
+# ---------- net-snapshot: atomic temp-dir swap (item 3) ----------
 
-def test_net_snapshot_clears_taken_at_first_and_rewrites_last(tmp_path):
-    """taken-at is removed up front (so a mid-capture crash reads as incomplete) and present again
-    after a full run. A probe stub fired mid-script proves taken-at is absent while the capture runs.
-    The stub block points SNAP at $STATE/snapshot, so seed the prior slot there."""
+def test_net_snapshot_swaps_in_complete_capture(tmp_path):
+    """A complete capture replaces the slot via the temp-dir swap: the slot ends up with a FRESH
+    taken-at (not the stale prior), and no swap temps (`.snapshot.new.*` / `.snapshot.prev`) are left
+    lying around under /var/lib/net-safe."""
     slot = tmp_path / "snapshot"
     slot.mkdir()
     (slot / "taken-at").write_text("STALE-PRIOR-VALUE\n")   # a prior good slot being refreshed
-    probe = tmp_path / "probe.txt"
-    # `ip` is called (routes/addrs) AFTER the up-front rm but BEFORE taken-at is rewritten. If the rm
-    # ran first, taken-at is absent at that moment -> the probe stays empty. Also silence the
-    # unprivileged mkdir of /run/net-safe and stub the hyphenated *-save forensic dumps.
-    extra = (f'ip(){{ [ -f "$SNAP/taken-at" ] && printf PRESENT >> "{probe}"; return 0; }}\n'
-             'mkdir(){ command mkdir -p "$SNAP/nm-system-connections" 2>/dev/null; }\n'
-             'iptables-save(){ return 0; }\n'
-             'ip6tables-save(){ return 0; }\n')
-    rc, _ = _run("net-snapshot", tmp_path, [], extra_stubs=extra)
+    rc, _ = _run("net-snapshot", tmp_path, [])
     assert rc == 0
-    assert not probe.exists() or probe.read_text() == "", "taken-at was present mid-capture — not cleared first"
-    assert (slot / "taken-at").read_text().strip() != "STALE-PRIOR-VALUE"  # rewritten
-    assert (slot / "taken-at").exists()  # present after a completed run
+    assert (slot / "taken-at").exists()
+    assert (slot / "taken-at").read_text().strip() != "STALE-PRIOR-VALUE"   # swapped in fresh
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".snapshot.")]
+    assert leftovers == [], f"swap temps left behind: {leftovers}"
+
+
+def test_net_snapshot_keeps_prior_when_capture_incomplete(tmp_path):
+    """If the completion witness can't be written (disk full → `date > taken-at` fails), the PRIOR
+    slot is left byte-for-byte intact and the run exits 1 — a complete-stale slot beats a torn-fresh
+    one. No swap happens; the temp is cleaned up."""
+    slot = tmp_path / "snapshot"
+    slot.mkdir()
+    (slot / "taken-at").write_text("PRIOR-GOOD\n")
+    (slot / "marker").write_text("keep-me\n")
+    rc, _ = _run("net-snapshot", tmp_path, [], extra_stubs="date(){ return 1; }\n")
+    assert rc == 1
+    assert (slot / "taken-at").read_text() == "PRIOR-GOOD\n"   # untouched
+    assert (slot / "marker").read_text() == "keep-me\n"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".snapshot.")]
+    assert leftovers == [], f"temp left behind after a failed capture: {leftovers}"
+
+
+def test_net_rollback_reconciles_orphaned_prev(tmp_path):
+    """A crash between net-snapshot's two renames leaves the slot absent but the prior good copy in
+    `.snapshot.prev`. net-rollback promotes it before its no-snapshot gate, so recovery never sees a
+    false 'cannot roll back'."""
+    prev = tmp_path / ".snapshot.prev"
+    prev.mkdir()
+    (prev / "default-route.txt").write_text("default via 10.0.0.1 dev eth0\n")
+    (prev / "fw-nftables-active").write_text("")
+    (prev / "taken-at").write_text("2026-08-10T09:00:00-06:00\n")
+    assert not (tmp_path / "snapshot").exists()             # slot orphaned
+    rc, log = _run("net-rollback", tmp_path, [])
+    assert rc == 0                                          # complete slot recovered → clean rollback
+    assert "recovered snapshot from an interrupted swap" in log
+    assert (tmp_path / "snapshot" / "taken-at").exists()    # .prev promoted into the slot
+    assert not prev.exists()
+    assert "NO SNAPSHOT" not in log

@@ -108,6 +108,23 @@ def test_snapshots_lists_current_and_named(tmp_path, monkeypatch, capsys):
     assert "keep" in out and "2026-06-14T09:00:00" in out
 
 
+def test_snapshots_hides_swap_temps(tmp_path, monkeypatch, capsys):
+    # net-snapshot's swap temps land under snapshots/ for a NAMED capture; the lister must skip them
+    # (a leading dot can never be a valid snapshot name) so they never show as bogus named snapshots.
+    _seed_canonical(tmp_path, taken="2026-06-15T10:00:00+00:00")
+    named = tmp_path / "var/lib/net-safe/snapshots"
+    (named / "real").mkdir(parents=True)
+    (named / "real/taken-at").write_text("2026-06-14T09:00:00+00:00\n")
+    (named / ".real.new.1234").mkdir()          # crash-leftover swap temp
+    (named / ".real.prev").mkdir()
+    _ctx(monkeypatch, RecordingSystem(tmp_path))
+    args = cli.build_parser().parse_args(["snapshots", "--root", str(tmp_path)])
+    assert cli.cmd_snapshots(args) == 0
+    out = capsys.readouterr().out
+    assert "real" in out
+    assert ".real.new" not in out and ".real.prev" not in out
+
+
 def test_rollback_named_restores_then_runs_net_rollback(tmp_path, monkeypatch):
     _seed_sbin(tmp_path, "net-rollback")
     _seed_canonical(tmp_path, marker="stale")

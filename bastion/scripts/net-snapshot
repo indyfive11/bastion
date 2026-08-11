@@ -9,28 +9,41 @@ STATE=/var/lib/net-safe; SNAP="${1:-$STATE/snapshot}"
 # of the repo; the live node always has machine.env.
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
 log(){ logger -t net-safe "net-snapshot: $*"; }
-mkdir -p "$SNAP/nm-system-connections" /run/net-safe
 
-# C7: this capture rewrites the slot IN PLACE (fw markers rm'd + routes truncated below), so clear the
-# completion witness first. `taken-at` is written LAST (bottom of file), after every restore-relevant
-# file — so its ABSENCE means a capture is in-flight or was interrupted, and net-rollback then treats
-# the slot as INCOMPLETE instead of restoring a torn half-overwrite as known-good. A run that reaches
-# the end rewrites it. (A slot from an older bastion is never touched until its first refresh, so it
-# keeps its taken-at and is still read as complete.)
-rm -f "$SNAP/taken-at"
+# Atomic-swap capture (item 3): build the whole capture in a hidden sibling temp dir and swap it into
+# place ONLY once it is complete, instead of rewriting the live slot in place. Two properties this buys
+# over the old in-place rewrite: (1) a failed/truncated capture (e.g. disk full) NEVER touches the live
+# slot — a complete-but-stale known-good beats a torn-fresh one; (2) a reader (net-rollback, the
+# watchdog) never observes a half-written slot — it sees the old complete slot, then the new complete
+# slot, with only a rename-sized gap where the slot is briefly absent (which every reader already
+# handles fail-safe). `mv -T` never nests, so a rare concurrent capture can't corrupt the slot; the
+# moved-aside PREV lets a crash mid-swap be reconciled (below, and at the top of net-rollback).
+PARENT=${SNAP%/*}; BASE=${SNAP##*/}
+NEW="$PARENT/.$BASE.new.$$"; PREV="$PARENT/.$BASE.prev"
+trap 'rm -rf "$NEW"' EXIT
+
+# Reconcile a snapshot orphaned by a crash mid-swap (or a non-durable rename after power loss): if the
+# slot vanished but the moved-aside copy survived, promote it before doing anything else.
+if [ ! -e "$SNAP" ] && [ -e "$PREV" ]; then
+  mv -T "$PREV" "$SNAP" 2>/dev/null && log "recovered known-good slot from an interrupted swap (.prev)"
+fi
+
+mkdir -p /run/net-safe
+# 0700 on the temp (umask 077): the NM connection copies below carry PSKs/secrets; the swap carries
+# this mode onto the live slot, so the known-good dir ends up 0700 (tighter than the old 0755).
+(umask 077; rm -rf "$NEW"; mkdir -p "$NEW/nm-system-connections")
 
 # Authoritative static config (IP / gateway / DNS live in the NM profiles)
-cp -a /etc/NetworkManager/system-connections/. "$SNAP/nm-system-connections/" 2>/dev/null || true
+cp -a /etc/NetworkManager/system-connections/. "$NEW/nm-system-connections/" 2>/dev/null || true
 # DNS resolver file
-cp -P /etc/resolv.conf "$SNAP/resolv.conf" 2>/dev/null || true
+cp -P /etc/resolv.conf "$NEW/resolv.conf" 2>/dev/null || true
 # Operational state (for restore + audit)
-ip route show table main  > "$SNAP/routes.txt"        2>/dev/null || true
-ip route show default     > "$SNAP/default-route.txt" 2>/dev/null || true
-ip -br addr               > "$SNAP/addrs.txt"         2>/dev/null || true
+ip route show table main  > "$NEW/routes.txt"        2>/dev/null || true
+ip route show default     > "$NEW/default-route.txt" 2>/dev/null || true
+ip -br addr               > "$NEW/addrs.txt"         2>/dev/null || true
 # Was dnsmasq active at snapshot? (so rollback knows whether to stop it)
-rm -f "$SNAP/dnsmasq-was-active" "$SNAP/dnsmasq-was-inactive"
-if systemctl is-active --quiet dnsmasq; then : > "$SNAP/dnsmasq-was-active"
-else : > "$SNAP/dnsmasq-was-inactive"; fi
+if systemctl is-active --quiet dnsmasq; then : > "$NEW/dnsmasq-was-active"
+else : > "$NEW/dnsmasq-was-inactive"; fi
 
 # Firewall known-good: which manager DRIVES THE LIVE RULESET at snapshot time?
 # Detect by the actual loaded ruleset, NOT service unit state: ufw.service can
@@ -39,18 +52,34 @@ else : > "$SNAP/dnsmasq-was-inactive"; fi
 # governing firewall is whoever owns the live ruleset. This MUST agree with
 # net-rollback's edge_loaded() or the baseline inverts (the 2026-06-05 flap).
 # net-rollback restores THIS manager: edge => reload nftables; ufw => restart ufw.
-rm -f "$SNAP/fw-ufw-active" "$SNAP/fw-nftables-active"
 if nft list table ${NFT_TABLE:-inet edge} >/dev/null 2>&1; then
-  : > "$SNAP/fw-nftables-active"
+  : > "$NEW/fw-nftables-active"
 elif systemctl is-active --quiet ufw; then
-  : > "$SNAP/fw-ufw-active"
+  : > "$NEW/fw-ufw-active"
 fi
 # Live rulesets — forensic/audit only; restore is service-driven, not blob-replay.
-nft list ruleset > "$SNAP/nft-ruleset.txt" 2>/dev/null || true
-iptables-save    > "$SNAP/iptables.txt"    2>/dev/null || true
-ip6tables-save   > "$SNAP/ip6tables.txt"   2>/dev/null || true
+nft list ruleset > "$NEW/nft-ruleset.txt" 2>/dev/null || true
+iptables-save    > "$NEW/iptables.txt"    2>/dev/null || true
+ip6tables-save   > "$NEW/ip6tables.txt"   2>/dev/null || true
 
-date -Iseconds > "$SNAP/taken-at" 2>/dev/null || date > "$SNAP/taken-at"
+# `taken-at` is the COMPLETION witness — written last, after every restore-relevant file. If it can't
+# be written (disk full), the capture is incomplete: leave the PRIOR slot untouched and fail, rather
+# than swap in a partial. net-rollback treats a slot with no taken-at as incomplete (belt-and-braces).
+if date -Iseconds > "$NEW/taken-at" 2>/dev/null || date > "$NEW/taken-at"; then
+  # Swap the complete capture in. Move the current slot aside to PREV first (so a crash between the two
+  # renames leaves recoverable data), put the new slot in with `mv -T` (never nests), then guarantee a
+  # slot exists (restore the aside if a rare concurrent capture won the slot and ours didn't land).
+  rm -rf "$PREV"
+  [ -e "$SNAP" ] && mv -T "$SNAP" "$PREV" 2>/dev/null
+  mv -T "$NEW" "$SNAP" 2>/dev/null
+  [ -e "$SNAP" ] || mv -T "$PREV" "$SNAP" 2>/dev/null
+  # Drop the aside ONLY if a valid slot is in place. If both renames somehow failed (slot absent),
+  # KEEP PREV — it's the only surviving good copy, and net-rollback's reconcile will promote it.
+  [ -e "$SNAP" ] && rm -rf "$PREV"
+else
+  log "capture incomplete (could not write taken-at) — kept the prior snapshot, NOT swapping"
+  exit 1
+fi
 
 DEF="$(cat "$SNAP/default-route.txt" 2>/dev/null)"
 FW="none"; [ -f "$SNAP/fw-ufw-active" ] && FW="ufw"; [ -f "$SNAP/fw-nftables-active" ] && FW="nftables"
