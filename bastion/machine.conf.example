@@ -107,7 +107,7 @@ try_port_22 = yes
 [monitoring]
 # L6 watchdog/verify/alert + L4 DNS-sinkhole knobs, rendered into machine.env.
 # egress canary URL (net-confirm, flowcheck)
-egress_probe = https://api.anthropic.com
+egress_probe = https://example.com
 # relay far-end / masquerade-side IP (edge-watchdog, lan-verify); blank if no relay
 relay_dst = 10.0.0.3
 # PUBLIC endpoint IP of the upstream relay/tunnel — the address the tunnel dials OUT to (e.g. a

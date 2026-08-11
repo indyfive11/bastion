@@ -10,7 +10,8 @@
 # The blocklists themselves are fetched from GitHub — sinkholing this would brick all future updates.
 github.com
 githubusercontent.com
-# AI backend API (the default egress probe) + the secondary egress canary.
+# Neutral default egress probe (example.com is IANA-reserved) + AI backend API + secondary canary.
+example.com
 anthropic.com
 cloudflare.com
 # Distro update infrastructure — sinkholing these breaks pacman / apt / dnf.

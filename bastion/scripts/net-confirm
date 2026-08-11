@@ -10,7 +10,7 @@
 # the box with no ongoing self-heal until reboot. The cutover deadman is a SEPARATE transient unit
 # (bastion-switch-deadman) that the caller disarms; this script only reports egress stability.
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
-EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
+EGRESS_PROBE=${EGRESS_PROBE:-https://example.com}
 PROBE_HOST=${EGRESS_PROBE#*://}; PROBE_HOST=${PROBE_HOST%%/*}
 
 log(){ logger -t bastion "net-confirm: $*"; }

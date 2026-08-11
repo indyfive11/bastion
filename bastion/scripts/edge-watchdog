@@ -87,7 +87,7 @@ LAN_IP=${_OV_LAN_IP:-${LAN_IP:-}}                    # this node's LAN IP (DNS-l
 DNS_UPSTREAM=${_OV_DNS_UPSTREAM:-${DNS_UPSTREAM:-}}  # local stub resolver host#port (DNS-leak-watch gate)
 RELAY_DST=${_OV_RELAY_DST:-${RELAY_DST:-}}           # relay far-end probe target (optional)
 EXT_PINGS=${EXT_PINGS:-"1.1.1.1 8.8.8.8 9.9.9.9"}   # diverse external endpoints (ISP-up signal)
-EXT_HTTPS=${EXT_HTTPS:-"https://api.anthropic.com https://www.cloudflare.com"}
+EXT_HTTPS=${EXT_HTTPS:-"https://example.com https://www.cloudflare.com"}
 MODE=${_OV_MODE:-${MODE:-edge}}                      # edge | endpoint — endpoint never rolls back (no edge config to repair)
 
 # need <bin>... — B4 preflight: exit early with a clear message naming any missing required

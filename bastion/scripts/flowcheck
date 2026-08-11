@@ -7,7 +7,7 @@ RELAY_IF=${RELAY_IF:-}                 # upstream relay/tunnel interface (option
 WG_SERVER_IF=${WG_SERVER_IF:-}         # WireGuard server interface (optional)
 LAN_IP=${LAN_IP:-}                     # this node's LAN IP (for the local DNS listen check)
 DNS_UPSTREAM=${DNS_UPSTREAM:-}         # local stub resolver, host#port (e.g. 127.0.0.1#5335)
-EGRESS_PROBE=${EGRESS_PROBE:-https://api.anthropic.com}
+EGRESS_PROBE=${EGRESS_PROBE:-https://example.com}
 MODE=${MODE:-edge}                     # edge | endpoint — endpoint skips edge-only flows (relay/WG/local-DNS)
 
 # need <bin>... — B4 preflight: exit early with a clear message naming any missing required

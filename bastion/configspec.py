@@ -159,7 +159,7 @@ SETTINGS: tuple[Setting, ...] = (
        EVERYDAY, _v_port, "a port 1–65535 (or blank for auto)", APPLY_GENERATE),
     _S("recovery.try_port_22", "Recovery tries :22", "Also bind port 22 for recovery when free.",
        EVERYDAY, _v_choice("yes", "no"), "yes | no", APPLY_GENERATE, choices=("yes", "no")),
-    _S("monitoring.egress_probe", "Egress probe", "URL the watchdog/flowcheck use as the ISP-up canary.",
+    _S("monitoring.egress_probe", "Egress probe", "URL net-confirm/flowcheck probe as the egress canary (the watchdog keeps its own EXT_HTTPS list).",
        EVERYDAY, _v_url, "an http(s) URL", APPLY_GENERATE),
     _S("monitoring.relay_endpoint", "Relay public endpoint",
        "Public IP of the upstream relay/tunnel far end; folded into the never-block allowlist.",

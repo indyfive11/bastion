@@ -204,7 +204,7 @@ if printf '%s' "$LAYERS" | grep -qw l6; then
   check_rc "SIMULATE seam auto-cleared on exit" test ! -e /run/edge-watchdog/simulate-egress-dead
   check_rc "table $FAM $TABLE intact after DRYRUN heal walk" nft list table $FAM $TABLE
 
-  # flowcheck — informational: egress probe to api.anthropic.com may fail behind slirp, so don't hard-fail.
+  # flowcheck — informational: the egress probe may fail behind slirp, so don't hard-fail.
   /usr/local/sbin/flowcheck >/tmp/flowcheck.out 2>&1; rc=$?
   note "flowcheck rc=$rc (output in /tmp/flowcheck.out)"
   if grep -qiE 'FAIL.*(relay|wireguard|local.?dns).*endpoint' /tmp/flowcheck.out; then
