@@ -256,6 +256,36 @@ def test_l0_edge_renders_forward_sysctl(tmp_path):
     assert f"net.ipv6.conf.{config['interfaces']['wan']}.accept_ra = 2" in body
 
 
+# M2: the source-route / redirect hardening every edge box must carry (v4 + v6 where a knob exists).
+FORWARD_HARDENING = (
+    "net.ipv4.conf.all.accept_source_route = 0",
+    "net.ipv4.conf.default.accept_source_route = 0",
+    "net.ipv6.conf.all.accept_source_route = 0",
+    "net.ipv6.conf.default.accept_source_route = 0",
+    "net.ipv4.conf.all.accept_redirects = 0",
+    "net.ipv4.conf.default.accept_redirects = 0",
+    "net.ipv6.conf.all.accept_redirects = 0",
+    "net.ipv6.conf.default.accept_redirects = 0",
+    "net.ipv4.conf.all.secure_redirects = 0",
+    "net.ipv4.conf.default.secure_redirects = 0",
+    "net.ipv4.conf.all.send_redirects = 0",
+    "net.ipv4.conf.default.send_redirects = 0",
+)
+
+
+def test_l0_edge_renders_antispoof_hardening(tmp_path):
+    # M2: every edge install carries the router source-address / redirect hardening.
+    config = state.load_conf(EXAMPLE)
+    layers.get("l0").install(_ctx(tmp_path, config))
+    body = (tmp_path / FORWARD).read_text()
+    for line in FORWARD_HARDENING:
+        assert line in body, f"missing hardening sysctl: {line}"
+    # M2 must NOT (yet) ship an rp_filter directive — it's unsafe on this policy-routed box (M2b).
+    # (The scope-note comment mentions rp_filter by name, so check for a real setting line only.)
+    assert not [ln for ln in body.splitlines()
+                if "rp_filter" in ln and not ln.lstrip().startswith("#")]
+
+
 def test_l0_ipv6_forward_no_omits_v6(tmp_path):
     config = state.load_conf(EXAMPLE)
     config["network"]["ipv6_forward"] = "no"
@@ -264,6 +294,9 @@ def test_l0_ipv6_forward_no_omits_v6(tmp_path):
     assert "net.ipv4.ip_forward = 1" in body
     assert "forwarding = 1" not in body.replace("ip_forward = 1", "")   # no v6 forwarding line
     assert "accept_ra" not in body
+    # The M2 hardening is independent of the forwarding choice — present even with v6 forwarding off.
+    for line in FORWARD_HARDENING:
+        assert line in body, f"hardening must not depend on ipv6_forward: {line}"
 
 
 def test_l0_endpoint_writes_no_forward_sysctl(tmp_path):
