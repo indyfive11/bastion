@@ -66,6 +66,41 @@ def test_parse_ssh_port():
     assert detect.parse_ssh_port("", "") == 22
 
 
+def test_parse_socket_listen_ports():
+    P = detect.parse_socket_listen_ports
+    # systemd expands a bare `ListenStream=2222` to v4+v6 -> dedup to one port
+    assert P("Listen=[::]:2222 (Stream)\nListen=0.0.0.0:2222 (Stream)") == [2222]
+    assert P("Listen=2222 (Stream)") == [2222]                 # bare form, if rendered so
+    assert P("Listen=[2001:db8::1]:22 (Stream)") == [22]       # full v6 addr: brackets protect colons
+    assert P("Listen=/run/ssh-unix-local/socket (Stream)") == []   # AF_UNIX multiplex socket, not TCP
+    assert P("Listen=/run/journal/socket (Datagram)\nListen=[::]:22 (Stream)") == [22]  # UDP skipped
+    assert P("Listen=[::]:22 (Stream)\nListen=[::]:2222 (Stream)") == [22, 2222]  # multi-port
+    assert P("") == [] and P("Listen= (Stream)") == []
+
+
+def test_reconcile_ssh_port():
+    R = detect.reconcile_ssh_port
+    # socket-activated: config/`sshd -T` says 22, active ssh.socket listens on 2222 -> ADOPT 2222 + warn
+    port, warn = R(22, [2222], [("tcp", 2222), ("tcp", 80)], True)
+    assert port == 2222 and warn and "socket-activated" in warn
+    # config already matches the (single) socket port -> keep, no warning
+    assert R(2222, [2222], [("tcp", 2222)], True) == (2222, None)
+    # NO active socket, parsed port is genuinely listening -> keep, no warning
+    assert R(22, [], [("tcp", 22)], False) == (22, None)
+    # NO active socket, parsed port NOT listening -> KEEP it + tripwire warn; never auto-pick 80/3306
+    port, warn = R(22, [], [("tcp", 80), ("tcp", 3306)], False)
+    assert port == 22 and warn and "lock you out" in warn
+    # no listener data at all (ss empty/denied) -> no false warning
+    assert R(22, [], [], False) == (22, None)
+    # multi-port socket, config port declared-but-DEAD -> prefer the live socket port
+    port, warn = R(22, [22, 2222], [("tcp", 2222)], True)
+    assert port == 2222 and "socket-activated" in warn
+    # multi-port socket, config port IS live -> keep it, but warn only one port is opened
+    port, warn = R(2222, [22, 2222], [("tcp", 22), ("tcp", 2222)], True)
+    assert port == 2222 and "multiple ports" in warn
+    # Fedora/RHEL socket name path is handled by _ssh_socket_ports, not here; reconcile is name-agnostic.
+
+
 def test_sshd_config_text_includes_dropins():
     # The real port often lives in a drop-in, not the main sshd_config; non-root detection
     # (sshd -T denied) must still find it. Drop-ins come first (first-match wins).
@@ -205,6 +240,65 @@ def test_detect_falls_back_when_tools_absent():
     assert d.lan_iface is None
     assert d.proposed_scope == "exclusive"      # nothing co-resident -> bastion owns the ruleset
     assert d.proposed_zones == {}
+
+
+# --- H1: socket-activated sshd port correction (lockout guard) --------------
+
+def _base_cmds(sshd_t="port 22\n"):
+    return {
+        ("ip", "-o", "link", "show"): LINK,
+        ("ip", "-o", "-4", "addr", "show"): ADDR,
+        ("ip", "route", "show", "default"): ROUTE,
+        ("sshd", "-T"): sshd_t,
+    }
+
+
+def test_detect_socket_activated_ssh_port_is_corrected():
+    # The H1 bug: `sshd -T` reports the stock 22, but an ACTIVE ssh.socket listens on 2222.
+    cmds = _base_cmds()
+    cmds[("ss", "-tulnH")] = "tcp LISTEN 0 128 0.0.0.0:2222 0.0.0.0:*\n"
+    cmds[("systemctl", "show", "ssh.socket", "-p", "Listen")] = "Listen=[::]:2222 (Stream)\n"
+    have = {"pacman", "nft", "ssh.socket"}          # unit_active(ssh.socket) -> True
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=ubuntu\n"}, have))
+    assert d.ssh_port == 2222                        # corrected, not the stock 22 -> firewall opens 2222
+    assert d.ssh_port_warning and "socket-activated" in d.ssh_port_warning
+
+
+def test_detect_inactive_socket_does_not_override_traditional_sshd():
+    # A present-but-INACTIVE ssh.socket must never override a real traditional sshd (that would itself
+    # lock the operator out). Traditional sshd -T reports 2222; ssh.socket is not active.
+    cmds = _base_cmds(sshd_t="port 2222\n")
+    cmds[("ss", "-tulnH")] = "tcp LISTEN 0 128 0.0.0.0:2222 0.0.0.0:*\n"
+    cmds[("systemctl", "show", "ssh.socket", "-p", "Listen")] = "Listen=[::]:22 (Stream)\n"
+    have = {"pacman", "nft"}                         # ssh.socket NOT in have -> unit_active False
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=debian\n"}, have))
+    assert d.ssh_port == 2222 and d.ssh_port_warning is None
+    # Prove the active-gate is load-bearing (not a vacuous pass): the SAME fixtures with the socket
+    # ACTIVE flip the port to the socket's declared 22 — so the assertion above genuinely guards the
+    # gate rather than coinciding with a no-op reconcile.
+    d2 = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=debian\n"}, have | {"ssh.socket"}))
+    assert d2.ssh_port == 22 and d2.ssh_port_warning
+
+
+def test_detect_listener_disagreement_warns_without_autopicking():
+    # No active socket; parsed default 22 is NOT among live listeners (only 80/3306). The fix must
+    # NEVER auto-adopt a random service port (that opens the wrong hole AND drops SSH) — keep 22, warn.
+    cmds = _base_cmds()
+    cmds[("ss", "-tulnH")] = ("tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n"
+                              "tcp LISTEN 0 128 0.0.0.0:3306 0.0.0.0:*\n")
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=arch\n"}, {"pacman", "nft"}))
+    assert d.ssh_port == 22                          # 80/3306 NEVER auto-picked
+    assert d.ssh_port_warning and "lock you out" in d.ssh_port_warning
+
+
+def test_detect_sshd_socket_fedora_unit_name():
+    # Fedora/RHEL use `sshd.socket`, not `ssh.socket`; the detection must try both.
+    cmds = _base_cmds()
+    cmds[("ss", "-tulnH")] = "tcp LISTEN 0 128 [::]:2222 [::]:*\n"
+    cmds[("systemctl", "show", "sshd.socket", "-p", "Listen")] = "Listen=[::]:2222 (Stream)\n"
+    have = {"dnf", "nft", "sshd.socket"}
+    d = detect.detect(FakeSystem(cmds, {"/etc/os-release": "ID=rocky\n"}, have))
+    assert d.ssh_port == 2222 and d.ssh_port_warning
 
 
 # --- P3: categorisation, co-resident detection, listeners, synthesis -------

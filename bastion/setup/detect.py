@@ -118,6 +118,7 @@ class Detection:
     listeners: list[tuple[str, int]] = field(default_factory=list)   # (proto, port) non-loopback
     proposed_scope: str = "exclusive"                # exclusive | cooperative
     proposed_zones: dict[str, str] = field(default_factory=dict)     # name -> "source -> action"
+    ssh_port_warning: str | None = None              # set when the detected SSH port is uncertain (H1)
 
     def physical_ifaces(self) -> list[Iface]:
         return [i for i in self.interfaces if i.physical]
@@ -208,6 +209,71 @@ def parse_ssh_port(sshd_t_text: str, sshd_config_text: str = "") -> int:
         if m:
             return int(m.group(1))
     return 22
+
+
+def parse_socket_listen_ports(show_listen_text: str) -> list[int]:
+    """TCP port(s) from `systemctl show <ssh.socket> -p Listen` output — the port a socket-activated
+    sshd actually listens on (which `sshd -T`/sshd_config never report). Each listener renders as a
+    line ``Listen=<value> (Stream|Datagram)``; we take Stream (TCP) endpoints of the form ``ADDR:PORT``
+    (``0.0.0.0:2222``, ``[::]:22``, or a bare ``2222``) and skip AF_UNIX paths (``/run/…`` — e.g. the
+    ssh multiplex socket), Datagram (UDP), and anything without a numeric port. ``systemctl show``
+    returns the MERGED effective value, so the ``systemctl edit`` reset idiom (``ListenStream=`` then
+    ``=2222``) is already resolved — no fragment/drop-in ordering to hand-parse."""
+    ports: set[int] = set()
+    for line in show_listen_text.splitlines():
+        line = line.strip()
+        if not line.startswith("Listen=") or not line.endswith("(Stream)"):
+            continue
+        addr = line[len("Listen="):-len("(Stream)")].strip()
+        if not addr or addr.startswith("/"):        # AF_UNIX socket path — not a TCP port
+            continue
+        port = addr.rpartition(":")[2]              # ADDR:PORT / [::]:PORT / bare PORT -> PORT
+        if port.isdigit() and 1 <= int(port) <= 65535:   # reject 0/out-of-range; never adopt a bogus port
+            ports.add(int(port))
+    return sorted(ports)
+
+
+def reconcile_ssh_port(sshd_port: int, socket_ports: list[int],
+                       listeners: list[tuple[str, int]], socket_active: bool) -> tuple[int, str | None]:
+    """Reconcile the config-derived SSH port (`parse_ssh_port`) against ground truth (H1), returning
+    ``(port, warning)``.
+
+    Socket-activated sshd (Ubuntu/Debian ``ssh.socket``) declares the port in the socket unit, which
+    ``sshd -T``/sshd_config never see — so ``parse_ssh_port`` returns the stock 22 while the box
+    listens elsewhere, the firewall opens 22, and the operator is locked out. When an ACTIVE ssh
+    socket unit names TCP port(s), it IS the authoritative listener, so we adopt it — an *identified*
+    correction, not a guess. The ``ss`` listener set carries no process identity (``ss -tulnH`` has no
+    ``-p``, and under socket activation the listener is ``systemd`` not ``sshd``), so it is only a
+    disagreement *tripwire* that warns — it never selects a port (picking a random listening service
+    port would open the wrong hole AND still drop real SSH). If a legacy ``sshd.service`` ALSO listens
+    on a different port while the socket is active (a rare misconfig — the two are normally mutually
+    exclusive), the active socket still wins and the returned warning surfaces the swap."""
+    tcp_ports = {p for pr, p in listeners if pr == "tcp"}
+    if socket_active and socket_ports:
+        # single scalar target. Keep the config port only when it is itself a socket port AND is
+        # actually listening (or we have no liveness data at all); otherwise prefer a socket port the
+        # box is really listening on — a declared-but-dead port would still lock the operator out.
+        live = sorted(p for p in socket_ports if p in tcp_ports)
+        if sshd_port in socket_ports and (sshd_port in tcp_ports or not live):
+            chosen = sshd_port
+        elif live:
+            chosen = live[0]
+        else:
+            chosen = sorted(socket_ports)[0]
+        if chosen != sshd_port:
+            return chosen, (f"SSH: config/`sshd -T` reports port {sshd_port}, but the active "
+                            f"ssh.socket listens on {socket_ports} — using {chosen} "
+                            f"(socket-activated sshd).")
+        if len(socket_ports) > 1:
+            return chosen, (f"SSH: ssh.socket declares multiple ports {socket_ports}; the firewall "
+                            f"opens only {chosen}. Add the rest via [network] service_ports if needed.")
+        return chosen, None
+    # No active socket override: keep the parsed port; warn only if it is not actually listening.
+    if tcp_ports and sshd_port not in tcp_ports:
+        return sshd_port, (f"SSH: detected port {sshd_port} is not among live TCP listeners "
+                           f"{sorted(tcp_ports)}. If sshd is socket-activated or on another port, "
+                           f"confirm before applying — opening the wrong port can lock you out.")
+    return sshd_port, None
 
 
 def parse_os_release(text: str) -> str:
@@ -499,6 +565,11 @@ def detect(sys: System) -> Detection:
     # P3: co-resident managers + existing intent (all read-only, fail-soft -> empty when absent).
     foreign = foreign_nft_tables(parse_nft_tables(sys.run("nft", "list", "tables").stdout))
     listeners = parse_listeners(sys.run("ss", "-tulnH").stdout)
+
+    # H1: correct the SSH port against the live listener. Socket-activated sshd hides its port from
+    # `sshd -T`; an active ssh.socket is authoritative. `listeners` (process-blind) only warns.
+    socket_ports, socket_active = _ssh_socket_ports(sys)
+    ssh_port, ssh_port_warning = reconcile_ssh_port(ssh_port, socket_ports, listeners, socket_active)
     co_resident = [sid for sid in ("ufw", "firewalld", *_SELF_MANAGING)
                    if services.get(sid) and services[sid].present]
     proposed_scope = propose_scope(services, foreign)
@@ -511,7 +582,23 @@ def detect(sys: System) -> Detection:
         lan_ip=lan_ip, lan_cidr=lan_cidr,
         co_resident_firewalls=co_resident, nft_foreign_tables=foreign, listeners=listeners,
         proposed_scope=proposed_scope, proposed_zones=proposed_zones,
+        ssh_port_warning=ssh_port_warning,
     )
+
+
+def _ssh_socket_ports(sys: System) -> tuple[list[int], bool]:
+    """Effective TCP ListenStream port(s) of the ssh socket unit, and whether that socket is the
+    ACTIVE listener (H1). Only an *active* socket is authoritative — a stale/present-but-inactive
+    ``ssh.socket`` must never override a real traditional ``sshd.service`` (that would itself lock the
+    operator out). Tries both distro unit names (``ssh.socket`` Debian/Ubuntu/Arch, ``sshd.socket``
+    Fedora/RHEL). ``systemctl show -p Listen`` gives the merged value, so drop-in reset is pre-resolved."""
+    for unit in ("ssh.socket", "sshd.socket"):
+        if not sys.unit_active(unit):
+            continue
+        ports = parse_socket_listen_ports(sys.run("systemctl", "show", unit, "-p", "Listen").stdout)
+        if ports:
+            return ports, True
+    return [], False
 
 
 def _sshd_config_text(sys: System) -> str:

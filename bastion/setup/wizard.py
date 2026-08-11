@@ -545,6 +545,8 @@ class Wizard:
             o(f"  iface {i.name}: {i.kind}/{i.category}, {link}, {i.addrs or 'no-addr'}")
         o(f"  default route: {d.default_iface or '-'} via {d.gateway or '-'}")
         o(f"  ssh port: {d.ssh_port}")
+        if d.ssh_port_warning:
+            o(f"  WARNING: {d.ssh_port_warning}")
         active = sorted(k for k, v in d.services.items() if v.active)
         o(f"  active services: {', '.join(active) or 'none'}")
 
