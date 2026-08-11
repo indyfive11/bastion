@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.14] - 2026-08-11
+
+Two safety/hardening fixes on the AI and secret-writing paths. Normal-path runtime behavior is
+unchanged on a healthy box; both close a fail-silent failure mode that only shows up under load or a
+crash.
+
+### Fixed
+
+- **H5 — cap the AI collector's observation payload (cost/latency guard).** `edge-ai-collect` built an
+  unbounded `observations` list (one row per distinct public attacker over a 24h window) and piped it
+  verbatim to the paid AI backend every analyzer cycle — a heavily-scanned box burned cost and latency
+  on a multi-hundred-KB payload in normal operation (the backend caps its *output* at 32 intents, but
+  nothing bounded the *input*). Cap at the top `MAX_OBSERVATIONS=200`, applied after the no-arch-leak
+  scrub and before the serialized-bytes tripwire (truncation is removal-only, so it can never introduce
+  a leak). Rank by a composite key `(crowdsec-active-decision, total_events, ip)`, all descending, so
+  the cap keeps confirmed-malicious IPs (which carry no in-window events and would otherwise sort to the
+  bottom and be dropped first) and is deterministic run-to-run (a stable `ip` tiebreak, without which
+  PYTHONHASHSEED-randomized set iteration would emit a different top-N each run). The cap is never
+  silent: `observations_total` (the full pre-cap count) and `capped` are reported in the doc and the
+  stdout summary, the ranking is explained in the doc `note`, and the fail-closed tripwire branch zeros
+  both count fields.
+
+- **M1 — atomic 0600 writes for the three secret files.** `write_env_file` (edge-ai API-key
+  EnvironmentFile), `apply_alerts` (notify-alert.conf) and `write_wg_conf` (wireguard `<iface>.conf`)
+  each did `os.open(final, O_TRUNC, 0o600)` straight to the destination, so a crash / EIO / ENOSPC
+  mid-write left the final file truncated but present — the consumer then silently read a keyless or
+  partial config (edge-ai starts with no API key, alert sinks disabled, VPN interface broken). The
+  in-place idiom also had a real exposure window: `O_TRUNC` on a pre-existing 0644 file writes the
+  secret into a still-0644 file and only chmods 600 a syscall later. New shared helper
+  `state.atomic_write_private(out, text)` (0600-from-creation temp → fsync → `os.replace`) routes all
+  three writers through an atomic swap: the destination is now either the old or the new complete
+  contents, never truncated, and inherits the temp's fresh 0600 inode (the post-write chmod and its
+  window are gone).
+
+### Tests
+
+- 615 passing (+16: 7 for the observation cap's ranking/determinism/honesty, 9 for the atomic
+  secret-writer's crash-safety, perms, and per-site delegation).
+
 ## [1.5.13] - 2026-08-11
 
 A cross-distro install-guidance fix: on Debian/Ubuntu and Fedora/RHEL, `full-edge` pulls packages that
