@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.10] - 2026-08-10
+
+A safety-and-robustness release for the recovery path. `bastion confirm` gains a present-operator
+override so a confirmed change is never force-reverted when egress is down for a reason unrelated to
+the change; `net-snapshot` now captures atomically, so a failed capture can no longer destroy the
+known-good snapshot it was refreshing. Also ships B9 (combined interface + source-network zones). No
+change to normal-path runtime behavior.
+
+### Added
+
+- **B9 — a zone can pin an interface AND a source network (`iface:NAME+<CIDR>`).** The combined zone
+  source renders `iifname "NAME" ip[6] saddr <CIDR>`, restricting a zone-opened port to a given source
+  network arriving on one interface (anti-spoof for that port). An `iface:` source now always emits
+  its `iifname` clause, so a malformed source fails **closed** (`iifname ""`, which nft rejects)
+  instead of a bare accept-all. Detection preserves the pairing when synthesising a zone from a `ufw`
+  `in on IFACE … from CIDR` rule. The guarantee is narrow and documented: it narrows an accept, it is
+  not a standalone anti-spoof drop, and zones render last so it cannot retro-harden an already-open port.
+- **`bastion confirm --force` — present-operator override.** The default `confirm` gates the deadman
+  disarm on a stable-egress probe (`net-confirm`) — the safe default, since a cutover that broke egress
+  *should* revert. But a present operator whose egress is down for an **unrelated** reason (a fresh
+  install before egress is up, an ISP/probe-host outage) would otherwise be forced into an auto-revert
+  of a config they want. `--force` disarms the deadman on the operator's explicit assertion **without**
+  running the 45 s probe (so the deadman cannot fire mid-probe), and verifies the timer is actually
+  stopped before reporting success. Egress is not verified under `--force` — the command says so and
+  journals the override. When a default `confirm` fails because egress is down, it now prints how to
+  override.
+
+### Changed
+
+- **`net-snapshot` captures atomically (temp-dir swap).** Each capture is built in a hidden sibling
+  temp dir and swapped into the live slot only once its `taken-at` completion witness is written. A
+  failed or truncated capture (e.g. a full disk) now leaves the **prior** known-good slot untouched —
+  a complete-but-stale snapshot beats a torn-fresh one — and a reader (`net-rollback`, the watchdog)
+  never observes a half-written slot. The swap uses `mv -T` so a rare concurrent capture cannot
+  nest-corrupt the slot, and moves the prior slot aside so a crash mid-swap is recoverable:
+  `net-snapshot` and `net-rollback` both promote the aside copy if the slot is found missing. The
+  captured slot is now mode `0700` (it holds NetworkManager secrets); `bastion snapshots` skips the
+  swap temps. Builds on C7 (which made a torn capture *detectable*); this makes a failed refresh
+  *non-destructive*.
+
+### Tests
+
+- 562 passing. New `bastion confirm --force` cases (disarm-without-probe, verified-stop, root gate,
+  egress-down hint), `net-snapshot` swap / keep-prior / reconcile cases, and a `snapshots`-lister
+  filter case. Both features were live-validated on the edge KVM VM (swap slot mode `0700`, no temp
+  leftovers, `.prev` reconcile; `--force` disarm; egress-down hint).
+
 ## [1.5.9] - 2026-07-06
 
 A robustness-and-docs release. Two operational scripts stop *misreporting* when a conditional
