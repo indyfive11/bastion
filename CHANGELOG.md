@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.11] - 2026-08-10
+
+Two scripts-layer robustness fixes. The edge watchdog's known-good snapshot auto-refresh — advertised
+but never actually running — is activated and guarded so it can't capture a leaked DNS state; and the
+default egress/liveness probe becomes a neutral, vendor-agnostic host. No change to normal-path runtime
+behavior.
+
+### Changed
+
+- **N2 — the known-good snapshot auto-refresh now runs (edge-watchdog).** `maybe_refresh` invoked a
+  `net-snapshot.service` unit that does not exist, so the "self-refreshing known-good snapshot" was a
+  silent no-op — the watchdog's rollback target never refreshed. It now calls `net-snapshot` directly
+  (the idiom every other caller uses). The refresh is held while a host-resolver DNS leak is detected
+  (edge mode + a loopback stub chain), so a leaked `/etc/resolv.conf` can't be baked into the known-good
+  slot and later restored by `net-rollback`; the hold notice latches once per episode.
+- **N1 — neutral default egress probe.** The default egress/liveness probe changes from
+  `https://api.anthropic.com` to `https://example.com` (IANA/RFC-2606 reserved) across `net-confirm`,
+  `flowcheck`, the watchdog's `EXT_HTTPS` liveness list, `machine.conf.example`, and the DNS never-sink
+  allowlist. example.com returns a clean HTTP 200 for flowcheck's `[200|404]` gate and has no datacenter
+  bot-challenge, so it doesn't false-fail on VPS egress; flowcheck's independent cross-check stays a
+  different host (cloudflare). A general firewall framework shouldn't hard-default its liveness canary to
+  one SaaS API — an operator can still set `[monitoring] egress_probe` to any host.
+
+### Tests
+
+- `tests/test_edge_watchdog_refresh.py` (10) and `tests/test_egress_probe_defaults.py` (5); 577 total.
+
 ## [1.5.10] - 2026-08-10
 
 A safety-and-robustness release for the recovery path. `bastion confirm` gains a present-operator
