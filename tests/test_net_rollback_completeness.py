@@ -23,6 +23,10 @@ def _run(script_name, testdir, argv, extra_stubs="", pre=""):
     # (cat, rm, mkdir, [, grep -q on files) stay real.
     stubs = (
         f'STATE="{testdir}"; SNAP="$STATE/snapshot"\n'
+        # Point net-snapshot's completeness-gate seams at (absent) fixtures by default so the gate
+        # skips both clauses — the dev box is a live node with real NM profiles + resolv.conf, which
+        # would otherwise be read by the gate. Tests that exercise the gate override these.
+        f'NM_DIR="{testdir}/nm-src"; RESOLV_CONF="{testdir}/resolv-absent"\n'
         f'logger(){{ printf "%s\\n" "$*" >> "{log}"; }}\n'
         'nft(){ return 1; }\n'            # no bastion table loaded (edge_loaded -> false)
         'ip(){ return 0; }\n'

@@ -5,10 +5,19 @@
 # slot net-rollback + the watchdog use); an optional $1 captures to a different dir instead, so a
 # NAMED snapshot is written straight to its own slot WITHOUT clobbering the auto slot (F10).
 STATE=/var/lib/net-safe; SNAP="${1:-$STATE/snapshot}"
+# Marker write, extracted (and defined BEFORE the machine.env source so a unit test injecting stubs at
+# that line can override it) so a test can force it to fail — simulating a transient EIO on the tiny
+# known-good firewall marker, which would otherwise leave net-rollback with no firewall to restore.
+write_marker(){ : > "$1"; }
 # NFT_TABLE (inet edge on edge, inet bastion on endpoint) — must match net-rollback's
 # edge_loaded() or the firewall-manager baseline inverts. Generic fallback keeps topology out
 # of the repo; the live node always has machine.env.
 [ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+# Testability + override seams: the authoritative NM profile dir and the resolver file. Default to the
+# real host paths (zero production change); the unit tests point them at fixtures so the completeness
+# gate below can be exercised hermetically (the dev box is a live node with real NM profiles).
+NM_DIR=${NM_DIR:-/etc/NetworkManager/system-connections}
+RESOLV_CONF=${RESOLV_CONF:-/etc/resolv.conf}
 log(){ logger -t net-safe "net-snapshot: $*"; }
 
 # Atomic-swap capture (item 3): build the whole capture in a hidden sibling temp dir and swap it into
@@ -34,10 +43,13 @@ mkdir -p /run/net-safe
 # this mode onto the live slot, so the known-good dir ends up 0700 (tighter than the old 0755).
 (umask 077; rm -rf "$NEW"; mkdir -p "$NEW/nm-system-connections")
 
-# Authoritative static config (IP / gateway / DNS live in the NM profiles)
-cp -a /etc/NetworkManager/system-connections/. "$NEW/nm-system-connections/" 2>/dev/null || true
+# Authoritative static config (IP / gateway / DNS live in the NM profiles). Sample the source profile
+# count BEFORE the copy so the completeness gate compares against a frozen number, not a re-count that
+# could race NM rewriting a profile mid-snapshot (boot / `bastion setup`).
+src_nm=$(ls -1 "$NM_DIR"/*.nmconnection 2>/dev/null | wc -l)
+cp -a "$NM_DIR/." "$NEW/nm-system-connections/" 2>/dev/null || true
 # DNS resolver file
-cp -P /etc/resolv.conf "$NEW/resolv.conf" 2>/dev/null || true
+cp -P "$RESOLV_CONF" "$NEW/resolv.conf" 2>/dev/null || true
 # Operational state (for restore + audit)
 ip route show table main  > "$NEW/routes.txt"        2>/dev/null || true
 ip route show default     > "$NEW/default-route.txt" 2>/dev/null || true
@@ -54,19 +66,65 @@ else : > "$NEW/dnsmasq-was-inactive"; fi
 # net-rollback's edge_loaded() or the baseline inverts (the 2026-06-05 flap).
 # net-rollback restores THIS manager: edge => reload nftables; ufw => restart ufw.
 if nft list table ${NFT_TABLE:-inet edge} >/dev/null 2>&1; then
-  : > "$NEW/fw-nftables-active"
+  write_marker "$NEW/fw-nftables-active" || fw_marker_failed=1
 elif systemctl is-active --quiet ufw; then
-  : > "$NEW/fw-ufw-active"
+  write_marker "$NEW/fw-ufw-active" || fw_marker_failed=1
 fi
 # Live rulesets — forensic/audit only; restore is service-driven, not blob-replay.
 nft list ruleset > "$NEW/nft-ruleset.txt" 2>/dev/null || true
 iptables-save    > "$NEW/iptables.txt"    2>/dev/null || true
 ip6tables-save   > "$NEW/ip6tables.txt"   2>/dev/null || true
 
-# `taken-at` is the COMPLETION witness — written last, after every restore-relevant file. If it can't
-# be written (disk full), the capture is incomplete: leave the PRIOR slot untouched and fail, rather
-# than swap in a partial. net-rollback treats a slot with no taken-at as incomplete (belt-and-braces).
-if date -Iseconds > "$NEW/taken-at" 2>/dev/null || date > "$NEW/taken-at"; then
+# --- Completeness gate (H2): a capture WRITE can fail silently (disk pressure, a transient EIO) while
+# the tiny taken-at write below still succeeds — which would swap a content-INCOMPLETE slot in as
+# known-good and let a later net-rollback "restore" from it and report success. So require the
+# RESTORE-RELEVANT captures this host should have produced to have actually landed, BEFORE stamping the
+# slot complete. Each clause SKIPS when its source is legitimately absent (an NM-less endpoint, a box
+# with no resolver, a firewall-less box) so a sparse-but-valid host never false-fails and disables its
+# own safety net. Logs stay generic — counts only, never a profile name or resolver contents. NOT
+# gated (survivable, so gating would only add false-incomplete risk): default-route.txt (net-rollback
+# has a GATEWAY fallback) and the dnsmasq marker (its loss only skips a non-lifeline stop).
+capture_ok=1
+# NM profiles: the frozen copy must hold at least the pre-copy source count (>= tolerates a concurrent
+# add/delete), and no profile may be zero-length (a truncated copy). Skip when NM manages nothing here.
+if [ "${src_nm:-0}" -gt 0 ]; then
+  dst_nm=$(ls -1 "$NEW/nm-system-connections/"*.nmconnection 2>/dev/null | wc -l)
+  # Compare against min(count before cp, count now): a profile legitimately ADDED or DELETED between
+  # the pre-cp sample and here is not a capture failure — only a copy that landed fewer than the source
+  # actually held is. Keeps a concurrent NM edit (boot / `bastion setup`) from false-failing the capture.
+  now_nm=$(ls -1 "$NM_DIR"/*.nmconnection 2>/dev/null | wc -l)
+  floor=$src_nm; [ "$now_nm" -lt "$floor" ] && floor=$now_nm
+  if [ "$dst_nm" -lt "$floor" ]; then
+    capture_ok=0; log "capture incomplete (content): NM profiles captured $dst_nm of $floor"
+  else
+    for f in "$NEW/nm-system-connections/"*.nmconnection; do
+      [ -e "$f" ] || continue
+      [ -s "$f" ] && continue
+      # A zero-length COPY is a failure only if the source counterpart had content (a truncated write);
+      # an already-empty source faithfully reproduced by cp is NOT — else one stray 0-byte profile on
+      # the host would disable snapshotting forever.
+      [ -s "$NM_DIR/${f##*/}" ] || continue
+      capture_ok=0; log "capture incomplete (content): an NM profile copied empty"; break
+    done
+  fi
+fi
+# resolv.conf is stored verbatim as a SYMLINK by design (cp -P), so completeness = the copy exists as a
+# file OR a symlink; NEVER deref the target (a relative/absent stub target would false-fail a valid
+# capture — the field-vs-dev trap). Skip when the host has no resolver file at all.
+if [ -e "$RESOLV_CONF" ] || [ -L "$RESOLV_CONF" ]; then
+  [ -e "$NEW/resolv.conf" ] || [ -L "$NEW/resolv.conf" ] \
+    || { capture_ok=0; log "capture incomplete (content): resolv.conf copy missing"; }
+fi
+# Firewall known-good marker: if a firewall was detected active above, its marker write must have
+# landed, else net-rollback would restore NO firewall (both markers absent). Only fires on a failed
+# marker WRITE — a firewall-less box legitimately has neither marker (fw_marker_failed stays unset).
+[ "${fw_marker_failed:-0}" = 1 ] && { capture_ok=0; log "capture incomplete (content): firewall known-good marker not written"; }
+
+# `taken-at` is the COMPLETION witness — written last, after every restore-relevant file. If the
+# content gate above failed, or taken-at itself can't be written (disk full), the capture is
+# incomplete: leave the PRIOR slot untouched and fail, rather than swap in a partial. net-rollback
+# also treats a slot with no taken-at as incomplete (belt-and-braces for the reconcile/legacy cases).
+if [ "$capture_ok" = 1 ] && { date -Iseconds > "$NEW/taken-at" 2>/dev/null || date > "$NEW/taken-at"; }; then
   # Swap the complete capture in. Move the current slot aside to PREV first (so a crash between the two
   # renames leaves recoverable data), put the new slot in with `mv -T` (never nests), then guarantee a
   # slot exists (restore the aside if a rare concurrent capture won the slot and ours didn't land).
@@ -78,7 +136,7 @@ if date -Iseconds > "$NEW/taken-at" 2>/dev/null || date > "$NEW/taken-at"; then
   # KEEP PREV — it's the only surviving good copy, and net-rollback's reconcile will promote it.
   [ -e "$SNAP" ] && rm -rf "$PREV"
 else
-  log "capture incomplete (could not write taken-at) — kept the prior snapshot, NOT swapping"
+  [ "$capture_ok" = 1 ] && log "capture incomplete (could not write taken-at) — kept the prior snapshot, NOT swapping"
   exit 1
 fi
 
