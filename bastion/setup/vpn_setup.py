@@ -15,10 +15,10 @@ and orchestration; this module just turns answers into files.
 from __future__ import annotations
 
 import ipaddress
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import state
 from ..system import System
 
 WG_DIR = "/etc/wireguard"
@@ -86,11 +86,7 @@ def write_wg_conf(sys: System, iface: str, c: WgConf) -> str:
     --root staging stays contained). Returns the logical (un-rooted) path written."""
     rel = wg_conf_path(iface)
     dest = sys.path(rel)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(render_wg_conf(c))
-    os.chmod(dest, 0o600)
+    state.atomic_write_private(dest, render_wg_conf(c))
     return rel
 
 

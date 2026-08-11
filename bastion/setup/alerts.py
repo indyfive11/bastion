@@ -13,10 +13,10 @@ through `System`, so it is fully testable with a fake System — no host access,
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import state
 from ..system import System
 
 ALERT_CONF = "/etc/bastion/notify-alert.conf"
@@ -69,11 +69,7 @@ def apply_alerts(sys: System, values: dict[str, str], *, path: str = ALERT_CONF)
     """Write notify-alert.conf chmod 600 (root-prefixed via ``sys.path`` so --root staging stays
     contained). Returns the logical (un-rooted) path written."""
     dest = sys.path(path)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(render_conf(values))
-    os.chmod(dest, 0o600)
+    state.atomic_write_private(dest, render_conf(values))
     return path
 
 

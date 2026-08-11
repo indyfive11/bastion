@@ -147,15 +147,11 @@ def detect_backend(sys: System, *, env: dict | None = None) -> BackendState:
 # --- write the captured secret (live / staged) -----------------------------
 
 def write_env_file(path: Path, variables: dict[str, str]) -> None:
-    """Write a systemd EnvironmentFile (KEY=value) chmod 600 from creation. API keys carry no
-    special characters, so plain KEY=value is correct (systemd reads it verbatim)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write a systemd EnvironmentFile (KEY=value) chmod 600 from creation, atomically. API keys
+    carry no special characters, so plain KEY=value is correct (systemd reads it verbatim). Written
+    via temp+replace so a crash mid-write can't truncate the file and leave edge-ai silently keyless."""
     body = "".join(f"{k}={v}\n" for k, v in variables.items())
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(body)
-    os.chmod(path, 0o600)
+    state.atomic_write_private(path, body)
 
 
 def apply_secret(sys: System, *, secrets_path: str, key_env: str, key_value: str) -> list[str]:

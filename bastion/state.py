@@ -119,6 +119,32 @@ def write_secrets(secrets: dict[str, str], path: str | Path) -> None:
             tmp.unlink()
 
 
+def atomic_write_private(out: str | Path, text: str) -> None:
+    """Write ``text`` to ``out`` atomically at mode 0600 — the secret/private-file sibling of
+    ``layers.base.atomic_write_text`` (whose temp is created world-readable, so it must not be used
+    for secrets). Render to a temp file created 0600-from-the-start in the SAME directory, fsync it,
+    then ``os.replace`` into place. Two guarantees the old ``os.open(final, O_TRUNC)`` idiom lacked:
+      * the secret bytes never touch disk world-readable, even briefly (the temp is 0600 before the
+        first write), and a crash/EIO/ENOSPC mid-write can never leave a truncated FINAL file — the
+        destination is either the old complete contents or the new complete contents;
+      * ``os.replace`` repoints the destination at the temp's fresh 0600 inode, so an
+        over-permissioned pre-existing file is corrected with no separate post-write chmod window.
+    """
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f".{out.name}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 # --- machine.env rendering -------------------------------------------------
 #
 # (env_var, section, key) mapping for the flat shell file the operational scripts source.
