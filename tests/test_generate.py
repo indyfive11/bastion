@@ -161,6 +161,46 @@ def test_real_nft_templates_render_valid_with_zones():
         assert ok, f"{tmpl} (blank zones) failed nft -c: {err}"
 
 
+def test_real_nft_edge_scopes_zt_wg_control_ports():
+    # M3: ZeroTier(9993)/WireGuard(51820) control-port accepts must be POSITIVELY scoped to the box's
+    # non-WAN interfaces (not any-source), and must render valid nft even when the ZT/WG ifaces are
+    # blank (a WG/ZT-less edge), where each gated rule VANISHES rather than leaving a bare
+    # `iifname { }` (which nft rejects).
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)                     # lan=eth0 zt=zt0 wg_server=wg0 wg_vps=wg_vps
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    ifset = "{ eth0, zt0, wg0, wg_vps }"
+    assert f"iifname {ifset} tcp dport 9993 accept" in out
+    assert f"iifname {ifset} udp dport 9993 accept" in out
+    assert f"iifname {ifset} udp dport 51820 accept" in out
+    stripped = [ln.strip() for ln in out.splitlines()]
+    assert "tcp dport 9993 accept" not in stripped     # the bare any-source form is gone
+    assert "udp dport 51820 accept" not in stripped
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"scoped edge failed nft -c: {err}"
+
+    # WG/ZT-less edge: the M3 rules must gate off cleanly. Tested at the helper (isolated from the
+    # PRE-EXISTING forward-chain blank bug at nftables-edge.nft:126-136, `iifname ""` when zt/wg are
+    # blank, which independently breaks the whole ruleset and is tracked as a separate fix).
+    from bastion.templates import _nonwan_iface_accepts
+    # no ZT, no WG server -> both ports vanish
+    r = _nonwan_iface_accepts({"interfaces": {"lan": "eth0", "zt_iface": "", "wg_server_iface": "",
+                                              "wg_vps_iface": "wg_vps"}})
+    assert r["zt_accept_tcp"] == "" and r["zt_accept_udp"] == "" and r["wg_server_accept"] == ""
+    # ZT present, WG server absent -> only the 9993 rules, scoped to the non-blank set, no bare braces
+    r = _nonwan_iface_accepts({"interfaces": {"lan": "eth0", "zt_iface": "zt0",
+                                              "wg_server_iface": "", "wg_vps_iface": ""}})
+    assert r["zt_accept_tcp"] == "iifname { eth0, zt0 } tcp dport 9993 accept"
+    assert r["zt_accept_udp"] == "iifname { eth0, zt0 } udp dport 9993 accept"
+    assert r["wg_server_accept"] == ""
+    for v in r.values():
+        assert "{ }" not in v and "{  }" not in v and 'iifname ""' not in v
+    # everything blank -> all vanish, never a bare `iifname { }`
+    r = _nonwan_iface_accepts({"interfaces": {}})
+    assert all(v == "" for v in r.values())
+
+
 def _load_with_seeded_libvirt(ruleset_text: str):
     """In a fresh netns: seed a foreign `table ip libvirt_network`, load `ruleset_text` via a real
     `nft -f`, then return (returncode, tables_listing). Returns None when nft/unshare are absent

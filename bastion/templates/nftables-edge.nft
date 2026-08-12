@@ -72,17 +72,24 @@ table inet edge {
         icmpv6 type echo-reply accept
 
         ip saddr { {{ network.lan_cidr }}, {{ network.zt_cidr }} } tcp dport {{ ports.ssh }} accept
-        tcp dport 9993 accept
-        udp dport 9993 accept
-        udp dport 51820 accept
+        # ZeroTier (9993) + WireGuard-server (51820) control ports, POSITIVELY scoped to the box's own
+        # non-WAN interfaces (M3). The `iifname wan drop` above already keeps WAN off these, but only
+        # if `interfaces.wan` names the real uplink — a mis-detected or renamed WAN would let them leak
+        # to the internet. Scoping to the internal iface set removes that dependency; each rule vanishes
+        # when its service iface is unconfigured. Rendered by templates._nonwan_iface_accepts.
+        {{ network.zt_accept_tcp }}
+        {{ network.zt_accept_udp }}
+        {{ network.wg_server_accept }}
         ip saddr {{ network.lan_cidr }} udp dport 53 accept
         ip saddr {{ network.lan_cidr }} tcp dport 53 accept
         ip saddr @trusted_hosts accept
         ip6 saddr @trusted_hosts6 accept
 
         # Operator service ports ([network] service_ports): any-source accept for apps this box
-        # serves. The WAN jump+drop above already fires first, so WAN-sourced traffic never reaches
-        # here — these open the ports to LAN/overlay only. Blank by default.
+        # serves. The WAN jump+drop above fires first, so on a correctly-detected box WAN-sourced
+        # traffic never reaches here — these open the ports to LAN/overlay only. Blank by default.
+        # NOTE: unlike the ZT/WG accepts above, these stay any-source, so their WAN-safety still
+        # depends on `interfaces.wan` being correct (tracked: scope these positively too).
         {{ network.service_ports_tcp_accept }}
         {{ network.service_ports_udp_accept }}
 

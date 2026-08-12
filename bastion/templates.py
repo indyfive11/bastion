@@ -96,6 +96,7 @@ def _derived(config: dict) -> dict:
         f"udp dport {{ {', '.join(str(p) for p in udp_ports)} }} accept" if udp_ports else "")
     net["zones_input_rules"] = _render_zones(config)
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
+    net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
     mach = dict(config.get("machine") or {})
     mach["firewall_preamble"] = _firewall_preamble(config)
     return {**config, "network": net, "machine": mach}
@@ -125,6 +126,39 @@ def _lan_ssh_accept(config: dict) -> str:
     if not lan_cidr or not ssh or not _is_private_cidr(lan_cidr):
         return ""
     return f"ip saddr {lan_cidr} tcp dport {ssh} accept"
+
+
+def _nonwan_iface_accepts(config: dict) -> dict:
+    """M3: the ZeroTier (9993 tcp+udp) and WireGuard-server (51820 udp) control-port accepts,
+    POSITIVELY scoped to the box's non-WAN interfaces.
+
+    These were any-source accepts (``tcp dport 9993 accept`` …). They sit AFTER the input chain's
+    ``iifname wan drop``, so on a correctly-detected box they only ever match non-WAN sources — but
+    that safety rests entirely on ``interfaces.wan`` naming the real uplink. A mis-detected or (more
+    realistically) *renamed* WAN makes that drop match nothing, and the any-source accepts then expose
+    ZeroTier/WireGuard to the internet. Scoping to a positive allowlist of the box's OWN interfaces
+    removes that dependency: an unknown/renamed iface simply isn't in the set.
+
+    Each key renders a COMPLETE rule line or ``""`` — never a bare ``iifname { }`` (nft rejects an
+    empty set, the same class as the ``trusted_hosts`` empty-``elements`` trap). The source set is the
+    non-blank ``{lan, zt, wg_server, wg_vps}``; a port's rule also vanishes when its owning service
+    iface is unconfigured (no ZeroTier => no 9993; no WG server => no 51820). Behavior-preserving on a
+    correctly-detected box. (Does NOT touch the any-source ``service_ports``/``zones`` accepts, which
+    share the same WAN-dependence — tracked separately.)"""
+    ifaces = config.get("interfaces") or {}
+    def _name(k): return str(ifaces.get(k) or "").strip()
+    lan, zt = _name("lan"), _name("zt_iface")
+    wg_server, wg_vps = _name("wg_server_iface"), _name("wg_vps_iface")
+    internal = [i for i in (lan, zt, wg_server, wg_vps) if i]
+    src = "{ " + ", ".join(internal) + " }" if internal else ""
+
+    def _rule(owner_iface: str, proto: str, port: int) -> str:
+        # owner_iface present => it is in `internal`, so `src` is non-empty (never a bare `{ }`).
+        return f"iifname {src} {proto} dport {port} accept" if (owner_iface and src) else ""
+
+    return {"zt_accept_tcp": _rule(zt, "tcp", 9993),
+            "zt_accept_udp": _rule(zt, "udp", 9993),
+            "wg_server_accept": _rule(wg_server, "udp", 51820)}
 
 
 def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:
