@@ -106,12 +106,52 @@ def nft(*args):
     return subprocess.run(["nft", *args], capture_output=True, text=True)
 
 def audit(rec):
+    # M9: audit.jsonl is appended by BOTH this tool and edge-reconciler (root, 60s timer). Serialize
+    # with an exclusive lock on the audit file so two concurrent appends can't tear a record, and write
+    # the whole line (os.write may short-write). Best-effort + non-fatal: if the lock can't be taken we
+    # append anyway (a lone O_APPEND write is still atomic — losing an audit row is worse), and any
+    # failure only warns (audit must never abort a kill-switch/reconcile action).
     rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    line = (json.dumps(rec, separators=(",", ":")) + "\n").encode()
+    fd = None
     try:
-        with open(AUDIT, "a") as f:
-            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        fd = os.open(AUDIT, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        mv = memoryview(line)
+        while mv:
+            mv = mv[os.write(fd, mv):]
     except Exception as e:
         print(f"warn: audit write failed: {e}", file=sys.stderr)
+    finally:
+        if fd is not None:
+            os.close(fd)            # releases the flock
+
+
+def _read_json_lines(path):
+    """Read a .jsonl into a list of records, SKIPPING blank/corrupt lines so one torn or interleaved
+    line can't abort the whole read — which today hides every record after it, crashes `edge-ctl
+    proposals`, or (cmd_rollback) DENIES recovery off a single bad audit row. Missing file -> []. A
+    corrupt line is counted and reported ONCE (not per-line — a corrupt file would flood the terminal)."""
+    try:
+        with open(path) as f:
+            raw = f.readlines()
+    except FileNotFoundError:
+        return []
+    out, skipped = [], 0
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            skipped += 1
+    if skipped:
+        print(f"warn: skipped {skipped} unparseable line(s) in {path}", file=sys.stderr)
+    return out
 
 def set_count(s):
     p = nft("-j", "list", "set", FAM, TBL, s)
@@ -185,7 +225,7 @@ def cmd_status():
         pass
     print("== recent ai audit rows ==")
     try:
-        rows = [json.loads(l) for l in open(AUDIT)][-200:]
+        rows = _read_json_lines(AUDIT)[-200:]
         ai = [r for r in rows if r.get("set") in AI_SETS][-6:]
         for r in ai:
             print(f"  id={r.get('id')} set={r.get('set')} applied={r.get('desired_count')} "
@@ -256,10 +296,7 @@ def cmd_ai_enable():
     return p.returncode
 
 def cmd_rollback(rid):
-    try:
-        rows = [json.loads(l) for l in open(AUDIT)]
-    except Exception as e:
-        print(f"cannot read audit: {e}"); return 1
+    rows = _read_json_lines(AUDIT)      # skips torn lines instead of denying rollback off one bad row
     rec = next((r for r in rows if str(r.get("id")) == str(rid) and r.get("set") in AI_SETS), None)
     if not rec:
         print(f"no ai audit record with id={rid}"); return 1
@@ -310,21 +347,11 @@ def _proposal_id(rec):
 
 
 def _load_proposals():
-    try:
-        return [json.loads(l) for l in open(PROPOSALS) if l.strip()]
-    except FileNotFoundError:
-        return []
+    return _read_json_lines(PROPOSALS)
 
 
 def _resolved_ids():
-    ids = set()
-    try:
-        for l in open(RESOLVED):
-            if l.strip():
-                ids.add(json.loads(l).get("id"))
-    except FileNotFoundError:
-        pass
-    return ids
+    return {r.get("id") for r in _read_json_lines(RESOLVED)}
 
 
 def _pending_proposals():

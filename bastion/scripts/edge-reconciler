@@ -329,12 +329,27 @@ def reconcile_set(setname, desired):
     return True, "ok"
 
 def audit(record):
+    # M9: audit.jsonl is appended by BOTH this reconciler and edge-ctl (operator panic/accept/reject).
+    # Serialize with an exclusive lock on the audit file so two concurrent appends can't tear a record,
+    # and write the whole line (os.write may short-write). Best-effort + non-fatal: if the lock can't be
+    # taken we append anyway (a lone O_APPEND write is still atomic), and any failure only warns.
     record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    fd = None
     try:
-        with open(AUDIT, "a") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        fd = os.open(AUDIT, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        mv = memoryview(line)
+        while mv:
+            mv = mv[os.write(fd, mv):]
     except Exception as e:
         log(f"audit write failed: {e}")
+    finally:
+        if fd is not None:
+            os.close(fd)            # releases the flock
 
 def main():
     # A live pass mutates nft sets + reads the spool — serialize it against the kill switch.
