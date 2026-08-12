@@ -97,6 +97,7 @@ def _derived(config: dict) -> dict:
     net["zones_input_rules"] = _render_zones(config)
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
     net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
+    net.update(_forward_iface_rules(config))     # M13: blank-safe forward/nat overlay-iface rules
     mach = dict(config.get("machine") or {})
     mach["firewall_preamble"] = _firewall_preamble(config)
     return {**config, "network": net, "machine": mach}
@@ -159,6 +160,42 @@ def _nonwan_iface_accepts(config: dict) -> dict:
     return {"zt_accept_tcp": _rule(zt, "tcp", 9993),
             "zt_accept_udp": _rule(zt, "udp", 9993),
             "wg_server_accept": _rule(wg_server, "udp", 51820)}
+
+
+def _forward_iface_rules(config: dict) -> dict:
+    """M13: the edge forward-chain LAN<->tunnel + tunnel->WAN accepts and the postrouting masquerade
+    rules, rendered only for the interfaces / CIDRs actually configured.
+
+    These interpolated the OPTIONAL overlay ifaces (zt/wg_server/wg_vps) inside ``iifname "..."`` /
+    ``oifname "..."`` and the optional overlay CIDRs inside ``ip saddr ...``. A blank value rendered
+    ``iifname ""`` or an empty ``ip saddr`` — both of which nft REJECTS — so a legit WG/ZT-less edge
+    (a valid, hand-editable config; ``validate_conf`` doesn't require these) could not load its ruleset
+    at ALL. Each rule now renders as a complete line or vanishes (never ``iifname ""``). ``lan``/``wan``/
+    ``lan_cidr`` are mandatory on an edge (a blank one is a broken uplink, not a supported config) and
+    stay literal in the template. Fails closed: a blank ``lan`` drops the forward rules to ``policy
+    drop`` while the input-chain protection still loads — strictly safer than the whole-ruleset failure."""
+    ifaces = config.get("interfaces") or {}
+    net = config.get("network") or {}
+    def _if(k): return str(ifaces.get(k) or "").strip()
+    def _cidr(k): return str(net.get(k) or "").strip()
+    lan, wan = _if("lan"), _if("wan")
+
+    tunnel: list[str] = []
+    for ov in (_if("zt_iface"), _if("wg_server_iface"), _if("wg_vps_iface")):
+        if lan and ov:
+            tunnel += [f'iifname "{lan}" oifname "{ov}" accept',
+                       f'iifname "{ov}" oifname "{lan}" accept']
+    egress = [f'iifname "{ov}" oifname "{wan}" accept'
+              for ov in (_if("zt_iface"), _if("wg_server_iface")) if ov and wan]
+    nat: list[str] = []
+    for cidr_k, oif in (("zt_cidr", lan), ("wg_server_cidr", lan), ("lan_cidr", _if("wg_vps_iface"))):
+        c = _cidr(cidr_k)
+        if c and oif:
+            nat.append(f'ip saddr {c} oifname "{oif}" masquerade')
+    join = "\n        ".join            # subsequent lines carry the 8-space forward/nat body indent
+    return {"forward_tunnel_rules": join(tunnel),
+            "forward_overlay_egress": join(egress),
+            "nat_masq_rules": join(nat)}
 
 
 def _parse_service_ports(raw: str) -> tuple[list[int], list[int]]:

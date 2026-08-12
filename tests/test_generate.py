@@ -201,6 +201,70 @@ def test_real_nft_edge_scopes_zt_wg_control_ports():
     assert all(v == "" for v in r.values())
 
 
+def test_real_nft_edge_forward_nat_blank_iface_safe():
+    # M13: the forward-chain LAN<->tunnel / tunnel->WAN accepts and the postrouting masquerade rules
+    # must render only for CONFIGURED overlay ifaces/CIDRs. With an optional iface (or its CIDR) blank
+    # they must VANISH, not render `iifname ""` / an empty `ip saddr` (both nft-fatal — the whole
+    # ruleset would fail to load on a legit WG/ZT-less edge).
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)                # all ifaces + cidrs set
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    # behavior-preserving: every rule still present (content, single-spaced from the helper).
+    for rule in ('iifname "eth0" oifname "zt0" accept', 'iifname "zt0" oifname "eth0" accept',
+                 'iifname "eth0" oifname "wg0" accept', 'iifname "eth0" oifname "wg_vps" accept',
+                 'iifname "zt0" oifname "eth1" accept', 'iifname "wg0" oifname "eth1" accept',
+                 'ip saddr 10.147.17.0/24 oifname "eth0" masquerade',
+                 'ip saddr 10.8.0.0/24 oifname "eth0" masquerade',
+                 'ip saddr 10.0.1.0/24 oifname "wg_vps" masquerade'):
+        assert rule in out, rule
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"all-set edge failed nft -c: {err}"
+
+    def _no_empty_fragments(text):
+        # check RULE lines only — the template comments mention `iifname ""` / empty `ip saddr` by name.
+        rules = [ln for ln in text.splitlines() if not ln.strip().startswith("#")]
+        for ln in rules:
+            assert 'iifname ""' not in ln and 'oifname ""' not in ln, ln
+            assert "ip saddr  oifname" not in ln and "ip saddr oifname" not in ln, ln
+
+    # ZeroTier-less edge: removing ZT blanks BOTH zt_iface and zt_cidr. The zt forward pair AND the
+    # zt_cidr masquerade (nat :157) must vanish — no `iifname ""`, no empty `ip saddr`, still valid.
+    cfg["interfaces"]["zt_iface"] = ""
+    cfg["network"]["zt_cidr"] = ""
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    assert 'oifname "zt0"' not in out and 'iifname "zt0"' not in out
+    _no_empty_fragments(out)
+    assert 'iifname "wg0" oifname "eth0" accept' in out                       # WG pair still there
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"ZT-less edge failed nft -c: {err}"
+
+    # All overlays gone (VPN-less edge): only the mandatory lan<->wan forward + wan masquerade survive.
+    for k in ("zt_iface", "wg_server_iface", "wg_vps_iface"):
+        cfg["interfaces"][k] = ""
+    for k in ("zt_cidr", "wg_server_cidr"):
+        cfg["network"][k] = ""
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    _no_empty_fragments(out)
+    assert 'iifname "eth0"          oifname "eth1" accept' in out             # lan->wan kept
+    assert 'oifname "eth1" masquerade' in out                                 # wan masq kept
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"VPN-less edge failed nft -c: {err}"
+
+    # Helper unit: a ZT-less config emits no zt rules and no empty fragments.
+    from bastion.templates import _forward_iface_rules
+    r = _forward_iface_rules({"interfaces": {"lan": "eth0", "wan": "eth1", "zt_iface": "",
+                                             "wg_server_iface": "wg0", "wg_vps_iface": ""},
+                              "network": {"lan_cidr": "10.0.1.0/24", "zt_cidr": "",
+                                          "wg_server_cidr": "10.8.0.0/24"}})
+    assert "zt" not in r["forward_tunnel_rules"] and "zt" not in r["forward_overlay_egress"]
+    assert r["forward_tunnel_rules"] == 'iifname "eth0" oifname "wg0" accept\n        iifname "wg0" oifname "eth0" accept'
+    assert r["forward_overlay_egress"] == 'iifname "wg0" oifname "eth1" accept'
+    assert r["nat_masq_rules"] == 'ip saddr 10.8.0.0/24 oifname "eth0" masquerade'   # zt_cidr + wg_vps gone
+
+
 def _load_with_seeded_libvirt(ruleset_text: str):
     """In a fresh netns: seed a foreign `table ip libvirt_network`, load `ruleset_text` via a real
     `nft -f`, then return (returncode, tables_listing). Returns None when nft/unshare are absent

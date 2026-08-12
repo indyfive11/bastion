@@ -129,18 +129,13 @@ table inet edge {
         icmpv6 type echo-request limit rate 10/second accept
         icmpv6 type echo-reply accept
 
-        # LAN <-> tunnels (inter-subnet)
-        iifname "{{ interfaces.lan }}" oifname "{{ interfaces.zt_iface }}" accept
-        iifname "{{ interfaces.zt_iface }}" oifname "{{ interfaces.lan }}" accept
-        iifname "{{ interfaces.lan }}" oifname "{{ interfaces.wg_server_iface }}" accept
-        iifname "{{ interfaces.wg_server_iface }}" oifname "{{ interfaces.lan }}" accept
-        iifname "{{ interfaces.lan }}" oifname "{{ interfaces.wg_vps_iface }}" accept
-        iifname "{{ interfaces.wg_vps_iface }}" oifname "{{ interfaces.lan }}" accept
+        # LAN <-> tunnels (inter-subnet) — one bidirectional pair per CONFIGURED overlay iface; a
+        # blank zt/wg iface vanishes instead of rendering `iifname ""` (nft-fatal). templates._forward_iface_rules (M13).
+        {{ network.forward_tunnel_rules }}
 
         # Direct WAN egress (used when policy routing is off = the speed-toggle path)
         iifname "{{ interfaces.lan }}"          oifname "{{ interfaces.wan }}" accept
-        iifname "{{ interfaces.zt_iface }}"     oifname "{{ interfaces.wan }}" accept
-        iifname "{{ interfaces.wg_server_iface }}" oifname "{{ interfaces.wan }}" accept
+        {{ network.forward_overlay_egress }}
     }
 
     chain output { type filter hook output priority filter; policy accept; }
@@ -154,9 +149,9 @@ table inet edge {
 table ip edge_nat {
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        ip saddr {{ network.zt_cidr }}        oifname "{{ interfaces.lan }}" masquerade
-        ip saddr {{ network.wg_server_cidr }} oifname "{{ interfaces.lan }}" masquerade
-        ip saddr {{ network.lan_cidr }}       oifname "{{ interfaces.wg_vps_iface }}" masquerade
+        # Overlay/relay masquerade — one line per CONFIGURED overlay CIDR/iface; a blank zt_cidr /
+        # wg_server_cidr / wg_vps_iface vanishes instead of an empty `ip saddr` (nft-fatal). M13.
+        {{ network.nat_masq_rules }}
         oifname "{{ interfaces.wan }}" masquerade
     }
 }
