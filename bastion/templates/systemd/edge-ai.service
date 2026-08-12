@@ -32,3 +32,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+# Resource ceilings (M7): the analyzer shells out to a pluggable backend and buffers its output.
+# A cgroup backstop complements the in-script byte cap — a hung / hostile / local backend can't
+# OOM the box or fork-bomb it. A killed cycle self-heals: the previous intents.json expires by TTL.
+MemoryMax=256M
+TasksMax=64

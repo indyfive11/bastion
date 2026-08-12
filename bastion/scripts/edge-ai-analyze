@@ -11,7 +11,7 @@
 # though intents.json persists (the reconciler applies timeout = expires - now). On ANY
 # error we leave the previous intents.json UNTOUCHED so its entries keep expiring normally.
 #
-import json, os, re, shlex, subprocess, sys, time
+import json, os, re, selectors, shlex, signal, subprocess, sys, time
 
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")   # C0 controls + DEL (ANSI ESC \x1b, CR/LF, tab, ...)
 def _clean(s, n):
@@ -27,6 +27,20 @@ SIGNALS     = "/var/lib/edge-ai/signals.json"
 INTENTS     = "/var/lib/edge-ai/intents.json"
 PROPOSALS   = "/var/lib/edge-ai/proposals.jsonl"   # human-review queue (propose_base_change)
 APPLY_ACTIONS = {"block_src", "ratelimit_src", "tarpit_src"}
+MAX_STDERR_BYTES = 1 << 16       # only stderr[:300] is ever surfaced; 64 KiB is ample headroom
+MAX_TOTAL_INTENTS = 512          # hard ceiling on intents PROCESSED per run — bounds the proposals
+                                 # path (the applied-only MAX_INTENTS break does NOT limit proposals)
+
+
+class BackendTimeout(Exception):
+    """Backend ran past BACKEND_TIMEOUT."""
+
+
+class BackendTooBig(Exception):
+    """Backend wrote past the byte ceiling on the named stream ('out' | 'err')."""
+    def __init__(self, stream):
+        super().__init__(stream)
+        self.stream = stream
 
 def log(m): sys.stderr.write(f"edge-ai-analyze: {m}\n")
 def die(m, code=1):
@@ -34,7 +48,8 @@ def die(m, code=1):
 
 def load_conf():
     cfg = {"BACKEND_CMD": "/usr/local/sbin/edge-ai-backend-mock", "MODEL": "claude-opus-4-8",
-           "MAX_INTENTS": 32, "MAX_TTL": 86400, "MIN_TTL": 60, "BACKEND_TIMEOUT": 60}
+           "MAX_INTENTS": 32, "MAX_TTL": 86400, "MIN_TTL": 60, "BACKEND_TIMEOUT": 60,
+           "MAX_OUTPUT_BYTES": 1 << 20}
     try:
         with open(BACKENDCONF) as f:
             for line in f:
@@ -44,10 +59,89 @@ def load_conf():
                 cfg[k.strip()] = v.strip()
     except FileNotFoundError:
         log(f"WARNING: {BACKENDCONF} missing, using defaults")
-    for k in ("MAX_INTENTS", "MAX_TTL", "MIN_TTL", "BACKEND_TIMEOUT"):
+    for k in ("MAX_INTENTS", "MAX_TTL", "MIN_TTL", "BACKEND_TIMEOUT", "MAX_OUTPUT_BYTES"):
         try: cfg[k] = int(cfg[k])
         except (ValueError, TypeError): pass
+    # A malformed backend.conf override for the memory ceiling must never survive as a string (it
+    # feeds a bounded read) — fall back to the safe default rather than crash the analyzer later.
+    if not (isinstance(cfg["MAX_OUTPUT_BYTES"], int) and cfg["MAX_OUTPUT_BYTES"] > 0):
+        cfg["MAX_OUTPUT_BYTES"] = 1 << 20
+    # Upper-clamp so a fat-fingered override can't silently disable the in-process ceiling (which
+    # would leave only the cgroup MemoryMax as the bound). 64 MiB is far past any real envelope.
+    cfg["MAX_OUTPUT_BYTES"] = min(cfg["MAX_OUTPUT_BYTES"], 64 << 20)
     return cfg
+
+def _kill_group(p):
+    """SIGKILL the child's whole process group (a pluggable BACKEND_CMD may fork), falling back to
+    killing just the child if the group is already gone."""
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+
+
+def run_backend(cmd, signals_path, timeout, env, max_bytes):
+    """Invoke the pluggable backend and read its stdout/stderr under a hard byte ceiling + a
+    wall-clock deadline, so a hung / compromised / local backend cannot OOM this (unprivileged)
+    analyzer by streaming unbounded output. Returns ``(returncode, stdout_text, stderr_text)``.
+
+    Design (M7): the signals FILE is handed to the child as its stdin fd — no parent-side stdin
+    write — which structurally removes the stdin-pipe deadlock and any BrokenPipe. stdout is capped
+    at ``max_bytes``, stderr at ``MAX_STDERR_BYTES``; exceeding either kills the child's process
+    group and raises :class:`BackendTooBig`. The deadline is ABSOLUTE (``time.monotonic()``), so a
+    slow-drip backend that dribbles under the cap is still cut at ``timeout`` (:class:`BackendTimeout`).
+    The child is always reaped. NOT ``subprocess.run``/``communicate`` — those buffer both pipes
+    unbounded into this process before any size can be checked."""
+    out_buf, err_buf = bytearray(), bytearray()
+    with open(signals_path, "rb") as sf, subprocess.Popen(
+            cmd, stdin=sf, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, start_new_session=True) as p:
+        streams = {p.stdout.fileno(): ("out", out_buf, max_bytes),
+                   p.stderr.fileno(): ("err", err_buf, MAX_STDERR_BYTES)}
+        sel = selectors.DefaultSelector()
+        for f in (p.stdout, p.stderr):
+            os.set_blocking(f.fileno(), False)
+            sel.register(f, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        verdict = None
+        try:
+            while sel.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:                    # absolute deadline: defeats a slow drip
+                    verdict = "timeout"; break
+                events = sel.select(remaining)
+                if not events:                        # select() itself hit the deadline
+                    verdict = "timeout"; break
+                for key, _ in events:
+                    try:
+                        chunk = os.read(key.fd, 65536)
+                    except BlockingIOError:
+                        continue
+                    except OSError:                   # unexpected read error — kill + fail closed
+                        _kill_group(p); p.wait(); raise
+                    if not chunk:                     # EOF — MUST unregister or select() busy-spins
+                        sel.unregister(key.fileobj)
+                        continue
+                    tag, buf, cap = streams[key.fd]
+                    buf += chunk
+                    if len(buf) > cap:
+                        verdict = tag; break
+                if verdict:
+                    break
+        finally:
+            sel.close()
+        if verdict:
+            _kill_group(p)
+        rc = p.wait()
+    if verdict == "timeout":
+        raise BackendTimeout()
+    if verdict:
+        raise BackendTooBig(verdict)
+    return rc, out_buf.decode("utf-8"), err_buf.decode("utf-8", "replace")
+
 
 def main():
     cfg = load_conf()
@@ -74,19 +168,27 @@ def main():
     key_env = str(cfg.get("KEY_ENV", "ANTHROPIC_API_KEY")).strip()
     if key_env and key_env in os.environ:
         env[key_env] = os.environ[key_env]
+    # Bounded read: the signals file is the child's stdin; stdout/stderr are capped so a runaway
+    # backend can't OOM this analyzer (M7). Any failure -> die, leaving the prior intents to expire.
     try:
-        p = subprocess.run(cmd, input=signals_raw, capture_output=True, text=True,
-                           timeout=cfg["BACKEND_TIMEOUT"], env=env)
-    except subprocess.TimeoutExpired:
+        rc, out, err = run_backend(cmd, SIGNALS, cfg["BACKEND_TIMEOUT"], env, cfg["MAX_OUTPUT_BYTES"])
+    except BackendTimeout:
         die(f"backend {cmd[0]} timed out after {cfg['BACKEND_TIMEOUT']}s")
+    except BackendTooBig as e:
+        die(f"backend {cmd[0]} exceeded the {e.stream} byte ceiling "
+            f"(MAX_OUTPUT_BYTES={cfg['MAX_OUTPUT_BYTES']}) — refusing to buffer a runaway backend")
+    except UnicodeDecodeError as e:
+        die(f"backend {cmd[0]} stdout not valid UTF-8: {e}")
     except Exception as e:
         die(f"backend {cmd[0]} exec failed: {e}")
-    if p.returncode != 0:
-        die(f"backend {cmd[0]} rc={p.returncode}: {p.stderr.strip()[:300]}")
+    if rc != 0:
+        die(f"backend {cmd[0]} rc={rc}: {err.strip()[:300]}")
     try:
-        env_doc = json.loads(p.stdout)
-    except json.JSONDecodeError as e:
-        die(f"backend output not JSON: {e}; head={p.stdout[:200]!r}")
+        env_doc = json.loads(out)
+    except (json.JSONDecodeError, ValueError, RecursionError) as e:
+        # RecursionError (deeply-nested JSON) is NOT a JSONDecodeError — catch it so a hostile
+        # payload dies gracefully (prior intents self-heal) instead of an uncaught traceback.
+        die(f"backend output not parseable JSON: {e}; head={out[:200]!r}")
 
     # ---- validate envelope shape (jsonschema if available, else manual) ----
     try:
@@ -104,7 +206,18 @@ def main():
     now = int(time.time())
     backend_id = _clean(env_doc.get("backend", cmd[0]), 200)
     applied, proposals = [], []
-    for it in env_doc.get("intents", []):
+    # Hard ceiling on TOTAL intents processed. MAX_INTENTS below caps only APPLIED intents; without
+    # this a backend returning e.g. 50k propose_base_change intents (well within MAX_OUTPUT_BYTES)
+    # would append them all to proposals.jsonl in one run. Bounds the proposals write too.
+    all_intents = env_doc.get("intents", [])
+    if len(all_intents) > MAX_TOTAL_INTENTS:
+        log(f"backend returned {len(all_intents)} intents; processing first {MAX_TOTAL_INTENTS}")
+    for it in all_intents[:MAX_TOTAL_INTENTS]:
+        if not isinstance(it, dict):
+            # Manual validation (the default path — jsonschema is not a declared dep) only checks
+            # that `intents` is a list, so a hostile `intents:[1,"x",null]` would reach here and
+            # crash `it.get(...)` with an uncaught AttributeError. Skip non-object items instead.
+            log(f"drop non-object intent {it!r}"); continue
         action = it.get("action")
         if action == "propose_base_change":
             proposals.append({"ts": now, "backend": backend_id,
