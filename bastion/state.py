@@ -310,6 +310,14 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
     if ipv6_fwd and ipv6_fwd.lower() not in ("yes", "no"):
         errors.append(f"[network] ipv6_forward={ipv6_fwd!r} — must be 'yes' or 'no'")
 
+    prefer_v4 = _get("network", "prefer_ipv4")
+    if prefer_v4:
+        if prefer_v4.lower() not in ("off", "soft", "hard"):
+            errors.append(f"[network] prefer_ipv4={prefer_v4!r} — must be 'off', 'soft', or 'hard'")
+        elif prefer_v4.lower() != "off" and mode != "endpoint":
+            warnings.append(f"[network] prefer_ipv4={prefer_v4} is endpoint-only (routers must not "
+                            f"prefer IPv4) — ignored in {mode} mode")
+
     relay_ep = _get("monitoring", "relay_endpoint")
     if relay_ep:
         try:

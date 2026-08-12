@@ -40,6 +40,21 @@ def test_validate_conf_clean_example():
     assert errs == []
 
 
+def test_validate_conf_prefer_ipv4(tmp_path):
+    # M12: value must be off|soft|hard; a bad value is an error.
+    c = _conf(); c["machine"]["mode"] = "endpoint"; c["network"]["prefer_ipv4"] = "maybe"
+    errs, _ = state.validate_conf(c)
+    assert any("prefer_ipv4" in e for e in errs)
+    # valid endpoint value -> clean.
+    c["network"]["prefer_ipv4"] = "soft"
+    assert [e for e in state.validate_conf(c)[0] if "prefer_ipv4" in e] == []
+    # endpoint-only: set on an EDGE box -> a warning (ignored), not an error.
+    c["machine"]["mode"] = "edge"; c["network"]["prefer_ipv4"] = "hard"
+    errs, warns = state.validate_conf(c)
+    assert [e for e in errs if "prefer_ipv4" in e] == []
+    assert any("prefer_ipv4" in w and "endpoint-only" in w for w in warns)
+
+
 def test_validate_conf_rejects_bad_values():
     c = _conf()
     c["machine"]["mode"] = "bridge"

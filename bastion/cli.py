@@ -560,6 +560,18 @@ def cmd_firewall(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_prefer_ipv4_apply(args: argparse.Namespace) -> int:
+    """Re-apply the endpoint `[network] prefer_ipv4` artifacts (M12) after a `config set` — write or
+    tear down /etc/gai.conf (+ the disable_ipv6 sysctl) to match the new value. No-op in edge mode
+    (the setting is endpoint-only). The write/remove logic is owned by L0 so this stays a thin shim."""
+    from .layers.l0_core import L0Core
+    ctx = build_context(args)
+    if ctx.mode != "endpoint":
+        return 0
+    L0Core()._apply_prefer_ipv4(ctx)
+    return 0
+
+
 # `bastion ai <action>` maps to edge-ctl, the L3 operator kill switch (Commandment #6). edge-ctl
 # is the implementation (it enforces root and does the nft flush / spool clear / timer toggle); this
 # surfaces the human kill switch on the top-level CLI, as the docs and L3 install message promise.

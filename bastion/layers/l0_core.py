@@ -8,6 +8,35 @@ from .base import (Layer, Context, LayerStatus, HealthCheck, nft_table_health,
                    warn_if_foreign_nftables_conf)
 
 
+# M12 — endpoint prefer_ipv4. A box whose IPv6 is up but has no working v6 egress (e.g. behind an
+# IPv4-only VPN gateway) has glibc pick an unreachable v6 address for dual-stack names, so apps hang.
+# The full RFC 3484 precedence table with ONLY ::ffff:0:0/96 raised to 100 — a lone `precedence` line
+# would disable the rest of the table (gai.conf(5): "the presence of a single precedence line causes
+# the default table to not be used"), so all default rows are reproduced.
+_GAI_PREFER_IPV4 = """\
+# bastion (L0): prefer IPv4 for dual-stack hostnames on an endpoint whose IPv6 has no working egress
+# (apps otherwise hang dialing an unreachable v6 node). Full default precedence table with only the
+# IPv4-mapped row raised — a lone precedence line would drop every other row (gai.conf(5)).
+# Reaches glibc getaddrinfo consumers (curl, MEGA, most desktop apps); Go/musl binaries (rclone,
+# syncthing) use private resolvers and IGNORE this file — use prefer_ipv4=hard for those. Restart an
+# already-running app to pick up the change. bastion owns this file (marker .gai-conf-by-bastion).
+precedence  ::1/128       50
+precedence  ::/0          40
+precedence  2002::/16     30
+precedence  ::/96         20
+precedence  ::ffff:0:0/96 100
+"""
+
+# M12 hard mode — the sysctl hammer that also covers Go/musl (rclone). A bastion-private drop-in.
+_PREFER_IPV4_DISABLE_V6 = """\
+# bastion (L0, endpoint prefer_ipv4=hard): fully disable IPv6 so Go/musl binaries (rclone, ...) that
+# ignore /etc/gai.conf can't dial an unreachable v6 node. CAVEAT: removes ALL IPv6 on this host,
+# including ::1 loopback binds (a local-stub unbound on ::1 will fail to start). Endpoint-only, opt-in.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+"""
+
+
 class L0Core(Layer):
     name = "l0"
     title = "core"
@@ -49,6 +78,14 @@ class L0Core(Layer):
     # disables it again (and leaves a box that never used the nft loader as it found it).
     NFT_ENABLED_MARKER = "/etc/bastion/.nftables-enabled-by-bastion"
 
+    # M12: endpoint prefer_ipv4 artifacts. /etc/gai.conf is a SHARED file (unlike the bastion-private
+    # sysctl drop-ins), so it gets the nftables.conf F4 treatment — backup a foreign one + a marker
+    # that records WE took ownership, so teardown restores the operator's file rather than deleting it.
+    GAI_CONF = "/etc/gai.conf"
+    GAI_BACKUP = "/etc/gai.conf.pre-bastion"
+    GAI_MARKER = "/etc/bastion/.gai-conf-by-bastion"
+    PREFER_IPV4_SYSCTL = "/etc/sysctl.d/99-bastion-prefer-ipv4.conf"
+
     @staticmethod
     def _nft_path(sys) -> str:
         """Absolute path to the nft binary for a systemd ExecStart (which can't use PATH)."""
@@ -81,6 +118,93 @@ class L0Core(Layer):
             # firewall verbs), which is scope-aware.
             "ExecStop=\n"
         )
+
+    # --- M12: endpoint prefer_ipv4 (gai.conf + optional disable_ipv6) -----
+    @staticmethod
+    def _prefer_ipv4_mode(ctx: Context) -> str:
+        """The endpoint `[network] prefer_ipv4` setting: off | soft | hard (absent/unknown => off)."""
+        val = str((ctx.config.get("network") or {}).get("prefer_ipv4", "off")).strip().lower()
+        return val if val in ("soft", "hard") else "off"
+
+    def _own_gai_conf(self, sys) -> None:
+        """Write bastion's prefer-IPv4 /etc/gai.conf, taking ownership of the shared file the same way
+        L0 owns a foreign /etc/nftables.conf: on FIRST write, back up any pre-existing operator/distro
+        gai.conf and drop a marker, so teardown restores the original (or removes ours if there was
+        none) instead of blindly deleting the operator's file."""
+        gai, backup, marker = sys.path(self.GAI_CONF), sys.path(self.GAI_BACKUP), sys.path(self.GAI_MARKER)
+        if not marker.exists():
+            if gai.exists():
+                backup.write_text(gai.read_text())      # preserve the operator/distro file, once
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("1\n")
+        gai.parent.mkdir(parents=True, exist_ok=True)
+        gai.write_text(_GAI_PREFER_IPV4)
+
+    def _restore_gai_conf(self, sys) -> None:
+        """Undo _own_gai_conf: restore the backed-up operator file, or remove ours if none existed.
+        Marker-gated so bastion never touches a gai.conf it didn't write."""
+        gai, backup, marker = sys.path(self.GAI_CONF), sys.path(self.GAI_BACKUP), sys.path(self.GAI_MARKER)
+        if not marker.exists():
+            return
+        if backup.exists():
+            gai.write_text(backup.read_text())
+            backup.unlink(missing_ok=True)
+        else:
+            gai.unlink(missing_ok=True)                 # there was no operator gai.conf to restore
+        marker.unlink(missing_ok=True)
+
+    def _apply_prefer_ipv4(self, ctx: Context) -> None:
+        """Endpoint-only: render/tear down the prefer_ipv4 artifacts per `[network] prefer_ipv4`.
+        Idempotent + reversible — hard->soft->off removes exactly what the higher level added. gai.conf
+        is handled BESPOKE (kept off the generate/manifest path) so a default-off endpoint never
+        clobbers its distro gai.conf on `bastion generate`."""
+        sys = ctx.system
+        mode = self._prefer_ipv4_mode(ctx)
+        if mode == "off":
+            self._teardown_prefer_ipv4(ctx)
+            return
+        self._own_gai_conf(sys)                          # soft + hard both prefer v4 in glibc getaddrinfo
+        if mode == "hard":
+            sysctl = sys.path(self.PREFER_IPV4_SYSCTL)
+            sysctl.parent.mkdir(parents=True, exist_ok=True)
+            sysctl.write_text(_PREFER_IPV4_DISABLE_V6)
+            layers = [l.strip() for l in (ctx.config.get("machine", {}).get("layers", "") or "").split(",")]
+            if "l4" in layers or (sys.is_live and sys.command_exists("unbound")):
+                print("l0: WARNING — prefer_ipv4=hard disables ALL IPv6; a local-stub unbound on ::1 "
+                      "will fail to (re)start. Verify DNS after applying.")
+            if sys.is_live:
+                sys.run("sysctl", "--system")            # apply disable_ipv6 now (no reboot)
+            print("l0: prefer_ipv4=hard — /etc/gai.conf prefers IPv4 + IPv6 disabled"
+                  + ("" if sys.is_live else " (staged — IPv6 disabled on live apply)")
+                  + " (endpoint hygiene; restart affected apps to pick it up).")
+        else:
+            self._drop_disable_ipv6(sys)                 # soft: undo any prior hard mode (re-enable v6)
+            print("l0: prefer_ipv4=soft — /etc/gai.conf prefers IPv4 "
+                  "(endpoint hygiene; restart affected apps to pick it up).")
+
+    def _drop_disable_ipv6(self, sys) -> None:
+        """Remove the disable_ipv6 drop-in and, on a live box, actively re-enable IPv6. This is the
+        OPPOSITE choice from the forward sysctl (which is left to reboot): with `disable_ipv6` the
+        HARMFUL direction is leaving the hammer engaged — dropping hard mode while the kernel still
+        has all v6 off contradicts the operator's choice and makes a downgraded `soft` gai.conf
+        meaningless. Re-enabling v6 is the restore direction (hands capability back, not disruptive),
+        so we force it live; `sysctl --system` then re-applies any OTHER file that legitimately wants
+        v6 off. No-op (beyond the unlink) when the drop-in wasn't ours to begin with."""
+        sysctl = sys.path(self.PREFER_IPV4_SYSCTL)
+        was_present = sysctl.exists()
+        sysctl.unlink(missing_ok=True)
+        if was_present and sys.is_live:
+            sys.run("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0")
+            sys.run("sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=0")
+            sys.run("sysctl", "--system")                # re-apply survivors (an operator's own v6-off file)
+            print("l0: prefer_ipv4 — re-enabled IPv6 (removed the disable_ipv6 drop-in).")
+
+    def _teardown_prefer_ipv4(self, ctx: Context) -> None:
+        """Remove all prefer_ipv4 artifacts (uninstall / toggle-off): restore a backed-up operator
+        gai.conf, and drop the disable_ipv6 hammer — re-enabling v6 live (see _drop_disable_ipv6)."""
+        sys = ctx.system
+        self._restore_gai_conf(sys)
+        self._drop_disable_ipv6(sys)
 
     # --- lifecycle --------------------------------------------------------
     def install(self, ctx: Context) -> None:
@@ -116,8 +240,14 @@ class L0Core(Layer):
         # (defense-in-depth), so it gets no drop-in; remove a stale one from a prior edge install.
         if ctx.mode != "endpoint":
             self.render_to(ctx, "sysctl-forward.conf", self.FORWARD_SYSCTL)
+            # A router must not prefer-IPv4 — tear down any endpoint prefer_ipv4 artifacts left by a
+            # prior endpoint install (mirror the endpoint branch removing the stale forward sysctl).
+            self._teardown_prefer_ipv4(ctx)
         else:
             sys.path(self.FORWARD_SYSCTL).unlink(missing_ok=True)
+            # M12: render/tear down the endpoint prefer_ipv4 artifacts (gai.conf + optional
+            # disable_ipv6 sysctl) per [network] prefer_ipv4. Handles its own live `sysctl --system`.
+            self._apply_prefer_ipv4(ctx)
 
         # Install the always-present recovery script + unit (recovery stays DISABLED).
         for script in self.scripts:
@@ -198,6 +328,8 @@ class L0Core(Layer):
         # kernel keeps its current ip_forward value until a reboot or an explicit `sysctl -w`; we
         # don't force it off live, which could disrupt traffic mid-teardown.)
         sys.path(self.FORWARD_SYSCTL).unlink(missing_ok=True)
+        # M12: restore a foreign /etc/gai.conf we backed up + drop the disable_ipv6 sysctl (endpoint).
+        self._teardown_prefer_ipv4(ctx)
         # Remove the nftables.service loader drop-in (restores the distro's default ExecStart).
         drop = sys.path(self.NFT_DROPIN)
         drop.unlink(missing_ok=True)

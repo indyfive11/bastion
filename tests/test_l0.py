@@ -19,6 +19,11 @@ def _ctx(root: Path, config: dict, dry_run=True) -> Context:
                    templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
 
 
+def _ns(**kw):
+    import argparse
+    return argparse.Namespace(**kw)
+
+
 def test_l0_in_registry():
     assert "l0" in layers.REGISTRY
     assert layers.get("l0").title == "core"
@@ -544,3 +549,177 @@ def test_teardown_keep_config(tmp_path):
                    "--conf", str(tmp_path / "none.conf")])
     assert rc == 0
     assert (tmp_path / "etc/bastion").exists()                # --keep-config preserves it
+
+
+# --- M12: endpoint prefer_ipv4 (gai.conf + optional disable_ipv6) ---------------------------
+GAI = "etc/gai.conf"
+GAI_BACKUP = "etc/gai.conf.pre-bastion"
+GAI_MARKER = "etc/bastion/.gai-conf-by-bastion"
+PREFER_SYSCTL = "etc/sysctl.d/99-bastion-prefer-ipv4.conf"
+
+# The full RFC 3484 precedence table glibc uses by default — a lone `precedence` line would DISABLE
+# every other row (gai.conf(5)), so the fix must reproduce all of them with only ::ffff:0:0/96 bumped.
+_DEFAULT_PRECEDENCE_ROWS = ("::1/128", "::/0", "2002::/16", "::/96", "::ffff:0:0/96")
+
+
+def _endpoint(prefer=None):
+    c = state.load_conf(EXAMPLE)
+    c["machine"]["mode"] = "endpoint"
+    if prefer is not None:
+        c["network"]["prefer_ipv4"] = prefer
+    return c
+
+
+def test_l0_prefer_ipv4_mode_parsing(tmp_path):
+    from bastion.layers.l0_core import L0Core
+    mk = lambda v: L0Core._prefer_ipv4_mode(_ctx(tmp_path, _endpoint(v)))
+    assert mk("soft") == "soft" and mk("hard") == "hard"
+    assert mk("off") == "off"
+    assert L0Core._prefer_ipv4_mode(_ctx(tmp_path, _endpoint())) == "off"     # absent -> off
+    assert mk("garbage") == "off" and mk("YES") == "off"                       # unknown -> off (safe)
+
+
+def test_l0_endpoint_prefer_ipv4_off_writes_nothing(tmp_path):
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("off")))
+    assert not (tmp_path / GAI).exists()
+    assert not (tmp_path / GAI_MARKER).exists()
+    assert not (tmp_path / PREFER_SYSCTL).exists()
+
+
+def test_l0_endpoint_prefer_ipv4_soft_writes_full_gai_table(tmp_path):
+    # Load-bearing correctness guard: the fix must write the FULL default precedence table with
+    # ::ffff:0:0/96 raised to 100 — NOT a lone line (which would silently drop every other row).
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))
+    body = (tmp_path / GAI).read_text()
+    for row in _DEFAULT_PRECEDENCE_ROWS:
+        assert any(ln.startswith("precedence") and row in ln for ln in body.splitlines()), \
+            f"missing precedence row {row} (a lone line disables the default table — gai.conf(5))"
+    assert "precedence  ::ffff:0:0/96 100" in body                # v4-mapped row bumped above native v6
+    assert (tmp_path / GAI_MARKER).exists()                       # ownership recorded
+    assert not (tmp_path / PREFER_SYSCTL).exists()                # soft never disables v6
+
+
+def test_l0_endpoint_prefer_ipv4_hard_adds_disable_v6(tmp_path):
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("hard")))
+    assert (tmp_path / GAI).exists()                              # hard still writes gai.conf (soft ⊂ hard)
+    sysctl = (tmp_path / PREFER_SYSCTL).read_text()
+    assert "net.ipv6.conf.all.disable_ipv6 = 1" in sysctl
+    assert "net.ipv6.conf.default.disable_ipv6 = 1" in sysctl
+
+
+def test_l0_prefer_ipv4_backs_up_and_restores_operator_gai(tmp_path):
+    # A pre-existing operator/distro /etc/gai.conf must be preserved on first ownership and restored
+    # verbatim on toggle-off — bastion must never silently clobber or delete the operator's file.
+    op = tmp_path / GAI
+    op.parent.mkdir(parents=True, exist_ok=True)
+    op.write_text("# operator gai\nlabel ::1/128 0\n")
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))
+    assert (tmp_path / GAI_BACKUP).read_text() == "# operator gai\nlabel ::1/128 0\n"
+    assert "precedence  ::ffff:0:0/96 100" in op.read_text()      # ours is live now
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("off")))    # toggle off -> restore
+    assert op.read_text() == "# operator gai\nlabel ::1/128 0\n"
+    assert not (tmp_path / GAI_BACKUP).exists()
+    assert not (tmp_path / GAI_MARKER).exists()
+
+
+def test_l0_prefer_ipv4_no_operator_file_teardown_removes_ours(tmp_path):
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))
+    assert (tmp_path / GAI).exists() and (tmp_path / GAI_MARKER).exists()
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("off")))
+    assert not (tmp_path / GAI).exists()                          # no operator file existed -> remove ours
+    assert not (tmp_path / GAI_BACKUP).exists()
+    assert not (tmp_path / GAI_MARKER).exists()
+
+
+def test_l0_prefer_ipv4_idempotent_backup_not_clobbered(tmp_path):
+    # Re-applying soft must NOT overwrite the pristine backup with bastion's own render (marker guard).
+    op = tmp_path / GAI
+    op.parent.mkdir(parents=True, exist_ok=True)
+    op.write_text("# operator original\n")
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))   # second apply
+    assert (tmp_path / GAI_BACKUP).read_text() == "# operator original\n"
+
+
+def test_l0_prefer_ipv4_hard_to_soft_drops_sysctl(tmp_path):
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("hard")))
+    assert (tmp_path / PREFER_SYSCTL).exists()
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("soft")))   # downgrade
+    assert not (tmp_path / PREFER_SYSCTL).exists()                # disable_ipv6 removed
+    assert (tmp_path / GAI).exists()                              # gai.conf preference kept
+
+
+def test_l0_endpoint_prefer_ipv4_live_hard_applies_sysctl(tmp_path, capsys):
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    layers.get("l0").install(Context(system=sysobj, config=_endpoint("hard"),
+                                     templates_dir=TEMPLATES, scripts_dir=SCRIPTS))
+    assert ("sysctl", "--system") in sysobj.calls                # applied live, no reboot
+    assert (tmp_path / PREFER_SYSCTL).exists()
+    # _FwSys.command_exists returns True (unbound "present") -> the ::1-bind caveat must fire.
+    assert "disables ALL IPv6" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("downgrade", ["off", "soft"])
+def test_l0_prefer_ipv4_live_downgrade_reenables_v6(tmp_path, downgrade):
+    # Dropping hard mode on a LIVE box must actively re-enable IPv6 (the kernel keeps disable_ipv6=1
+    # until told otherwise) — otherwise v6 stays silently dead, contradicting the operator's choice.
+    sysobj = _FwSys(tmp_path, active_fw=None)
+    layers.get("l0").install(Context(system=sysobj, config=_endpoint("hard"),
+                                     templates_dir=TEMPLATES, scripts_dir=SCRIPTS))
+    sysobj.calls.clear()
+    layers.get("l0").install(Context(system=sysobj, config=_endpoint(downgrade),
+                                     templates_dir=TEMPLATES, scripts_dir=SCRIPTS))
+    assert ("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0") in sysobj.calls
+    assert ("sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=0") in sysobj.calls
+    assert not (tmp_path / PREFER_SYSCTL).exists()
+
+
+def test_l0_uninstall_restores_operator_gai(tmp_path):
+    op = tmp_path / GAI
+    op.parent.mkdir(parents=True, exist_ok=True)
+    op.write_text("# op\n")
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("hard")))
+    layers.get("l0").uninstall(_ctx(tmp_path, _endpoint("hard")))
+    assert op.read_text() == "# op\n"
+    assert not (tmp_path / GAI_MARKER).exists()
+    assert not (tmp_path / PREFER_SYSCTL).exists()
+
+
+def test_l0_edge_ignores_prefer_ipv4(tmp_path):
+    # prefer_ipv4 is endpoint-only; an edge install must never touch gai.conf even if the key is set.
+    c = state.load_conf(EXAMPLE)                                  # edge mode
+    c["network"]["prefer_ipv4"] = "hard"
+    layers.get("l0").install(_ctx(tmp_path, c))
+    assert not (tmp_path / GAI).exists()
+    assert not (tmp_path / GAI_MARKER).exists()
+    assert not (tmp_path / PREFER_SYSCTL).exists()
+
+
+def test_l0_edge_tears_down_stale_prefer_ipv4(tmp_path):
+    # Converting an endpoint (prefer_ipv4=hard) to edge must remove the stale gai.conf + disable_ipv6
+    # drop-in — a router must not prefer-IPv4 (mirror of the endpoint removing the stale forward sysctl).
+    op = tmp_path / GAI
+    op.parent.mkdir(parents=True, exist_ok=True)
+    op.write_text("# op\n")
+    layers.get("l0").install(_ctx(tmp_path, _endpoint("hard")))
+    assert (tmp_path / PREFER_SYSCTL).exists() and (tmp_path / GAI_MARKER).exists()
+    layers.get("l0").install(_ctx(tmp_path, state.load_conf(EXAMPLE)))   # reinstall as edge
+    assert op.read_text() == "# op\n"                                    # operator gai restored
+    assert not (tmp_path / PREFER_SYSCTL).exists()
+    assert not (tmp_path / GAI_MARKER).exists()
+
+
+def test_cmd_prefer_ipv4_apply_endpoint_writes_gai(tmp_path):
+    conf = tmp_path / "machine.conf"
+    conf.write_text("[machine]\nmode = endpoint\n[network]\nprefer_ipv4 = soft\n")
+    rc = cli.cmd_prefer_ipv4_apply(_ns(conf=str(conf), root=str(tmp_path)))
+    assert rc == 0
+    assert (tmp_path / GAI).exists()
+
+
+def test_cmd_prefer_ipv4_apply_edge_is_noop(tmp_path):
+    conf = tmp_path / "machine.conf"
+    conf.write_text("[machine]\nmode = edge\n[network]\nprefer_ipv4 = hard\n")
+    rc = cli.cmd_prefer_ipv4_apply(_ns(conf=str(conf), root=str(tmp_path)))
+    assert rc == 0
+    assert not (tmp_path / GAI).exists()

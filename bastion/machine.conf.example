@@ -48,6 +48,17 @@ gateway = 10.0.1.254
 # yes, generate also pins accept_ra=2 on the WAN so enabling forwarding can't strip the box's own
 # WAN IPv6. Ignored in endpoint mode (endpoints never forward).
 ipv6_forward = yes
+# Prefer IPv4 (ENDPOINT mode only): for a box whose IPv6 is up but has no working v6 egress (e.g.
+# behind an IPv4-only VPN gateway), dual-stack apps hang dialing an unreachable v6 node.
+#   off  = normal dual-stack (default; also the behaviour when this key is absent)
+#   soft = /etc/gai.conf makes glibc getaddrinfo prefer IPv4 (curl, MEGA, most desktop apps)
+#   hard = soft + disable IPv6 via sysctl — also covers Go/musl apps (rclone) that ignore gai.conf.
+#          CAVEAT: removes ALL IPv6, including ::1 loopback binds. Reversible (toggle off + re-apply).
+# Ignored in edge mode (routers must not prefer-v4). Static — when roaming to a network with real
+# IPv6, re-apply with `bastion config set network.prefer_ipv4 off` (or `bastion setup`); `bastion
+# generate` alone does NOT touch gai.conf. bastion backs up an existing /etc/gai.conf and restores
+# it on uninstall/off.
+#prefer_ipv4 = off
 # ZeroTier subnet (edge full profile); set equal to lan_cidr if unused
 zt_cidr = 10.147.17.0/24
 # WireGuard server subnet (L5)

@@ -39,9 +39,10 @@ APPLY_GENERATE_FIREWALL = "generate+firewall"   # + `firewall reload` (nft)
 APPLY_GENERATE_DNSMASQ = "generate+dns"   # + reload dnsmasq/unbound (L4)
 APPLY_GENERATE_AI = "generate+ai"         # + `ai enable` (re-render edge-ai.timer + daemon-reload + re-arm)
 APPLY_GENERATE_SYSCTL = "generate+sysctl" # + `sysctl --system` (re-apply the forwarding drop-in)
+APPLY_GENERATE_PREFER_IPV4 = "generate+prefer-ipv4"  # + re-apply endpoint gai.conf/disable_ipv6 (M12)
 
 _APPLY_TAGS = {APPLY_NONE, APPLY_GENERATE, APPLY_GENERATE_FIREWALL, APPLY_GENERATE_DNSMASQ,
-               APPLY_GENERATE_AI, APPLY_GENERATE_SYSCTL}
+               APPLY_GENERATE_AI, APPLY_GENERATE_SYSCTL, APPLY_GENERATE_PREFER_IPV4}
 
 _APPLY_DESC = {
     APPLY_NONE: "stored only (reserved / inert — nothing re-renders)",
@@ -50,6 +51,8 @@ _APPLY_DESC = {
     APPLY_GENERATE_DNSMASQ: "re-renders configs, then reloads DNS/DHCP (dnsmasq + unbound)",
     APPLY_GENERATE_AI: "re-renders configs, then re-arms the AI timer (`bastion ai enable`)",
     APPLY_GENERATE_SYSCTL: "re-renders configs, then re-applies kernel sysctls (`sysctl --system`)",
+    APPLY_GENERATE_PREFER_IPV4: "re-renders configs, then re-applies the endpoint IPv4-preference "
+                               "(/etc/gai.conf +/- disable_ipv6 sysctl)",
 }
 
 
@@ -192,6 +195,13 @@ SETTINGS: tuple[Setting, ...] = (
        "Route IPv6 (make the edge box a real v6 router). no = v4-only routing, v6 rules stay inert.",
        ADVANCED, _v_choice("yes", "no"), "yes | no", APPLY_GENERATE_SYSCTL, choices=("yes", "no"),
        scope="edge"),
+    _S("network.prefer_ipv4", "Prefer IPv4 (endpoint)",
+       "Endpoint hygiene for a box whose IPv6 is up but has no working v6 egress (dual-stack apps "
+       "hang dialing an unreachable v6 node). off = normal dual-stack; soft = /etc/gai.conf makes "
+       "glibc prefer IPv4 (curl/MEGA); hard = soft + disable IPv6 via sysctl (also covers Go/musl "
+       "apps like rclone — removes ALL v6, incl ::1 loopback binds).",
+       ADVANCED, _v_choice("off", "soft", "hard"), "off | soft | hard", APPLY_GENERATE_PREFER_IPV4,
+       choices=("off", "soft", "hard"), scope="endpoint"),
     _S("interfaces.lan", "LAN interface", "LAN NIC name.", ADVANCED, _v_iface, "an interface name",
        APPLY_GENERATE_FIREWALL),
     _S("interfaces.wan", "WAN interface", "Uplink NIC name.", ADVANCED, _v_iface, "an interface name",
@@ -432,4 +442,7 @@ def _run_apply(cli, setting: Setting, sys_: System, conf_path: Path, root: str |
     elif tag == APPLY_GENERATE_SYSCTL:
         sys_.run("sysctl", "--system")
         res.steps.append("sysctl --system")
+    elif tag == APPLY_GENERATE_PREFER_IPV4:
+        rc = cli.cmd_prefer_ipv4_apply(argparse.Namespace(conf=str(conf_path), root=root))
+        res.steps.append("prefer-ipv4 apply")
     return rc

@@ -73,6 +73,9 @@ def test_applies_to_scope_and_layer_gate():
     ok, why = cfg.applies_to(cfg.get("monitoring.feed_sources"), endpoint)
     assert ok is True and "l1" in why
     assert cfg.applies_to(cfg.get("monitoring.dnsblock_sources"), ep_l1)[0] is False   # edge-only
+    # M12: prefer_ipv4 is endpoint-only -> hard refuse on an edge box, applies on an endpoint.
+    assert cfg.applies_to(cfg.get("network.prefer_ipv4"), edge)[0] is False
+    assert cfg.applies_to(cfg.get("network.prefer_ipv4"), endpoint) == (True, "")
 
 
 def test_apply_tag_selection():
@@ -81,6 +84,7 @@ def test_apply_tag_selection():
     assert cfg.get("ai.timer_interval").apply == cfg.APPLY_GENERATE_AI
     assert cfg.get("monitoring.egress_probe").apply == cfg.APPLY_GENERATE
     assert cfg.get("ai.expert_canary_seconds").apply == cfg.APPLY_NONE
+    assert cfg.get("network.prefer_ipv4").apply == cfg.APPLY_GENERATE_PREFER_IPV4
 
 
 def test_list_helpers():
