@@ -1029,6 +1029,10 @@ class Wizard:
         # 7a. All active-layer packages up front (idempotent --needed); unresolvable AUR-only deps
         #     are surfaced as a prerequisite, non-fatal — the layer's own install() then warns.
         pkgs = self._batch_install_packages(config)
+        # M5a: after the batch, honestly REPORT which active layers still have missing packages (they
+        #      still install below — the skip is deferred to M5b behind the VM harness). Detection-only,
+        #      so nothing about the install flow / deadman changes.
+        notes += self._report_package_gaps(config)
 
         # 7b. WireGuard configs must exist BEFORE L5.install() brings the tunnels up (it enables
         #     wg-quick@<iface> only when the conf is present). Needs `wg`, just installed in 7a.
@@ -1217,6 +1221,50 @@ class Wizard:
                     "(supported: Arch/pacman, Debian-Ubuntu/apt, Fedora-RHEL/dnf) — install these "
                     f"manually, then re-run: {', '.join(pkgs)}")
         return f"no supported package manager — ensure installed: {', '.join(pkgs)}"
+
+    def _report_package_gaps(self, config: dict) -> list[str]:
+        """M5a (detection-only): after the batch install, surface every active layer that still has a
+        missing package, so a binary-less-but-looks-installed layer is reported HONESTLY instead of
+        silently proceeding. Does NOT skip anything (that's M5b, deferred behind the VM harness) — the
+        layers still install below and self-warn; this just gives the operator one consolidated,
+        actionable remediation up front.
+
+        Returns a single consolidated note, or ``[]`` when everything is satisfied, when no package
+        manager resolved (can't query state — don't guess), or when not live (staged/dry-run never
+        reach this path, but guard anyway). The still-missing signal is a per-package re-query
+        (``mgr.missing``) — authoritative across a partial batch / an rc!=0-but-installed transaction,
+        unlike the batch return code."""
+        if not self.sys.is_live:
+            return []
+        mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))
+        if mgr is None:
+            return []
+        from .. import layers as layermod
+        vendor_only = set(mgr.repo_unavailable)     # known vendor/AUR-only for this manager
+        gaps: list[tuple[str, str, list[str]]] = []  # (lid, name, still-missing pkgs)
+        vendor_missing: list[str] = []
+        for lid in self._active_layer_ids(config):
+            layer = layermod.get(lid)
+            if not layer or not getattr(layer, "packages", ()):
+                continue
+            still = mgr.missing(self.sys, layer.packages)
+            if still:
+                gaps.append((lid, layer.name, still))
+                vendor_missing += [p for p in still if p in vendor_only]
+        if not gaps:
+            return []
+        lines = ["package gaps — these layers were installed but are MISSING binaries, so they are "
+                 "NOT functional until the packages are present (configs are staged, services not up):"]
+        for lid, name, still in gaps:
+            lines.append(f"  {lid} ({name}): missing {', '.join(still)}")
+        if vendor_missing:
+            # reuse the exact vendor/AUR one-liners (crowdsec packagecloud, zerotier install script)
+            lines.append("  " + mgr.unavailable_hint(sorted(set(vendor_missing))))
+        lines.append("  fix: install the missing packages above, then re-run `sudo bastion setup` to "
+                     "complete these layers (idempotent; re-arms the deadman — `bastion confirm` after).")
+        for ln in lines:
+            self.out("  " + ln)                     # prominent inline, not just the trailing summary
+        return ["\n".join(lines)]
 
     def _batch_install_packages(self, config: dict) -> list[str]:
         mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))

@@ -527,10 +527,12 @@ class _StubLayer:
 
 class _FakeMgr:
     name = "fakepkg"
+    repo_unavailable = ()
 
-    def __init__(self):
+    def __init__(self, missing_pkgs=()):
         self.installed = None
         self.refreshed = False
+        self._missing = list(missing_pkgs)     # packages that stay absent after the batch (M5a probe)
 
     def refresh(self, sysd, *, force=False):
         self.refreshed = True
@@ -541,11 +543,15 @@ class _FakeMgr:
         return InstallResult(command=["fakepkg", "-S", *pkgs], ran=True, returncode=0,
                              missing=list(pkgs))
 
+    def missing(self, sysd, pkgs):
+        # M5a re-query seam: which of `pkgs` are still absent after the batch install.
+        return [p for p in pkgs if p in self._missing]
+
     def install_command(self, pkgs):
         return ["fakepkg", "-S", *pkgs]
 
     def unavailable_hint(self, pkgs):
-        return "n/a"
+        return f"install out of band: {', '.join(pkgs)}"
 
 
 class _LiveFake(FakeSystem):
@@ -568,14 +574,16 @@ class _LiveFake(FakeSystem):
         return super().run(*args, capture=capture)
 
 
-def _patch_orchestration(monkeypatch):
+def _patch_orchestration(monkeypatch, missing=(), repo_unavailable=()):
     """Stub the package manager + layer registry so the live path is exercised without installing
-    anything or loading real nft rules. Returns (mgr, layer_install_calls)."""
+    anything or loading real nft rules. `missing` = packages that stay absent after the batch (M5a);
+    `repo_unavailable` = the manager's vendor/AUR-only set. Returns (mgr, layer_install_calls)."""
     import bastion.layers as layermod
     from bastion.setup import pkg as pkgmod
     real = dict(layermod.REGISTRY)
     calls: list[str] = []
-    mgr = _FakeMgr()
+    mgr = _FakeMgr(missing_pkgs=missing)
+    mgr.repo_unavailable = tuple(repo_unavailable)
     monkeypatch.setattr(pkgmod, "detect_manager", lambda sysd, distro=None: mgr)
     monkeypatch.setattr(layermod, "get", lambda lid: _StubLayer(lid, calls, real.get(lid)))
     return mgr, calls
@@ -597,6 +605,37 @@ def test_wizard_live_orchestration_installs_and_verifies(tmp_path, monkeypatch, 
     # step 8: flowcheck ran and passed.
     out = capsys.readouterr().out
     assert "running bastion check" in out and "all flows pass" in out
+
+
+def test_wizard_live_reports_package_gaps_without_skipping(tmp_path, monkeypatch, capsys):
+    # M5a (detection-only): a layer whose package is still missing after the batch is REPORTED
+    # honestly, but the install flow is UNCHANGED — the layer still installs (the skip is M5b,
+    # deferred behind the VM harness). Here l6-pkg is vendor-only and stays missing.
+    mgr, calls = _patch_orchestration(monkeypatch, missing=("l6-pkg",), repo_unavailable=("l6-pkg",))
+    sysd = _LiveFake(tmp_path)
+    wiz = wizard.Wizard(sysd, dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    result = wiz.run()
+    # flow UNCHANGED: every active layer still installed (M5a does not skip).
+    assert calls == ["l0", "l1", "l6"]
+    # one consolidated gap note names the layer + the still-missing package + the vendor hint + resume.
+    gap_notes = [n for n in result.notes if "package gaps" in n]
+    assert len(gap_notes) == 1
+    note = gap_notes[0]
+    assert "l6" in note and "l6-pkg" in note
+    assert "install out of band: l6-pkg" in note        # repo_unavailable -> vendor hint surfaced
+    assert "sudo bastion setup" in note                  # resume path
+    assert "missing l0-pkg" not in note and "missing l1-pkg" not in note   # satisfied layers not named
+
+
+def test_wizard_live_no_gap_note_when_all_satisfied(tmp_path, monkeypatch):
+    # No missing packages -> no gap note at all (the common case must stay quiet).
+    _mgr, calls = _patch_orchestration(monkeypatch)            # missing=() default
+    wiz = wizard.Wizard(_LiveFake(tmp_path), dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    result = wiz.run()
+    assert calls == ["l0", "l1", "l6"]
+    assert not [n for n in result.notes if "package gaps" in n]
     # machine.conf still written under the staged root (step 6 unchanged).
     assert (tmp_path / "etc/bastion/machine.conf").is_file()
 
