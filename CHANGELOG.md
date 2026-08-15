@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.15] - 2026-08-15
+
+A hardening + cross-distro-robustness release. Ten fixes across the edge data plane, the setup wizard,
+the AI collector, and the L4 resolver, validated live on a full-edge install across Ubuntu, Debian, and
+Rocky 9 (the last under SELinux **enforcing**) via a new isolated-LAN KVM harness that drives a real
+install through the firewall. No config migration required; new behavior is opt-in or fail-safe by
+default.
+
+### Security
+
+- **M2 — edge router source-address hardening.** Set the anti-spoof / anti-redirect sysctls on an edge
+  box (`rp_filter`, `accept_source_route=0`, `accept_redirects=0`, `send_redirects=0`, `secure_redirects=0`)
+  so a router-role host can't be steered by forged ICMP redirects or source-routed packets.
+
+- **M3 — scope ZeroTier/WireGuard control-port accepts to non-WAN interfaces.** The `:9993` (ZT) and
+  `:51820` (WG-server) input accepts are now positively bound to the box's own internal interfaces
+  instead of relying on the `iifname wan drop` firing first. A mis-detected or renamed WAN can no longer
+  leak these control ports to the internet. Each rule vanishes when its service interface is unconfigured.
+
+- **M3b / M2b — edge anti-spoof teeth.** Input chain now fails **closed**: everything not arriving on one
+  of the box's own internal interfaces is dropped (replacing a WAN-name-dependent drop), so a
+  mis-detected WAN can't expose the any-source service accepts. Plus a new opt-in `[network] anti_spoof`
+  knob (`off` default / `on` = BCP38 egress drop over the box's declared CIDRs / `strict` = + an IPv6
+  reverse-path drop). Default `off` preserves existing forwarding for cascaded downstream subnets.
+
+### Added
+
+- **M12 — endpoint `prefer_ipv4`.** Optional endpoint knob to prefer IPv4 in `getaddrinfo` (gai.conf)
+  with an optional `disable_ipv6`, for endpoints on broken/partial v6 networks.
+
+- **M5b — skip wholly binary-less layers at setup.** The wizard now skips a layer only when **every**
+  package it requires (config-aware) is missing after the install step, degrading cleanly instead of
+  failing; L0 and L6 are never skipped. A partially-provisioned layer (e.g. L5 with WireGuard present but
+  ZeroTier absent) still installs and self-degrades rather than being dropped wholesale.
+
+### Fixed
+
+- **M13 — blank-safe edge forward/NAT rules.** A WG/ZT-less edge previously rendered nftables that
+  wouldn't load (empty interface expansions); the forward/NAT rules now render safely when those
+  interfaces are unconfigured.
+
+- **M5a — honest binary-less-layer reporting.** After the package-install step, the wizard reports which
+  layers remain binary-less (config-aware `required_packages`), splitting genuinely-skipped from degraded.
+
+- **M9 — audit-log robustness.** Serialize the audit-log append and tolerate a corrupt JSONL line rather
+  than aborting the read.
+
+- **M7 — bound the AI backend read.** Cap the analyzer's read of the AI backend's output so a runaway or
+  misbehaving backend can't OOM the analyzer.
+
+- **L4 / SELinux — unbound `:5335` bind under enforcing.** On RHEL/Rocky/Fedora with SELinux enforcing,
+  unbound (`named_t`) was denied `name_bind` on `:5335` (labelled `howl_port_t`), leaving the resolver
+  dead. L4 now relabels the port to `dns_port_t` (`semanage port -a`/`-m` for tcp+udp) before starting
+  unbound — best-effort and idempotent, with a hint if `semanage` is absent.
+
 ## [1.5.14] - 2026-08-11
 
 Two safety/hardening fixes on the AI and secret-writing paths. Normal-path runtime behavior is
