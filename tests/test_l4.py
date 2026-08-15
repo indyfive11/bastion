@@ -17,6 +17,59 @@ def _ctx(root: Path, config: dict, dry_run=True) -> Context:
                    templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
 
 
+class _SelSys(System):
+    """Live System whose getenforce output + command availability are scripted; records semanage calls."""
+    def __init__(self, enforce="Enforcing", have=("getenforce", "semanage"), a_ok=False):
+        super().__init__(root=Path("/"), dry_run=False)
+        self._enforce, self._have, self._a_ok = enforce, set(have), a_ok
+        self.semanage_calls: list[list[str]] = []
+
+    def command_exists(self, name):
+        return name in self._have
+
+    def run(self, *args, capture=True, input=None):
+        cp = subprocess.CompletedProcess(list(args), 0, stdout="", stderr="")
+        if args and args[0] == "getenforce":
+            cp.stdout = self._enforce + "\n"
+        elif args and args[0] == "semanage":
+            self.semanage_calls.append(list(args))
+            # simulate the real box: `-a` fails on an already-defined port (5335=howl_port_t) -> -m
+            cp.returncode = 0 if (self._a_ok or "-m" in args) else 1
+        return cp
+
+
+def test_l4_selinux_dns_port_relabels_on_enforcing():
+    # Real bug caught live on Rocky 9: unbound (named_t) is DENIED name_bind on :5335 (howl_port_t)
+    # under SELinux enforcing. L4 must relabel 5335 -> dns_port_t via semanage before starting unbound.
+    from bastion.layers.l4_dns_dhcp import L4DnsDhcp, UNBOUND_PORT
+    sysd = _SelSys(enforce="Enforcing")
+    L4DnsDhcp()._selinux_dns_port(Context(system=sysd, config={}, templates_dir=TEMPLATES,
+                                          scripts_dir=SCRIPTS))
+    protos = {c[c.index("-p") + 1] for c in sysd.semanage_calls}
+    assert protos == {"tcp", "udp"}                       # both transports relabelled
+    assert all(str(UNBOUND_PORT) in c and "dns_port_t" in c for c in sysd.semanage_calls)
+    # -a failed (port pre-defined) so -m ran for each proto (4 calls total)
+    assert sum(1 for c in sysd.semanage_calls if "-m" in c) == 2
+
+    # permissive -> no semanage at all
+    perm = _SelSys(enforce="Permissive")
+    L4DnsDhcp()._selinux_dns_port(Context(system=perm, config={}, templates_dir=TEMPLATES,
+                                          scripts_dir=SCRIPTS))
+    assert perm.semanage_calls == []
+
+    # enforcing but no semanage -> warns, no crash, no calls
+    nosem = _SelSys(enforce="Enforcing", have=("getenforce",))
+    L4DnsDhcp()._selinux_dns_port(Context(system=nosem, config={}, templates_dir=TEMPLATES,
+                                          scripts_dir=SCRIPTS))
+    assert nosem.semanage_calls == []
+
+    # not-SELinux (no getenforce) -> no-op
+    nosel = _SelSys(have=())
+    L4DnsDhcp()._selinux_dns_port(Context(system=nosel, config={}, templates_dir=TEMPLATES,
+                                          scripts_dir=SCRIPTS))
+    assert nosel.semanage_calls == []
+
+
 def test_l4_in_registry():
     l4 = layers.get("l4")
     assert "l4" in layers.REGISTRY

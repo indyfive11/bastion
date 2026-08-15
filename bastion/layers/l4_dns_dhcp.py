@@ -15,6 +15,7 @@ from .base import Layer, Context, LayerStatus, HealthCheck
 BLOCKLIST = "/etc/unbound/blocklist.conf"
 ANCHOR = "/var/lib/unbound/root.key"   # RFC5011 DNSSEC root trust anchor (unbound.conf references it)
 ANCHOR_DIR = "/var/lib/unbound"
+UNBOUND_PORT = 5335   # the local validating resolver's listen port (127.0.0.1:5335); dnsmasq forwards here
 # unbound.service drop-in: the RFC5011 auto-trust anchor (auto-trust-anchor-file) must be WRITABLE by
 # the unbound process for its periodic re-signing. The distro unit runs unbound as root and lets it
 # self-drop to the `unbound` user via the config's `username:` — but StateDirectory=unbound then owns
@@ -78,6 +79,33 @@ class L4DnsDhcp(Layer):
         sys.run("chown", "unbound:unbound", ANCHOR)
         sys.run("chown", "unbound:unbound", str(var))
 
+    def _selinux_dns_port(self, ctx: Context) -> None:
+        """On SELinux-enforcing systems (RHEL/Rocky/Fedora), unbound binds 127.0.0.1:5335 — a port
+        SELinux labels ``howl_port_t``, NOT ``dns_port_t`` — so the confined unbound (``named_t``) is
+        DENIED ``name_bind`` and the resolver never starts (live-caught on Rocky 9 enforcing,
+        2026-08-15; Arch/Debian/Ubuntu don't ship enforcing policy so they never hit it). Relabel the
+        port as ``dns_port_t`` via ``semanage`` so unbound can bind. Best-effort + idempotent: a no-op
+        where SELinux is absent/permissive, and a clear hint when ``semanage`` is unavailable."""
+        sys = ctx.system
+        if not sys.is_live or not sys.command_exists("getenforce"):
+            return
+        if sys.run("getenforce").stdout.strip() != "Enforcing":
+            return
+        if not sys.command_exists("semanage"):
+            print(f"l4: WARNING — SELinux is enforcing but `semanage` is absent; unbound may fail to "
+                  f"bind :{UNBOUND_PORT} (labelled howl_port_t). Install policycoreutils-python-utils, "
+                  f"then run `semanage port -a -t dns_port_t -p tcp {UNBOUND_PORT}` (and udp) + "
+                  f"`systemctl restart unbound`.")
+            return
+        for proto in ("tcp", "udp"):
+            # -a adds a new mapping; a port already defined (e.g. 5335=howl_port_t) makes -a fail, so
+            # fall back to -m (modify). Idempotent: a second run just re-modifies to the same type.
+            if sys.run("semanage", "port", "-a", "-t", "dns_port_t",
+                       "-p", proto, str(UNBOUND_PORT)).returncode != 0:
+                sys.run("semanage", "port", "-m", "-t", "dns_port_t", "-p", proto, str(UNBOUND_PORT))
+        print(f"l4: SELinux enforcing — relabelled port {UNBOUND_PORT} (tcp/udp) as dns_port_t so "
+              f"unbound can bind.")
+
     # --- lifecycle --------------------------------------------------------
     def install(self, ctx: Context) -> None:
         sys = ctx.system
@@ -117,6 +145,8 @@ class L4DnsDhcp(Layer):
             sys.run("systemctl", "daemon-reload")
             # Seed the DNSSEC anchor BEFORE unbound's first start (auto-trust-anchor-file must exist).
             self._seed_trust_anchor(ctx)
+            # Relabel :5335 as dns_port_t BEFORE starting unbound (else name_bind denied on enforcing).
+            self._selinux_dns_port(ctx)
             for svc in self.services:
                 sys.run("systemctl", "enable", "--now", svc)
             for timer in self.timers:
