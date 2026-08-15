@@ -517,6 +517,11 @@ class _StubLayer:
     def __init__(self, lid, calls, real=None):
         self.name, self.packages, self._lid, self._calls = lid, (f"{lid}-pkg",), lid, calls
         self._real = real
+        # M5b: expose the real layer's prerequisites so the skip-cascade (l1 -> l2/l3) is exercised.
+        self.prerequisites = tuple(getattr(real, "prerequisites", ())) if real else ()
+
+    def required_packages(self, config):
+        return self.packages          # M5b: stub layers need all their (synthetic) packages
 
     def install(self, ctx):
         self._calls.append(self._lid)
@@ -607,25 +612,94 @@ def test_wizard_live_orchestration_installs_and_verifies(tmp_path, monkeypatch, 
     assert "running bastion check" in out and "all flows pass" in out
 
 
-def test_wizard_live_reports_package_gaps_without_skipping(tmp_path, monkeypatch, capsys):
-    # M5a (detection-only): a layer whose package is still missing after the batch is REPORTED
-    # honestly, but the install flow is UNCHANGED — the layer still installs (the skip is M5b,
-    # deferred behind the VM harness). Here l6-pkg is vendor-only and stays missing.
+def test_wizard_live_l6_degraded_never_skipped(tmp_path, monkeypatch, capsys):
+    # M5b: L6 (net-rollback / deadman) is HARD-EXCLUDED from skipping — even with its binary missing it
+    # still installs, reported as DEGRADED (not skipped). Here l6-pkg is vendor-only and stays missing.
     mgr, calls = _patch_orchestration(monkeypatch, missing=("l6-pkg",), repo_unavailable=("l6-pkg",))
     sysd = _LiveFake(tmp_path)
     wiz = wizard.Wizard(sysd, dry_run=False, profile="minimal-endpoint",
                         assume_defaults=True, example_conf=str(EXAMPLE))
     result = wiz.run()
-    # flow UNCHANGED: every active layer still installed (M5a does not skip).
+    # L6 still installed (never skipped); nothing skipped.
     assert calls == ["l0", "l1", "l6"]
-    # one consolidated gap note names the layer + the still-missing package + the vendor hint + resume.
-    gap_notes = [n for n in result.notes if "package gaps" in n]
+    gap_notes = [n for n in result.notes if "DEGRADED layers" in n]
     assert len(gap_notes) == 1
     note = gap_notes[0]
-    assert "l6" in note and "l6-pkg" in note
+    assert "l6" in note and "l6-pkg" in note and "SKIPPED layers" not in note
     assert "install out of band: l6-pkg" in note        # repo_unavailable -> vendor hint surfaced
     assert "sudo bastion setup" in note                  # resume path
-    assert "missing l0-pkg" not in note and "missing l1-pkg" not in note   # satisfied layers not named
+    assert not [n for n in result.notes if "skipped layers (missing binaries)" in n]
+
+
+def test_wizard_m5b_skips_binary_less_layer(tmp_path, monkeypatch, capsys):
+    # M5b: a skippable layer whose required binary is missing has install() NOT run — no half-config.
+    # L0 (firewall) and L6 (deadman) are never skipped, so the deadman path is preserved.
+    mgr, calls = _patch_orchestration(monkeypatch, missing=("l1-pkg",), repo_unavailable=("l1-pkg",))
+    wiz = wizard.Wizard(_LiveFake(tmp_path), dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    result = wiz.run()
+    assert calls == ["l0", "l6"]                          # l1 SKIPPED, l0/l6 still installed
+    skip_notes = [n for n in result.notes if "skipped layers (missing binaries)" in n]
+    assert len(skip_notes) == 1 and "l1" in skip_notes[0]
+    assert any("SKIPPED layers" in n and "l1" in n for n in result.notes)
+
+
+def test_wizard_m5b_l0_never_skipped(tmp_path, monkeypatch):
+    # M5b: L0 is NEVER skipped even if its binary is missing (a firewall-less box is worse than a
+    # loud install failure) — it installs; a real nftables failure would ABORT (exception path).
+    mgr, calls = _patch_orchestration(monkeypatch, missing=("l0-pkg",), repo_unavailable=())
+    wiz = wizard.Wizard(_LiveFake(tmp_path), dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    result = wiz.run()
+    assert "l0" in calls                                  # L0 installed, not skipped
+    assert not [n for n in result.notes if "skipped layers (missing binaries)" in n]
+
+
+def test_wizard_m5b_layers_to_skip_cascade_and_exclusions(tmp_path, monkeypatch):
+    # M5b unit: a skipped L1 cascades to its dependents (l2/l3); l0/l6 never skip; mgr None => nothing.
+    mgr, _calls = _patch_orchestration(monkeypatch, missing=("l1-pkg",))
+    wiz = wizard.Wizard(_LiveFake(tmp_path), dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    config = {"machine": {"layers": "l0,l1,l2,l3,l6", "distro": "arch"},
+              "interfaces": {}, "network": {}}
+    skip = wiz._layers_to_skip(config, mgr)
+    assert "l1" in skip and "l2" in skip and "l3" in skip   # l1 missing -> l2/l3 cascade
+    assert "l0" not in skip and "l6" not in skip            # hard-excluded
+    assert wiz._layers_to_skip(config, None) == {}          # no manager -> prove nothing, skip nothing
+
+
+def test_wizard_m5b_partial_layer_not_skipped(tmp_path, monkeypatch):
+    # M5b (regression #2, caught live on Debian): a layer with MULTIPLE required packages where SOME
+    # are present is NOT skipped — only a WHOLLY binary-less layer skips. A coarse whole-L5 skip when
+    # only the vendor-only zerotier-one is missing would drop the working WireGuard tunnel.
+    from bastion.setup import pkg as pkgmod
+    import bastion.layers as layermod
+
+    class _Multi:
+        name = "l5"; prerequisites = ("l0",)
+        packages = ("wireguard-tools", "zerotier-one")
+        def required_packages(self, config):
+            return self.packages
+    monkeypatch.setattr(layermod, "get", lambda lid: _Multi() if lid == "l5" else None)
+    wiz = wizard.Wizard(_LiveFake(tmp_path), dry_run=False, profile="minimal-endpoint",
+                        assume_defaults=True, example_conf=str(EXAMPLE))
+    cfg = {"machine": {"layers": "l0,l5", "distro": "arch"}, "interfaces": {}, "network": {}}
+    # wg present, zt (vendor-only) missing -> partial -> NOT skipped (install() self-degrades)
+    assert "l5" not in wiz._layers_to_skip(cfg, _FakeMgr(missing_pkgs=("zerotier-one",)))
+    # both missing -> wholly binary-less -> skipped
+    assert "l5" in wiz._layers_to_skip(cfg, _FakeMgr(missing_pkgs=("wireguard-tools", "zerotier-one")))
+
+
+def test_l5_required_packages_config_aware():
+    # M-A fix: L5's required packages track the configured ifaces, so a WG-only edge does NOT flag/skip
+    # on the vendor-only zerotier-one (and a VPN-less L5 needs nothing).
+    from bastion.layers.l5_vpn import L5Vpn
+    l5 = L5Vpn()
+    wg_only = {"interfaces": {"wg_server_iface": "wg0", "zt_iface": ""}}
+    assert l5.required_packages(wg_only) == ("wireguard-tools",)
+    zt_only = {"interfaces": {"wg_server_iface": "", "wg_vps_iface": "", "zt_iface": "zt0"}}
+    assert l5.required_packages(zt_only) == ("zerotier-one",)
+    assert l5.required_packages({"interfaces": {}}) == ()   # no VPN ifaces -> nothing needed
 
 
 def test_wizard_live_no_gap_note_when_all_satisfied(tmp_path, monkeypatch):

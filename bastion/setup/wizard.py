@@ -1029,14 +1029,22 @@ class Wizard:
         # 7a. All active-layer packages up front (idempotent --needed); unresolvable AUR-only deps
         #     are surfaced as a prerequisite, non-fatal — the layer's own install() then warns.
         pkgs = self._batch_install_packages(config)
-        # M5a: after the batch, honestly REPORT which active layers still have missing packages (they
-        #      still install below — the skip is deferred to M5b behind the VM harness). Detection-only,
-        #      so nothing about the install flow / deadman changes.
-        notes += self._report_package_gaps(config)
+        # M5b: compute the layers to SKIP (config-aware required binaries missing) BEFORE 7b, so a
+        #      skipped L5 also gates its wizard steps (7b wg-config / 7d zt-join) — no half-config. L0
+        #      (abort-not-skip) and L6 (deadman) are never in this set; mgr-None / staged => empty.
+        mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))
+        skip = self._layers_to_skip(config, mgr)
+        # M5a+M5b: honestly report skipped vs degraded layers (config-aware; the M-A false-positive fix).
+        notes += self._report_package_gaps(config, skip)
+        if skip:
+            notes.append("skipped layers (missing binaries): " + ", ".join(sorted(skip))
+                         + " — install the packages, then re-run `sudo bastion setup`.")
 
         # 7b. WireGuard configs must exist BEFORE L5.install() brings the tunnels up (it enables
         #     wg-quick@<iface> only when the conf is present). Needs `wg`, just installed in 7a.
-        notes += self._wg_configure(config)
+        #     Gated: a skipped L5 must not write a wg conf its (un-run) install() would never use.
+        if "l5" not in skip:
+            notes += self._wg_configure(config)
 
         # 7c. B1 — install as a transaction. Snapshot BEFORE touching the firewall so a failed
         #     core (L0) install can auto-roll-back. L0 is the drop-policy ruleset — the one layer
@@ -1045,6 +1053,9 @@ class Wizard:
         #     core up and is reported as retryable, not fatal.
         snapped = self._pre_install_snapshot(ctx)
         for lid in self._active_layer_ids(config):
+            if lid in skip:                          # M5b: binary-less layer — do not run install()
+                self.out(f"  skipping {lid} (required binaries missing — see notes).")
+                continue
             layer = layermod.get(lid)
             if layer is None:
                 continue
@@ -1066,7 +1077,9 @@ class Wizard:
                 notes.append(f"{lid} install raised: {exc} (retryable — core firewall is up).")
 
         # 7d. ZeroTier join AFTER L5 started zerotier-one (the cli needs the daemon running).
-        notes += self._zt_join_step(config)
+        #     Gated: a skipped L5 never started zerotier-one, so there is no daemon to join against.
+        if "l5" not in skip:
+            notes += self._zt_join_step(config)
 
         # F5: the live ruleset is now loaded. Wrap this first-load in an auto-reverting deadman so a
         # cutover that silently locks the operator out reverts itself — they run `bastion confirm`
@@ -1222,18 +1235,60 @@ class Wizard:
                     f"manually, then re-run: {', '.join(pkgs)}")
         return f"no supported package manager — ensure installed: {', '.join(pkgs)}"
 
-    def _report_package_gaps(self, config: dict) -> list[str]:
-        """M5a (detection-only): after the batch install, surface every active layer that still has a
-        missing package, so a binary-less-but-looks-installed layer is reported HONESTLY instead of
-        silently proceeding. Does NOT skip anything (that's M5b, deferred behind the VM harness) — the
-        layers still install below and self-warn; this just gives the operator one consolidated,
-        actionable remediation up front.
+    def _layers_to_skip(self, config: dict, mgr) -> dict[str, list[str]]:
+        """M5b: the active layers to SKIP because their REQUIRED (config-aware) binaries are missing —
+        ``{lid: still-missing-pkgs}``. A skipped layer's ``install()`` is not run (no half-configured
+        looks-installed state) and its wizard steps are gated.
 
-        Returns a single consolidated note, or ``[]`` when everything is satisfied, when no package
-        manager resolved (can't query state — don't guess), or when not live (staged/dry-run never
-        reach this path, but guard anyway). The still-missing signal is a per-package re-query
-        (``mgr.missing``) — authoritative across a partial batch / an rc!=0-but-installed transaction,
-        unlike the batch return code."""
+        HARD-EXCLUDED, never skipped: ``l0`` (the firewall core — its failure ABORTS the whole install,
+        it is never silently dropped) and ``l6`` (carries ``net-rollback`` + the auto-revert deadman —
+        wanted MORE when the box is degraded, not less). ``mgr is None`` => skip NOTHING (absence is
+        unprovable without a package DB — an all-hand-installed unsupported-distro box must not have
+        every layer skipped). Not live (staged/dry-run) => skip nothing. A skipped prerequisite CASCADES
+        to its dependents (a skipped ``l1`` — the reconciler/feed core — takes ``l2``/``l3`` with it)."""
+        if not self.sys.is_live or mgr is None:
+            return {}
+        from .. import layers as layermod
+        active = self._active_layer_ids(config)
+        skip: dict[str, list[str]] = {}
+        for lid in active:
+            if lid in ("l0", "l6"):
+                continue
+            layer = layermod.get(lid)
+            if not layer:
+                continue
+            need = layer.required_packages(config)
+            if not need:
+                continue
+            still = mgr.missing(self.sys, need)
+            # Skip ONLY when EVERY required binary is missing (wholly binary-less). A partially-present
+            # layer (e.g. L5 with wireguard-tools installed but the vendor-only zerotier-one absent) is
+            # NOT skipped — its install() self-degrades per interface, and a coarse whole-layer skip
+            # would drop the working half (the WG tunnel). Partial gaps still surface as DEGRADED.
+            if still and set(still) == set(need):
+                skip[lid] = still
+        changed = True                              # cascade over prerequisites to a fixpoint
+        while changed:
+            changed = False
+            for lid in active:
+                if lid in skip or lid in ("l0", "l6"):
+                    continue
+                layer = layermod.get(lid)
+                if layer and any(p in skip for p in getattr(layer, "prerequisites", ())):
+                    skip[lid] = ["prerequisite skipped: "
+                                 + ", ".join(p for p in layer.prerequisites if p in skip)]
+                    changed = True
+        return skip
+
+    def _report_package_gaps(self, config: dict, skip: dict[str, list[str]]) -> list[str]:
+        """M5a+M5b: after the batch install, HONESTLY report active layers with missing (config-aware)
+        binaries, split into two categories: those M5b SKIPPED (install not run) and those that still
+        installed but are DEGRADED (l0/l6, never skipped — their binaries missing => running but not
+        fully functional). Uses ``required_packages`` (M-A fix): a config-unneeded vendor dep (e.g.
+        ``zerotier-one`` on a WG-only edge) is neither reported nor skipped.
+
+        Returns one consolidated note, or ``[]`` when everything is satisfied / no package manager
+        resolved / not live (staged/dry-run guard)."""
         if not self.sys.is_live:
             return []
         mgr = pkgmod.detect_manager(self.sys, config.get("machine", {}).get("distro"))
@@ -1241,22 +1296,34 @@ class Wizard:
             return []
         from .. import layers as layermod
         vendor_only = set(mgr.repo_unavailable)     # known vendor/AUR-only for this manager
-        gaps: list[tuple[str, str, list[str]]] = []  # (lid, name, still-missing pkgs)
+        skipped: list[tuple[str, str, list[str]]] = []   # (lid, name, missing) — M5b did not install
+        degraded: list[tuple[str, str, list[str]]] = []  # (lid, name, missing) — installed anyway (l0/l6)
         vendor_missing: list[str] = []
         for lid in self._active_layer_ids(config):
             layer = layermod.get(lid)
-            if not layer or not getattr(layer, "packages", ()):
+            if not layer:
                 continue
-            still = mgr.missing(self.sys, layer.packages)
-            if still:
-                gaps.append((lid, layer.name, still))
-                vendor_missing += [p for p in still if p in vendor_only]
-        if not gaps:
+            need = layer.required_packages(config)
+            if not need:
+                continue
+            still = mgr.missing(self.sys, need)
+            if not still:
+                continue
+            (skipped if lid in skip else degraded).append((lid, layer.name, still))
+            vendor_missing += [p for p in still if p in vendor_only]
+        if not skipped and not degraded:
             return []
-        lines = ["package gaps — these layers were installed but are MISSING binaries, so they are "
-                 "NOT functional until the packages are present (configs are staged, services not up):"]
-        for lid, name, still in gaps:
-            lines.append(f"  {lid} ({name}): missing {', '.join(still)}")
+        lines: list[str] = []
+        if skipped:
+            lines.append("SKIPPED layers (required binaries missing — install() NOT run, nothing "
+                         "half-configured):")
+            for lid, name, still in skipped:
+                lines.append(f"  {lid} ({name}): missing {', '.join(still)}")
+        if degraded:
+            lines.append("DEGRADED layers (installed — the firewall core/monitoring is never skipped — "
+                         "but MISSING binaries, so their services are not fully up):")
+            for lid, name, still in degraded:
+                lines.append(f"  {lid} ({name}): missing {', '.join(still)}")
         if vendor_missing:
             # reuse the exact vendor/AUR one-liners (crowdsec packagecloud, zerotier install script)
             lines.append("  " + mgr.unavailable_hint(sorted(set(vendor_missing))))

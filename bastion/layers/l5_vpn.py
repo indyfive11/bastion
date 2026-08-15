@@ -31,6 +31,18 @@ class L5Vpn(Layer):
     units = ()                   # wg-quick@<iface>.service is a packaged template unit
     template_dests = ()          # no committed VPN config — keys/IDs are secret
 
+    def required_packages(self, config: dict) -> tuple[str, ...]:
+        """Config-aware (M5b/M-A): ``wireguard-tools`` only when a WG iface is declared, ``zerotier-one``
+        only when a ZT iface is. So a WG-only edge does not flag/skip on the vendor-only ``zerotier-one``,
+        and a fully VPN-less L5 (no ifaces) needs nothing."""
+        ifaces = config.get("interfaces", {})
+        pkgs: list[str] = []
+        if any(v for v in (ifaces.get("wg_server_iface", ""), ifaces.get("wg_vps_iface", ""))):
+            pkgs.append("wireguard-tools")
+        if ifaces.get("zt_iface", ""):
+            pkgs.append("zerotier-one")
+        return tuple(pkgs)
+
     # --- machine.conf-driven interface discovery --------------------------
     def _wg_ifaces(self, ctx: Context) -> list[str]:
         ifaces = ctx.config.get("interfaces", {})

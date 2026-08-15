@@ -247,6 +247,16 @@ class Layer(abc.ABC):
     template_dests: tuple[tuple[str, str], ...] = ()   # (template relpath, dest path)
     units: tuple[str, ...] = ()            # systemd unit filenames
 
+    def required_packages(self, config: dict) -> tuple[str, ...]:
+        """The subset of ``packages`` this layer actually NEEDS given ``config``.
+
+        A layer that uses a package only under some configs (L5's ``zerotier-one`` only when a
+        ZeroTier iface is declared) overrides this so a config-BLIND "missing package" check does not
+        false-flag an unneeded vendor-only dep — which would (M5a) mis-report a gap and (M5b) wrongly
+        SKIP a working layer (e.g. a WG-only edge skipped because ``zerotier-one`` isn't packaged).
+        Default: every declared package."""
+        return self.packages
+
     def owned_templates(self, mode: str) -> set[str]:
         """Template relpaths this layer is responsible for (config files + its systemd units).
 
