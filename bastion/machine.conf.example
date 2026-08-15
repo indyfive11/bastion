@@ -48,6 +48,16 @@ gateway = 10.0.1.254
 # yes, generate also pins accept_ra=2 on the WAN so enabling forwarding can't strip the box's own
 # WAN IPv6. Ignored in endpoint mode (endpoints never forward).
 ipv6_forward = yes
+# Anti-spoof teeth (EDGE mode; forward chain). BCP38 egress + optional v6 reverse-path.
+#   off    = no anti-spoof rules (default; also when this key is absent)
+#   on     = drop a packet forwarded OUT the WAN whose source is not one of THIS box's declared CIDRs
+#            (lan_cidr + zt_cidr + wg_server_cidr). Blocks foreign-source (spoofed) egress.
+#   strict = on + a v6 reverse-path drop (`fib saddr . iif oif missing`) for the IPv6 side.
+# CAVEAT: `on`/`strict` will DROP traffic from a downstream/cascaded subnet routed behind the LAN that
+# is NOT one of the declared CIDRs — declare such subnets (or leave anti_spoof=off) if you route them.
+# `strict`'s v6 fib is opt-in on purpose: a v4 reverse-path filter blackholes an asymmetric/policy-routed
+# relay return path (why bastion does NOT set v4 rp_filter). Ignored in endpoint mode.
+#anti_spoof = off
 # Prefer IPv4 (ENDPOINT mode only): for a box whose IPv6 is up but has no working v6 egress (e.g.
 # behind an IPv4-only VPN gateway), dual-stack apps hang dialing an unreachable v6 node.
 #   off  = normal dual-stack (default; also the behaviour when this key is absent)

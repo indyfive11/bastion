@@ -57,7 +57,12 @@ table inet edge {
         ip6 saddr @ai_tarpit6 ct state new limit rate over 2/minute burst 5 packets drop
 
         iifname "{{ interfaces.wan }}" jump wan_in
-        iifname "{{ interfaces.wan }}" drop
+        # Fail-CLOSED WAN drop (M3b): drop everything NOT on one of the box's own internal ifaces,
+        # rather than only the named WAN. A mis-detected/renamed WAN can no longer expose the
+        # any-source accepts below (service_ports/zones) to the internet. Falls back to the literal
+        # `iifname "{{ interfaces.wan }}" drop` when no internal iface is configured. See
+        # templates._internal_iface_drop. bastion-recovery inserts its accept ABOVE this line.
+        {{ network.internal_iface_drop }}
 
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
         ip protocol icmp icmp type echo-request limit rate 10/second accept
@@ -104,6 +109,11 @@ table inet edge {
 
         ct state established,related accept
         ct state invalid drop
+
+        # Anti-spoof teeth (M2b), gated by [network] anti_spoof (off|on|strict; blank when off).
+        # on = BCP38 v4 egress drop (foreign source out the WAN); strict = + v6 reverse-path fib.
+        # See templates._anti_spoof_rules.
+        {{ network.anti_spoof_rules }}
 
         # MSS clamp: pin forwarded TCP MSS to the route MTU. Fixes double-tunnel MTU in BOTH
         # directions for TCP without a far-end change. No-op on 1500-MTU LAN paths.

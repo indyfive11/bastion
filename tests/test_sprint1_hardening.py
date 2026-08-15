@@ -55,6 +55,21 @@ def test_validate_conf_prefer_ipv4(tmp_path):
     assert any("prefer_ipv4" in w and "endpoint-only" in w for w in warns)
 
 
+def test_validate_conf_anti_spoof(tmp_path):
+    # M2b: value must be off|on|strict; a bad value is an error.
+    c = _conf(); c["machine"]["mode"] = "edge"; c["network"]["anti_spoof"] = "loose"
+    errs, _ = state.validate_conf(c)
+    assert any("anti_spoof" in e for e in errs)
+    # valid edge value -> clean.
+    c["network"]["anti_spoof"] = "strict"
+    assert [e for e in state.validate_conf(c)[0] if "anti_spoof" in e] == []
+    # edge-only: set on an ENDPOINT box -> a warning (ignored), not an error.
+    c["machine"]["mode"] = "endpoint"; c["network"]["anti_spoof"] = "on"
+    errs, warns = state.validate_conf(c)
+    assert [e for e in errs if "anti_spoof" in e] == []
+    assert any("anti_spoof" in w and "edge-only" in w for w in warns)
+
+
 def test_validate_conf_rejects_bad_values():
     c = _conf()
     c["machine"]["mode"] = "bridge"

@@ -201,6 +201,80 @@ def test_real_nft_edge_scopes_zt_wg_control_ports():
     assert all(v == "" for v in r.values())
 
 
+def test_real_nft_edge_m3b_fail_closed_input_drop():
+    # M3b: the input-chain WAN drop is fail-CLOSED — `iifname != { <internal set> } drop` instead of
+    # the fail-OPEN `iifname "{{wan}}" drop`. A renamed/mis-detected WAN can no longer expose the
+    # any-source accepts below it. The WAN iface MUST be excluded from the internal set (else WAN
+    # traffic matches `!=` false and is NOT dropped — the exact exposure being closed).
+    from bastion import state, templates
+    from bastion.templates import _internal_iface_drop
+    cfg = state.load_conf(EXAMPLE)                     # lan=eth0 wan=eth1 zt=zt0 wg_server=wg0 wg_vps=wg_vps
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    assert "iifname != { eth0, zt0, wg0, wg_vps } drop" in out
+    stripped = [ln.strip() for ln in out.splitlines()]
+    assert 'iifname "eth1" drop' not in stripped        # the fail-open literal drop is gone
+    # false-green guard: WAN (eth1) must NOT be inside the internal set
+    drop = next(ln.strip() for ln in out.splitlines() if ln.strip().startswith("iifname !="))
+    assert "eth1" not in drop
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"M3b fail-closed drop failed nft -c: {err}"
+
+    # helper edge cases (isolated from the render)
+    # normal edge: internal = lan+overlays, wan excluded
+    assert _internal_iface_drop({"interfaces": {"lan": "eth0", "wan": "eth1", "zt_iface": "zt0",
+        "wg_server_iface": "wg0", "wg_vps_iface": "wg_vps"}}) == "iifname != { eth0, zt0, wg0, wg_vps } drop"
+    # WG/ZT-less edge: set collapses to just lan, still fail-closed
+    assert _internal_iface_drop({"interfaces": {"lan": "eth0", "wan": "eth1"}}) == "iifname != { eth0 } drop"
+    # WAN name collision: wan excluded even when it appears among the internal names
+    assert _internal_iface_drop({"interfaces": {"lan": "eth1", "wan": "eth1",
+        "zt_iface": "zt0"}}) == "iifname != { zt0 } drop"
+    # broken config with NO internal iface -> FALL BACK to the literal wan drop (never `!= { }`, nft-fatal)
+    assert _internal_iface_drop({"interfaces": {"wan": "eth1"}}) == 'iifname "eth1" drop'
+    for ifs in ({"interfaces": {"lan": "eth0", "wan": "eth1"}}, {"interfaces": {"wan": "eth1"}}):
+        d = _internal_iface_drop(ifs)
+        assert "!= { }" not in d and "!= {  }" not in d
+
+
+def test_real_nft_edge_m2b_anti_spoof_gated():
+    # M2b: forward-chain anti-spoof teeth gated by [network] anti_spoof (off|on|strict).
+    #   off    -> no rules (no forwarding change)
+    #   on     -> BCP38 v4 egress drop over the UNION of declared CIDRs (not lan_cidr alone — F3)
+    #   strict -> on + a v6 reverse-path fib drop (v6-only on purpose)
+    from bastion import state, templates
+    from bastion.templates import _anti_spoof_rules
+
+    def render(mode):
+        cfg = state.load_conf(EXAMPLE)                 # lan_cidr 10.0.1.0/24, zt 10.147.17.0/24, wg 10.8.0.0/24, wan eth1
+        cfg["network"] = dict(cfg["network"]); cfg["network"]["anti_spoof"] = mode
+        return templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+
+    off, on, strict = render("off"), render("on"), render("strict")
+    for out in (off, on, strict):
+        assert templates.find_placeholders(out) == set()
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"anti_spoof render failed nft -c: {err}"
+    # off: nothing
+    assert "saddr !=" not in off and "fib saddr" not in off
+    # on: BCP38 present, keyed on the UNION (false-green guard: all three CIDRs, not lan_cidr alone), no fib
+    assert 'oifname "eth1" ip saddr != { 10.0.1.0/24, 10.147.17.0/24, 10.8.0.0/24 } drop' in on
+    assert "fib saddr" not in on
+    # strict: BCP38 + v6-only fib reverse-path
+    assert "meta nfproto ipv6 fib saddr . iif oif missing drop" in strict
+    assert 'oifname "eth1" ip saddr' in strict
+
+    # helper edge cases
+    assert _anti_spoof_rules({"network": {"anti_spoof": "off"}}) == ""
+    assert _anti_spoof_rules({"network": {}}) == ""                      # absent key => off
+    # union dedups and drops blanks; no zt/wg -> just lan_cidr, never a bare `!= { }`
+    r = _anti_spoof_rules({"interfaces": {"wan": "eth1"}, "network": {"anti_spoof": "on",
+        "lan_cidr": "10.0.1.0/24", "zt_cidr": "", "wg_server_cidr": ""}})
+    assert r == 'oifname "eth1" ip saddr != { 10.0.1.0/24 } drop'
+    # blank wan or no CIDRs -> BCP38 line vanishes (never a bare set); strict still adds v6 fib
+    r = _anti_spoof_rules({"interfaces": {"wan": ""}, "network": {"anti_spoof": "strict"}})
+    assert "saddr !=" not in r and "fib saddr" in r
+
+
 def test_real_nft_edge_forward_nat_blank_iface_safe():
     # M13: the forward-chain LAN<->tunnel / tunnel->WAN accepts and the postrouting masquerade rules
     # must render only for CONFIGURED overlay ifaces/CIDRs. With an optional iface (or its CIDR) blank

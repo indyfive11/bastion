@@ -97,6 +97,8 @@ def _derived(config: dict) -> dict:
     net["zones_input_rules"] = _render_zones(config)
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
     net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
+    net["internal_iface_drop"] = _internal_iface_drop(config)  # M3b: fail-closed input WAN drop
+    net["anti_spoof_rules"] = _anti_spoof_rules(config)   # M2b: gated forward-chain anti-spoof teeth
     net.update(_forward_iface_rules(config))     # M13: blank-safe forward/nat overlay-iface rules
     mach = dict(config.get("machine") or {})
     mach["firewall_preamble"] = _firewall_preamble(config)
@@ -160,6 +162,83 @@ def _nonwan_iface_accepts(config: dict) -> dict:
     return {"zt_accept_tcp": _rule(zt, "tcp", 9993),
             "zt_accept_udp": _rule(zt, "udp", 9993),
             "wg_server_accept": _rule(wg_server, "udp", 51820)}
+
+
+def _internal_iface_drop(config: dict) -> str:
+    """M3b: the fail-CLOSED input-chain WAN drop (root-cause reframe of M3).
+
+    The input chain's ``iifname "{{wan}}" drop`` drops ONLY packets arriving on the *named* WAN iface,
+    so every any-source accept below it (``service_ports``, ``zones``, and — pre-M3 — the ZT/WG control
+    ports) is safe *only if* ``interfaces.wan`` names the real uplink. A mis-detected or renamed WAN
+    makes that drop match nothing and silently exposes those ports to the internet (fail-OPEN).
+
+    This drops everything NOT arriving on one of the box's OWN internal ifaces:
+    ``iifname != { lan, zt, wg_server, wg_vps } drop``. An unknown/renamed iface is now DROPPED, not
+    exposed (fail-CLOSED). The trade is *silent-exposure* → *loud-lockout*, and the lockout is
+    recoverable: ``bastion-recovery``'s ``ensure_main_accept`` INSERTS its accept at the TOP of the
+    input chain (above this drop), and the serial console is out-of-band.
+
+    Renders a COMPLETE rule line. Guards (pressure test A1):
+    * WAN is EXCLUDED from the internal set even on a name collision, so WAN is always dropped.
+    * Empty internal set (a broken, hand-editable config with no ``lan``) FALLS BACK to the literal
+      ``iifname "{wan}" drop`` — never ``!= { }`` (nft rejects an empty set), never a bare vanish
+      (which would delete the only WAN drop and re-open fail-open, strictly worse than today). So this
+      is strictly-safer-or-equal to the literal drop on every config.
+
+    M3's per-rule ``_nonwan_iface_accepts`` scoping is KEPT alongside this (defense in depth): this rule
+    closes the still-any-source ``service_ports``/``zones`` gap that M3 left open."""
+    ifaces = config.get("interfaces") or {}
+    def _name(k): return str(ifaces.get(k) or "").strip()
+    wan = _name("wan")
+    internal = [i for i in (_name("lan"), _name("zt_iface"),
+                            _name("wg_server_iface"), _name("wg_vps_iface")) if i and i != wan]
+    if internal:
+        return f'iifname != {{ {", ".join(internal)} }} drop'
+    return f'iifname "{wan}" drop'
+
+
+def _anti_spoof_rules(config: dict) -> str:
+    """M2b: the forward-chain anti-spoof teeth, gated by ``[network] anti_spoof`` (off|on|strict).
+
+    ``off`` (default) → ``""`` (today's behavior; no forwarding change on existing installs). This is
+    off-by-default because BCP38 keyed on the *declared* CIDRs can blackhole an UNDECLARED downstream/
+    cascaded subnet routed behind the LAN — the same class of legit-traffic blackhole the M2 pressure
+    test made bastion avoid (strict rp_filter on the asymmetric relay path). The operator opts in once
+    they know their source prefixes.
+
+    ``on`` → **BCP38 v4 egress drop**: a packet FORWARDED out the WAN whose source is not one of the
+    box's own declared CIDRs (``lan_cidr`` ∪ ``zt_cidr`` ∪ ``wg_server_cidr``) is dropped. Uses the
+    UNION (pressure test F3 — keying on ``lan_cidr`` alone would drop legit overlay-sourced egress).
+    Only matches ``oifname wan`` FORWARDED traffic, so the router's own output and the ``wg_vps`` relay
+    egress (``oifname wg_vps``) are untouched; masquerade is postrouting (after forward), so ``saddr``
+    is still the original in-CIDR source here. ct-established (chain top) already accepted return flows,
+    so the asymmetric-return path M2 rejected is NOT re-broken (BCP38 checks egress source, not reverse
+    route).
+
+    ``strict`` → BCP38 + a **v6 reverse-path** ``meta nfproto ipv6 fib saddr . iif oif missing drop``.
+    v6-only ON PURPOSE: there is no v6 rp_filter sysctl, but a v4 ``fib`` reverse-path reproduces the
+    exact policy-routing/asymmetry blackhole M2 rejected — so v4 stays BCP38-only, and even v6 fib is
+    behind this explicit ``strict`` opt-in.
+
+    Renders a complete block (one rule per line, forward-chain body indent) or ``""``. Each rule vanishes
+    if it would be empty (blank ``wan`` or no declared CIDRs → no BCP38 line; never a bare ``!= { }``)."""
+    net = config.get("network") or {}
+    ifaces = config.get("interfaces") or {}
+    mode = str(net.get("anti_spoof") or "off").strip().lower()
+    if mode not in ("on", "strict"):
+        return ""
+    wan = str(ifaces.get("wan") or "").strip()
+    cidrs: list[str] = []
+    for k in ("lan_cidr", "zt_cidr", "wg_server_cidr"):
+        c = str(net.get(k) or "").strip()
+        if c and c not in cidrs:
+            cidrs.append(c)
+    rules: list[str] = []
+    if wan and cidrs:
+        rules.append(f'oifname "{wan}" ip saddr != {{ {", ".join(cidrs)} }} drop')
+    if mode == "strict":
+        rules.append("meta nfproto ipv6 fib saddr . iif oif missing drop")
+    return "\n        ".join(rules)
 
 
 def _forward_iface_rules(config: dict) -> dict:

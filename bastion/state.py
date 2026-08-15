@@ -318,6 +318,14 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
             warnings.append(f"[network] prefer_ipv4={prefer_v4} is endpoint-only (routers must not "
                             f"prefer IPv4) — ignored in {mode} mode")
 
+    anti_spoof = _get("network", "anti_spoof")
+    if anti_spoof:
+        if anti_spoof.lower() not in ("off", "on", "strict"):
+            errors.append(f"[network] anti_spoof={anti_spoof!r} — must be 'off', 'on', or 'strict'")
+        elif anti_spoof.lower() != "off" and mode == "endpoint":
+            warnings.append(f"[network] anti_spoof={anti_spoof} is edge-only (endpoints do not "
+                            f"forward) — ignored in {mode} mode")
+
     relay_ep = _get("monitoring", "relay_endpoint")
     if relay_ep:
         try:
