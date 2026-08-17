@@ -30,6 +30,9 @@ When the architecture is ambiguous, resolve to the narrowest scope.
 `make leak-check` (leak gate) · `make generate-check` (templates resolve) · `python -m pytest -q`.
 See `README.md` for install and usage.
 
+Roadmap and release planning are tracked out-of-tree (maintainer-local), not in this repo.
+`CHANGELOG.md` + the git tag history are the in-repo record of what shipped.
+
 ## Identity (public repo)
 Author/committer: `indyfive11 <203553604+indyfive11@users.noreply.github.com>`.
 No `Co-Authored-By` trailers. No AI attribution in commit messages or PR descriptions.
