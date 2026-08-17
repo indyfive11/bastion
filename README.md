@@ -65,6 +65,14 @@ rate-limit / tarpit) has an IPv4 and an IPv6 variant, and the reconciler routes 
 source to the family-matched set — so a host attacking over IPv6 is filtered the same as over IPv4.
 `trusted_hosts` may likewise contain IPv6 addresses.
 
+**Anti-spoof teeth (opt-in).** The edge input chain already fails **closed** — anything not arriving on
+one of the box's own internal interfaces is dropped. Beyond that, the optional `[network] anti_spoof`
+knob adds source-address filtering to the *forward* path: `on` = a BCP38 egress drop (a packet leaving
+the WAN whose source isn't one of the box's declared CIDRs — `lan_cidr` + any `zt_cidr`/`wg_server_cidr`
+— is dropped), and `strict` = `on` plus an IPv6 reverse-path drop. It defaults to `off` because
+`on`/`strict` will also drop traffic from an *undeclared* cascaded subnet you route behind the LAN — so
+declare such subnets first, or leave it off.
+
 ### Suggested hardware
 
 bastion's data path is plain in-kernel nftables, and its threat-intel layer (CrowdSec) is
@@ -107,8 +115,10 @@ Notes:
 
 > **Distro support.** Arch (and Arch-based) is the **primary, regularly-tested** target.
 > **Debian/Ubuntu (`apt`) and Fedora/RHEL-family (`dnf`) are supported and have been
-> install-validated live** (Debian 12, Fedora 42) — Arch still sees the most use, so report any
-> rough edges. Package-name differences across distros are handled automatically (e.g. `python` →
+> install-validated live** — a full-edge install (L0–L6) is exercised across **Ubuntu, Debian 12,
+> and Rocky 9**, the last under **SELinux `enforcing`** (where L4 relabels unbound's `:5335` to
+> `dns_port_t` so the resolver binds). Arch still sees the most use, so report any rough edges.
+> Package-name differences across distros are handled automatically (e.g. `python` →
 > `python3`, `openssh` → `openssh-server`, and on Debian `conntrack-tools` → `conntrack`). A package
 > only in a third-party repo (e.g. CrowdSec on Debian/Fedora, or AUR on Arch) is reported with an
 > install hint rather than installed for you. Another manager (e.g. openSUSE's `zypper`) is detected
@@ -163,7 +173,7 @@ Key sections you provide:
 |---|---|
 | `[machine]` | `mode` (edge/endpoint), `profile`, active `layers`, `distro`, `firewall_scope` (exclusive/cooperative) |
 | `[interfaces]` | `lan`, `wan` (edge), optional `wg_server_iface` / `wg_vps_iface` / `zt_iface` |
-| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts`, `service_ports` |
+| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts`, `service_ports`, `ipv6_forward`; `anti_spoof` (edge BCP38 teeth — see [edge use case](#use-case-a-dedicated-router--firewall-box)); `prefer_ipv4` (endpoint IPv4-preference — see [endpoints on broken IPv6](#endpoints-on-broken-or-partial-ipv6-prefer_ipv4)) |
 | `[zones]` | inbound `source → action` rules (e.g. `lan = 192.168.1.0/24 -> 8096, 8989`) — see [zones](#firewall-zones--ownership-mode) |
 | `[ports]` | `ssh` listen port (detected from running sshd; confirm before locking down) |
 | `[ai]` | backend command, model, analysis `depth` (regular/advanced/expert) |
@@ -256,11 +266,35 @@ The AI layer is opt-in and provider-agnostic. Two knobs in `machine.conf [ai]` s
   It controls breadth of context, **not** authority — base/access changes (e.g. the SSH port) are
   always routed to a human-review queue and never auto-applied at any depth.
 
+### Endpoints on broken or partial IPv6 (`prefer_ipv4`)
+
+On an **endpoint** whose IPv6 is *up but has no working egress* — a common VPS or IPv4-only-VPN
+situation — dual-stack apps stall dialing an unreachable v6 address before falling back to IPv4. The
+endpoint-only `[network] prefer_ipv4` knob fixes this without touching your firewall rules:
+
+- **`off`** (default) — normal dual-stack.
+- **`soft`** — writes `/etc/gai.conf` so glibc's `getaddrinfo` prefers IPv4 (covers `curl` and most
+  desktop/CLI apps).
+- **`hard`** — `soft` **plus** disabling IPv6 via sysctl, which also covers Go/musl binaries (e.g.
+  `rclone`) that ignore `gai.conf`. This removes **all** IPv6, including `::1` loopback binds — so a
+  local-only service that binds `::1` (an unbound stub, for one) needs a v4 bind instead.
+
+```sh
+bastion config set network.prefer_ipv4 soft --advanced   # or: hard
+```
+
+It's fully reversible (`… prefer_ipv4 off` re-applies), bastion backs up any pre-existing
+`/etc/gai.conf` and restores it on uninstall, and it's ignored in edge mode (a router must not prefer
+v4). It's **static** — if the box later roams onto a network with real IPv6, re-run the command (or
+`bastion setup`); `bastion generate` alone does not touch `gai.conf`.
+
 ### Firewall zones & ownership mode
 
 **Zones** are bastion's unified inbound-access policy — one rule per `source → action`, where the
 source is `any`, an IP/CIDR, a whole interface (`iface:NAME`), or a network pinned to one interface
-(`iface:NAME+<CIDR>`), and the action is `all` or a port list. They render as inline nftables accepts;
+(`iface:NAME+<CIDR>`), and the action is `all` or a port list. A zone can also pin a **destination**
+in `machine.conf` (`<source> to <dest> -> <ports>`) to open a port only to one local service IP — see
+the [zones reference](docs/options/zones-and-ownership.md). They render as inline nftables accepts;
 on edge boxes they apply to LAN/overlay traffic (the WAN drop fires first).
 
 ```sh
@@ -402,8 +436,8 @@ make it straightforward to adopt on almost any Linux host.
   network, not export it.
 - **No required cloud, no lock-in.** Bastion is fully usable with rule-based detection and needs no API
   key or account; AI assistance is an enhancement you switch on or off. It orchestrates standard tools
-  — nftables, systemd, and well-known daemons — across Arch, Debian/Ubuntu, and Fedora, so your stack
-  stays transparent, inspectable, and yours.
+  — nftables, systemd, and well-known daemons — across Arch, Debian/Ubuntu, and the Fedora/RHEL family,
+  so your stack stays transparent, inspectable, and yours.
 
 ## Development
 
@@ -414,6 +448,9 @@ python -m pytest -q   # test suite
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
+
+Roadmap and release planning are maintained out-of-tree by the maintainer; this repository
+tracks shipped changes in [`CHANGELOG.md`](CHANGELOG.md) and the git tag history.
 
 ## License
 

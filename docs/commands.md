@@ -16,7 +16,7 @@ Anything that loads nft rules, installs units, or installs packages needs **root
 | `bastion setup --profile <p>` | Skip profile selection. `p` = `full-edge` / `basic-edge` / `full-endpoint` / `minimal-endpoint` / `custom`. |
 | `bastion setup --set KEY=VALUE` | Answer a prompt non-interactively (overrides detection *and* prompts). Repeatable: `--set lan_iface=eth1 --set ssh_port=1111`. Enables fully scripted installs. |
 | `bastion setup --bootstrap` | Soft recovery: re-detect from scratch, do **not** trust the existing `machine.conf` for detected values, and show where it disagrees with the live system (the "wrong SSH port locked me out" case). |
-| `bastion setup --no-ai` | Skip AI-assisted setup (setup is always rule-based today; flag reserved). |
+| `bastion setup --no-ai` | Exclude the L3 AI-analysis layer from the install (drops it from the active layer set; the wizard itself is always rule-based). |
 | `bastion generate` | Re-render every active layer's templates from `machine.conf` → `/etc/bastion/machine.env` + config files. Run after editing `machine.conf`. |
 | `bastion generate --check` | Validate that every template placeholder resolves. Writes nothing, no network — the config gate used in CI. |
 | `bastion config list` | The control room: list settings + current values (Everyday by default; `--advanced` also shows gated ones; `--group <section>` to scope; `--json`). |
