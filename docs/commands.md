@@ -31,8 +31,8 @@ Anything that loads nft rules, installs units, or installs packages needs **root
 | `bastion status` | Per-layer install/active state. Add `--json` for the machine-readable projection (a status-scoped slice of `bastion state`). |
 | `bastion status --health` | …plus each layer's health checks (binaries present, sets loaded, units enabled). |
 | `bastion tui` | Live terminal dashboard: layer health, nftables set counts, AI timer/proposals, reconciler audit tail, recovery state, and a command palette that can drive every operation. Needs `python-textual`. |
-| `bastion verify` | Drift check: do the live configs match what `bastion generate` would produce now? Flags hand-edits and stale renders. Add `--json` for the structured drift report. |
-| `bastion doctor` | One-shot triage of a sick box: required binaries, config drift, reboot persistence, recovery readiness, AI state. Read-only. Add `--json` for the structured triage report. |
+| `bastion verify` | Drift check: do the live config *files* match what `bastion generate` would produce now? Flags hand-edits and stale renders. Checks files, not the loaded ruleset — run `bastion doctor` to confirm the kernel is in sync. Add `--json` for the structured drift report. |
+| `bastion doctor` | One-shot triage of a sick box: required binaries, config drift, reboot persistence, **live kernel ruleset in sync with `/etc/nftables.conf`** (catches a `generate` with no `firewall reload`), recovery readiness, AI state. Read-only. Add `--json` for the structured triage report. |
 | `bastion check` | Connectivity/flow checks (wraps L6 `flowcheck`): egress, DNS, firewall state. Read-only, no root. |
 | `bastion check --full` | …also run the LAN forward-path check (`lan-verify`). |
 | `bastion check --lan` | Run *only* the LAN forward-path check — run it while a LAN client is generating traffic. |

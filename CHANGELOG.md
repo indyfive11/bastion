@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.17] - 2026-08-17
+
+Closes a false-green in `bastion doctor`: it (and `bastion verify`) compared the rendered config to
+disk but never to the **loaded kernel ruleset**, so a `bastion generate` without a following `bastion
+firewall reload` left the kernel behind while every health signal stayed green — a firewall that is
+live but stale read as fully healthy. Found on a live endpoint where a WireGuard accept present in
+`/etc/nftables.conf` was absent from the kernel and silently dropped the tunnel. Live-verified.
+
+### Added
+
+- **`doctor` "ruleset current" check.** `bastion doctor` now reports whether the live kernel ruleset
+  matches `/etc/nftables.conf`, catching a `generate` that was never reloaded. It detects this by
+  *differential canonicalization* — the on-disk file is loaded into a throwaway network namespace so
+  the same `nft` binary canonicalizes it exactly as the real load did, then each managed table (the
+  endpoint `inet bastion`, or the edge `inet edge` + `ip edge_nat`) is diffed against the live dump,
+  after normalizing away the parts that legitimately differ on a synced box: reconciler-filled set
+  elements, per-packet counters, and the transient `bastion-recovery` accept. It is a **WARN** (an
+  operator can legitimately be mid-change) and is gated exactly like the base-table probe — it needs a
+  live system, root, the base table loaded, and a working namespace; otherwise it reports "unknown",
+  never a false "stale".
+
+### Changed
+
+- **`verify` no longer over-promises.** Its "no drift" success message now states it checks config
+  *files*, not the loaded ruleset, and points at `bastion doctor` for the kernel-sync check.
+
 ## [1.5.16] - 2026-08-17
 
 Adds first-class firewall support for hosting a WireGuard **server** on an endpoint (e.g. a VPS that

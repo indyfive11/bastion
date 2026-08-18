@@ -409,7 +409,7 @@ bastion never rewrites your resolver config.
 | `bastion ai proposals \| accept <id> \| reject <id>` | review the AI human-review queue and record a decision (nothing auto-applies) |
 | `bastion ai rollback <id>` | undo the elements one audit record applied |
 | `bastion verify` | check live configs still match what `generate` would produce (drift detection) |
-| `bastion doctor` | one-shot triage: binaries, drift, firewall persistence, recovery, AI |
+| `bastion doctor` | one-shot triage: binaries, drift, firewall persistence, live kernel ruleset in sync, recovery, AI |
 | `bastion snapshot [--name N] \| snapshots \| rollback [N] \| confirm [--force]` | capture (optionally named) / list / restore known-good network state; confirm egress then disarm the watchdog (and any `switch` deadman). `confirm --force` disarms without the egress check when you're present but egress is down for an unrelated reason |
 | `bastion setup --bootstrap` | soft recovery: re-detect from scratch and show where the current config disagrees with the live system |
 | `bastion recovery <start\|stop\|extend\|status>` | operate the out-of-band rescue service |
