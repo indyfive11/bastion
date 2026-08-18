@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.18] - 2026-08-18
+
+Makes `bastion zones add`/`remove` a **proven one-command firewall change** instead of an edit that
+applies live, unpreviewed and unguarded. Prompted by a manual VPS port-open where the safe workflow —
+check the live ruleset isn't diverged, preview the exact rule, apply, verify — had to be run by hand.
+A Deep Probe found two real gaps behind that: `generate` is a full rewrite from `machine.conf`, so an
+unrelated `zones` edit silently **flushes any live rule not in the config** (unrecoverable); and the
+apply path had only *syntactic* validation — `zones add x 0.0.0.0/0 -> 22` opened SSH to the entire
+internet with **zero warning**. Live-verified against a real endpoint kernel.
+
+### Added
+
+- **Rule-delta preview + `--dry-run` on `bastion zones`.** Every `add`/`remove` now prints the exact
+  `+`/`-` nftables rules it will produce (a pure template render + diff — it never loads `nft`).
+  `bastion zones add … --dry-run` shows that delta and the checks below, then writes and reloads
+  nothing.
+- **Clobber gate.** Before applying, the command checks whether the live kernel ruleset has drifted
+  from `/etc/nftables.conf` (unmanaged/hand-added rules a regenerate would flush), reusing the
+  differential-canonicalization check from the `doctor` "ruleset current" row. On drift it warns and,
+  on a non-interactive run, refuses unless `--yes` is passed; a clean box applies with no friction. A
+  live apply is followed by a post-check that the kernel now matches disk.
+- **Public-source SSH-exposure warning.** `validate_conf` now warns when a zone grants SSH — or every
+  port — to a public subnet, `any`, or an internet-wide range (so it also surfaces on `generate` and
+  `zones add`). A local `iface:` source and a single pinned public `/32` (the jump-host pattern) stay
+  quiet; the warning is advisory, since a public-IP VPS pinning a trusted admin range is legitimate.
+
 ## [1.5.17] - 2026-08-17
 
 Closes a false-green in `bastion doctor`: it (and `bastion verify`) compared the rendered config to
