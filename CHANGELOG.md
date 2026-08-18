@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.16] - 2026-08-17
+
+Adds first-class firewall support for hosting a WireGuard **server** on an endpoint (e.g. a VPS that
+remote peers dial into). Previously the endpoint ruleset opened no inbound WireGuard port, so a WG
+server configured on an endpoint had its listen port silently firewalled shut — peers could never
+complete a handshake. Live-verified on a KVM VM.
+
+### Added
+
+- **Endpoint WireGuard-server listen-port accept.** When `interfaces.wg_server_iface` is set on an
+  endpoint, the firewall now opens the WireGuard listen port with an any-source `udp dport <port>
+  accept` (WireGuard's own cryptography drops every unauthenticated packet, so an open UDP port
+  exposes no surface beyond the protocol). The port comes from a new `[network] wg_server_listen_port`
+  (defaulting to WireGuard's `51820` when a server interface is set) — so a non-default `ListenPort`
+  is honoured instead of being firewalled shut. The accept sits after the block-list drops (a
+  blocklisted source is still dropped first) and renders nothing on a client endpoint (which stays
+  fully locked down). The edge WireGuard-server accept is unchanged — it keeps its interface-scoped
+  form. A reachability **caution** is emitted at validate time when a WG server is configured on an
+  endpoint (keep an SSH path independent of the tunnel, or a lockout is console-only to recover), and
+  the new port is range-validated.
+
+### Tests
+
+- 665 passing (+2: the endpoint WG-accept render / `nft -c` / false-green cases, and the validate
+  caution + port range-check). Live-verified on the KVM VM — an arbitrary-source UDP datagram reaches
+  the WireGuard listen port through the endpoint's `policy drop` input, and is dropped when the accept
+  is removed (false-red guarded).
+
 ## [1.5.15] - 2026-08-15
 
 A hardening + cross-distro-robustness release. Ten fixes across the edge data plane, the setup wizard,
