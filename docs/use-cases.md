@@ -68,6 +68,12 @@ router for DHCP and default routing. The firewall is interface- and IP-agnostic,
 working as the laptop roams between networks — it doesn't react to a network change, it just
 filters. Verify with `bastion status --health` and `bastion check`.
 
+**Hosting a WireGuard server on an endpoint** (e.g. a VPS relay peers dial into): configure the
+WireGuard server the usual way (L5 + `/etc/wireguard/<iface>.conf`), then set
+`interfaces.wg_server_iface` (and `network.wg_server_listen_port` for a non-default port) — the
+firewall then opens the WireGuard listen port to any source so peers can handshake. Keep an SSH path
+independent of the tunnel (LAN or a trusted IP), so a tunnel that can't come up doesn't lock you out.
+
 ## 3. Expose a service to just the LAN (zones)
 
 **Zones** are bastion's unified inbound policy: one rule per `source → action`, where the

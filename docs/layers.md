@@ -123,6 +123,12 @@ no config** — it never invents a key. `bastion setup` generates the keypair an
 `/etc/wireguard/<iface>.conf` (chmod 600); existing confs are never overwritten. Drop in your
 own conf, or run the wizard, before expecting `wg` interfaces to come up.
 
+On an **endpoint** that hosts a WireGuard *server* (e.g. a VPS peers dial into), setting
+`interfaces.wg_server_iface` makes the firewall open the WireGuard listen port to any source —
+`udp dport <port>` from `[network] wg_server_listen_port` (default `51820`) — so remote peers can
+complete a handshake. A client endpoint opens no inbound port. (On an edge box the WireGuard-server
+accept is interface-scoped instead.)
+
 ## L6 — `monitoring`
 
 **The watchdog + snapshot/rollback + flow & LAN-client checks + the canary confirm + the

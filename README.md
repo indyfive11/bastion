@@ -173,7 +173,7 @@ Key sections you provide:
 |---|---|
 | `[machine]` | `mode` (edge/endpoint), `profile`, active `layers`, `distro`, `firewall_scope` (exclusive/cooperative) |
 | `[interfaces]` | `lan`, `wan` (edge), optional `wg_server_iface` / `wg_vps_iface` / `zt_iface` |
-| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts`, `service_ports`, `ipv6_forward`; `anti_spoof` (edge BCP38 teeth — see [edge use case](#use-case-a-dedicated-router--firewall-box)); `prefer_ipv4` (endpoint IPv4-preference — see [endpoints on broken IPv6](#endpoints-on-broken-or-partial-ipv6-prefer_ipv4)) |
+| `[network]` | `lan_cidr`, `lan_ip`, `gateway`, `dns_upstream`, DHCP pool, `trusted_hosts`, `service_ports`, `ipv6_forward`; `anti_spoof` (edge BCP38 teeth — see [edge use case](#use-case-a-dedicated-router--firewall-box)); `prefer_ipv4` (endpoint IPv4-preference — see [endpoints on broken IPv6](#endpoints-on-broken-or-partial-ipv6-prefer_ipv4)); `wg_server_listen_port` (endpoint WG-server port — see [hosting a WireGuard server](#hosting-a-wireguard-server-on-an-endpoint-wg_server_listen_port)) |
 | `[zones]` | inbound `source → action` rules (e.g. `lan = 192.168.1.0/24 -> 8096, 8989`) — see [zones](#firewall-zones--ownership-mode) |
 | `[ports]` | `ssh` listen port (detected from running sshd; confirm before locking down) |
 | `[ai]` | backend command, model, analysis `depth` (regular/advanced/expert) |
@@ -287,6 +287,32 @@ It's fully reversible (`… prefer_ipv4 off` re-applies), bastion backs up any p
 `/etc/gai.conf` and restores it on uninstall, and it's ignored in edge mode (a router must not prefer
 v4). It's **static** — if the box later roams onto a network with real IPv6, re-run the command (or
 `bastion setup`); `bastion generate` alone does not touch `gai.conf`.
+
+### Hosting a WireGuard server on an endpoint (`wg_server_listen_port`)
+
+An **endpoint** can host a WireGuard *server* — e.g. a VPS that remote peers dial into. You set the
+WireGuard server up yourself — L5 plus a hand-authored `/etc/wireguard/<iface>.conf` (the setup wizard
+does **not** configure an endpoint WireGuard server); this knob is what opens the firewall for it.
+Point the config at the server interface, and set the listen port if it isn't the default:
+
+```sh
+bastion config set interfaces.wg_server_iface wg0 --advanced
+bastion config set network.wg_server_listen_port 51820 --advanced   # optional; 51820 is the default
+```
+
+With `wg_server_iface` set, the endpoint firewall opens the WireGuard listen port to **any source** —
+WireGuard's own cryptography drops every unauthenticated packet, so an open UDP port exposes no
+surface beyond the protocol. The firewall opens whatever `wg_server_listen_port` is set to (default
+`51820`) — it does **not** read the interface's conf, so if your `/etc/wireguard/<iface>.conf` uses a
+non-default `ListenPort` you must set `wg_server_listen_port` to match, or the real port stays
+firewalled shut. A *client* endpoint (no `wg_server_iface`) opens no inbound port and stays fully
+locked down. On an **edge** box the WireGuard-server accept is unchanged — it stays interface-scoped.
+
+> ⚠️ **Keep an SSH path independent of the tunnel.** If you pin SSH to the WireGuard subnet and the
+> tunnel can't come up, you're locked out with console-only recovery — so keep a LAN or trusted-IP
+> SSH path. `bastion` emits this caution at generate time. Today this is configured via `config set`
+> or a hand-authored `machine.conf`; the setup wizard does not yet prompt for an endpoint WireGuard
+> server.
 
 ### Firewall zones & ownership mode
 
