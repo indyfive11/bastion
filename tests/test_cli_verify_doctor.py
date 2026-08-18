@@ -168,3 +168,146 @@ def test_status_json_projection(tmp_path, capsys):
     assert "firewall" in doc and "loaded" in doc["firewall"]
     # the projection is exactly the status-scoped keys — no AI/audit/recovery noise
     assert set(doc) == {"schema_version", "mode", "root", "table", "firewall", "layers"}
+
+
+# --- H6: live-kernel-vs-rendered-file staleness (doctor "ruleset current") ----
+import pytest
+from bastion.layers.base import Context as _Ctx
+
+
+def _netns_available() -> bool:
+    try:
+        r = subprocess.run(["unshare", "-rn", "nft", "list", "ruleset"],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+_HAS_NETNS = _netns_available()
+
+
+def test_normalize_strips_volatile_counter_recovery():
+    dump = (
+        "table inet bastion {\n"
+        "\tset blk_feed {\n\t\ttype ipv4_addr\n\t\tflags interval,timeout\n"
+        "\t\telements = { 10.0.0.0/8,\n\t\t             172.16.0.0/12 }\n\t}\n"
+        "\tset trusted_hosts {\n\t\ttype ipv4_addr\n\t\telements = { 192.168.9.9 }\n\t}\n"
+        "\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n"
+        "\t\tct state established,related accept\n"
+        "\t\ttcp dport 22 accept counter packets 5 bytes 300\n"
+        "\t\ttcp dport { 22 } accept comment \"bastion-recovery\"\n"
+        "\t\tudp dport 51820 accept\n\t}\n}")
+    norm = cli._normalize_table_dump(dump)
+    assert "10.0.0.0/8" not in norm and "172.16.0.0/12" not in norm   # volatile set elements gone
+    assert "192.168.9.9" in norm                                       # trusted_hosts kept
+    assert "counter packets" not in norm and "tcp dport 22 accept" in norm  # counter stripped, rule kept
+    assert "bastion-recovery" not in norm                              # recovery punch stripped
+    assert "udp dport 51820 accept" in norm                            # real rule kept
+
+
+def test_normalize_detects_missing_rule():
+    good = ("chain input {\n\t\tct state established,related accept\n"
+            "\t\tudp dport 51820 accept\n\t\ttcp dport 1111 accept\n}")
+    stale = good.replace("\t\tudp dport 51820 accept\n", "")
+    assert cli._normalize_table_dump(good) != cli._normalize_table_dump(stale)
+
+
+def test_split_table_dumps():
+    marked = "@@ inet edge\ntable inet edge {\n\tx\n}\n@@ ip edge_nat\ntable ip edge_nat {\n\ty\n}"
+    d = cli._split_table_dumps(marked)
+    assert set(d) == {("inet", "edge"), ("ip", "edge_nat")}
+    assert "x" in d[("inet", "edge")] and "y" in d[("ip", "edge_nat")]
+
+
+class _LiveFake(cli.System):
+    """A System that reports live+root and serves canned nft/unshare output, so _ruleset_stale's
+    orchestration + gating are exercised without a real kernel (the honest kernel check is the
+    unshare test below)."""
+    @property
+    def is_live(self): return True
+    @property
+    def is_root(self): return True
+
+    def path(self, p):
+        return self._conf if str(p) == "/etc/nftables.conf" else super().path(p)
+
+    def run(self, *args, capture=True, input=None):
+        if args[0] == "unshare":
+            return subprocess.CompletedProcess(args, self._exp_rc, self._expected, "")
+        if args[:3] == ("nft", "list", "table"):
+            key = (args[3], args[4])
+            txt = self._live.get(key)
+            return subprocess.CompletedProcess(args, 0 if txt is not None else 1, txt or "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+
+def _mk_livefake(tmp_path, expected, live, exp_rc=0):
+    conf = tmp_path / "nftables.conf"
+    conf.write_text("# stub\n")
+    s = _LiveFake(root=Path("/"))
+    s._conf, s._expected, s._live, s._exp_rc = conf, expected, live, exp_rc
+    return _Ctx(system=s, config={"machine": {"mode": "endpoint"}}, templates_dir=TEMPLATES,
+                scripts_dir=SCRIPTS)
+
+
+def test_ruleset_stale_true_when_kernel_missing_rule(tmp_path):
+    exp = "@@ inet bastion\ntable inet bastion {\n\tchain input {\n\t\tudp dport 51820 accept\n\t}\n}"
+    live = {("inet", "bastion"): "table inet bastion {\n\tchain input {\n\t}\n}"}  # accept missing
+    ctx = _mk_livefake(tmp_path, exp, live)
+    assert cli._ruleset_stale(ctx) == (True, "inet bastion")
+
+
+def test_ruleset_stale_false_when_in_sync(tmp_path):
+    body = "table inet bastion {\n\tchain input {\n\t\tudp dport 51820 accept\n\t}\n}"
+    ctx = _mk_livefake(tmp_path, "@@ inet bastion\n" + body, {("inet", "bastion"): body})
+    assert cli._ruleset_stale(ctx) == (False, "")
+
+
+def test_ruleset_stale_none_when_unshare_unavailable(tmp_path):
+    # exp_rc != 0 models a hardened kernel with no userns/netns -> unknown, never a false STALE.
+    ctx = _mk_livefake(tmp_path, "", {("inet", "bastion"): "x"}, exp_rc=1)
+    assert cli._ruleset_stale(ctx) is None
+
+
+def test_ruleset_stale_none_when_not_live(tmp_path):
+    # staged --root tree (is_live False) must skip the live-kernel probe entirely.
+    _stage(tmp_path)
+    ctx = _Ctx(system=cli.System(root=tmp_path), config=state.load_conf(EXAMPLE),
+               templates_dir=TEMPLATES, scripts_dir=SCRIPTS)
+    assert cli._ruleset_stale(ctx) is None
+
+
+def test_doctor_omits_ruleset_row_under_root(monkeypatch, tmp_path, capsys):
+    # Regression: the new row is gated on is_live, so a staged doctor run must not emit it.
+    _stage(tmp_path)
+    _doctor_ctx(monkeypatch, tmp_path, state.load_conf(EXAMPLE))
+    cli.cmd_doctor(cli.build_parser().parse_args(["doctor"]))
+    assert "ruleset current" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not _HAS_NETNS, reason="needs working unshare -rn + nft (userns/netns)")
+def test_ruleset_stale_real_kernel_differential(tmp_path):
+    """Honest anchor: prove differential canonicalization against REAL nft output — identical
+    content normalizes equal (even with a volatile set filled live), a missing rule differs."""
+    def dump(text):
+        r = subprocess.run(["unshare", "-rn", "bash", "-c", "nft -f - >/dev/null 2>&1 && "
+                            "nft list table inet bastion"], input=text, text=True, capture_output=True)
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+
+    base = ("table inet bastion {{\n"
+            "  set blk_feed {{ type ipv4_addr; flags interval,timeout; {feed} }}\n"
+            "  set trusted_hosts {{ type ipv4_addr; flags interval; elements = {{ 192.168.9.9 }} }}\n"
+            "  chain input {{ type filter hook input priority 0; policy drop;\n"
+            "    ct state established,related accept\n{wg}"
+            "    tcp dport 1111 accept\n  }}\n}}\n")
+    expected = dump(base.format(feed="", wg="    udp dport 51820 accept\n"))              # ships empty
+    live_ok  = dump(base.format(feed="elements = { 10.0.0.0/8 }",                          # feed FILLED live
+                                wg="    udp dport 51820 accept\n"))
+    live_bad = dump(base.format(feed="", wg=""))                                           # wg accept MISSING
+
+    n = cli._normalize_table_dump
+    assert n(expected) == n(live_ok)      # volatile-set fill does NOT trip a false STALE
+    assert n(expected) != n(live_bad)     # a genuinely missing rule IS caught
+    assert "192.168.9.9" in n(live_ok)    # trusted_hosts survived normalization on real nft output

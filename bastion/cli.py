@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1042,6 +1043,100 @@ def _artifact_drift(ctx: Context) -> list[tuple[str, str]]:
     return out
 
 
+# H6 — live-kernel-vs-rendered-file staleness detection.
+# `verify`/`_drift_report` compare the rendered file to disk; nothing compared the file to the
+# LOADED kernel ruleset, so `generate` without a `firewall reload` left the kernel behind while
+# every health signal stayed green (a WireGuard accept in /etc/nftables.conf, absent from the
+# kernel, silently dropped the tunnel). We detect it by *differential canonicalization*: load the
+# on-disk file into a throwaway net namespace so the SAME nft binary canonicalizes it exactly as
+# the real load did, then diff each managed table against the live dump after normalizing the
+# parts that legitimately differ on a synced box.
+
+# Reconciler-filled sets ship EMPTY in the file and are populated + self-expire at runtime, so
+# their live elements always differ from the file — exclude their elements. trusted_hosts is
+# machine.conf-static (rendered INTO the file), so it stays IN the compare.
+_VOLATILE_SETS = frozenset(
+    f"{s}{v}" for s in ("blk_feed", "cs_block", "ai_block", "ai_ratelimit", "ai_tarpit")
+    for v in ("", "6"))
+_RECOVERY_RULE_TAG = "bastion-recovery"   # bastion-recovery punches a transient comment-tagged accept
+
+
+def _normalize_table_dump(text: str) -> str:
+    """Strip the parts of an `nft list table` dump that legitimately differ between the rendered
+    file and a live-but-synced kernel: volatile-set elements, per-packet counters, and the
+    transient bastion-recovery accept. Both sides are already nft-canonical (same binary)."""
+    out: list[str] = []
+    cur_set: str | None = None
+    skip_elems = False
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"set\s+(\S+)\s*\{", s)
+        if m:
+            cur_set = m.group(1)
+        if skip_elems:                                  # inside a volatile set's elements block
+            if s.endswith("}"):
+                skip_elems = False
+            continue
+        if cur_set in _VOLATILE_SETS and s.startswith("elements = {"):
+            skip_elems = not s.endswith("}")            # multi-line block → skip to its close
+            continue
+        if _RECOVERY_RULE_TAG in s:                     # recovery's runtime punch — never in the file
+            continue
+        out.append(re.sub(r" counter packets \d+ bytes \d+", "", line).rstrip())
+    return "\n".join(out).strip()
+
+
+def _split_table_dumps(marked: str) -> dict[tuple[str, str], str]:
+    """Split the netns listing (each table preceded by a `@@ <family> <table>` marker) into a
+    {(family, table): dump} map."""
+    res: dict[tuple[str, str], str] = {}
+    cur: tuple[str, str] | None = None
+    buf: list[str] = []
+    for line in marked.splitlines():
+        if line.startswith("@@ "):
+            if cur is not None:
+                res[cur] = "\n".join(buf)
+            parts = line.split()
+            cur, buf = (parts[1], parts[2]), []
+        elif cur is not None:
+            buf.append(line)
+    if cur is not None:
+        res[cur] = "\n".join(buf)
+    return res
+
+
+def _ruleset_stale(ctx: Context):
+    """H6: is the LIVE kernel ruleset stale vs the on-disk /etc/nftables.conf? Returns
+    ``(stale: bool, where: str)`` or ``None`` when undeterminable — non-live/--root, non-root,
+    the base table not loaded, the file absent, or `unshare`/netns unavailable (hardened kernel).
+    None ⇒ report "unknown", NEVER a false STALE."""
+    sys_ = ctx.system
+    if not sys_.is_live or not sys_.is_root:
+        return None
+    conf = sys_.path("/etc/nftables.conf")
+    if not conf.exists():
+        return None
+    tables = [("inet", "bastion")] if ctx.mode == "endpoint" else [("inet", "edge"), ("ip", "edge_nat")]
+    from . import worldstate
+    if worldstate.firewall_loaded(sys_, *tables[0]) is not True:
+        return None                                     # "not loaded" is a different story
+    # Expected: nft canonicalizes the file in a fresh netns exactly as the real load did.
+    listing = "; ".join(f"echo '@@ {f} {t}'; nft list table {f} {t} 2>/dev/null" for f, t in tables)
+    exp = sys_.run("unshare", "-rn", "bash", "-c",
+                   f"nft -f {shlex.quote(str(conf))} >/dev/null 2>&1 || exit 3; {listing}")
+    if exp.returncode != 0:
+        return None                                     # netns/unshare unavailable → unknown
+    expected = _split_table_dumps(exp.stdout)
+    diffs: list[str] = []
+    for f, t in tables:
+        live = sys_.run("nft", "list", "table", f, t)
+        exp_norm = _normalize_table_dump(expected.get((f, t), ""))
+        live_norm = _normalize_table_dump(live.stdout) if live.returncode == 0 else ""
+        if exp_norm != live_norm:
+            diffs.append(f"{f} {t}")
+    return (bool(diffs), ", ".join(diffs))
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     import json as _json
     ctx = build_context(args)
@@ -1076,7 +1171,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
               "(then `bastion firewall reload` for the ruleset) to reconcile — or fold your "
               "hand-edits back into machine.conf.")
         return 1
-    print("  no drift — live configs match what generate would produce.")
+    print("  no drift — generated files match disk. (This checks files, not the loaded ruleset — "
+          "run `bastion doctor` to confirm the live kernel is in sync.)")
     return 0
 
 
@@ -1142,6 +1238,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         loaded = worldstate.firewall_loaded(sys_, fam, tbl)   # SAME tri-state as state/status/TUI (E6)
         if loaded is True:
             add("OK", "base table", f"{fam} {tbl} loaded")
+            try:                                              # H6: is the loaded ruleset current?
+                stale = _ruleset_stale(ctx)
+            except Exception as exc:                          # noqa: BLE001 — never let triage crash
+                stale = None
+                add("WARN", "ruleset current", f"could not check ({exc})")
+            if stale is not None:
+                is_stale, where = stale
+                if is_stale:
+                    add("WARN", "ruleset current",
+                        f"live kernel ruleset is STALE vs /etc/nftables.conf ({where}) — run "
+                        "`bastion firewall reload` (a `generate` without a reload leaves the kernel behind)")
+                else:
+                    add("OK", "ruleset current", "live kernel matches /etc/nftables.conf")
         elif loaded is False:
             add("WARN", "base table", f"{fam} {tbl} not loaded — `bastion firewall reload`")
         else:                                                 # None — live non-root: explicit unknown
