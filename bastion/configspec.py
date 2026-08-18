@@ -212,6 +212,12 @@ SETTINGS: tuple[Setting, ...] = (
        _v_iface, "an interface name", APPLY_GENERATE_FIREWALL),
     _S("interfaces.wg_server_iface", "WG server interface", "Inbound WireGuard server NIC.", ADVANCED,
        _v_iface, "an interface name", APPLY_GENERATE_FIREWALL),
+    _S("network.wg_server_listen_port", "WG server listen port",
+       "Inbound WireGuard server's listen port (endpoint mode). The firewall opens this UDP port to "
+       "ANY source so remote peers can handshake (WG's crypto drops non-authenticated packets). Blank "
+       "=> WireGuard's default 51820 when a wg_server_iface is set. Endpoint-only: on an edge box the "
+       "WG-server accept stays iface-scoped and this field is ignored.",
+       ADVANCED, _v_port, "a port 1–65535 (blank = 51820)", APPLY_GENERATE_FIREWALL, scope="endpoint"),
     _S("ai.backend_cmd", "AI backend command", "Executable the analyzer shells out to.", ADVANCED,
        lambda v: bool(v.strip()), "a path to an executable", APPLY_GENERATE, layer_gate="l3"),
     _S("ai.model", "AI model", "Model id passed to the backend.", ADVANCED,

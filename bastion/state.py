@@ -211,6 +211,10 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
     if ssh and not (ssh.isdigit() and 1 <= int(ssh) <= 65535):
         errors.append(f"[ports] ssh={ssh!r} — must be an integer 1–65535")
 
+    wg_port = _get("network", "wg_server_listen_port")
+    if wg_port and not (wg_port.isdigit() and 1 <= int(wg_port) <= 65535):
+        errors.append(f"[network] wg_server_listen_port={wg_port!r} — must be an integer 1–65535")
+
     for key in ("lan_cidr", "zt_cidr", "wg_server_cidr"):
         val = _get("network", key)
         if not val:
@@ -325,6 +329,17 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
         elif anti_spoof.lower() != "off" and mode == "endpoint":
             warnings.append(f"[network] anti_spoof={anti_spoof} is edge-only (endpoints do not "
                             f"forward) — ignored in {mode} mode")
+
+    # M-A: an endpoint with a WireGuard SERVER (peers dial in) opens its listen port to ANY source.
+    # This is a supported config (a VPS relay), so it is a CAUTION, not "ignored" — the port IS
+    # honoured. The footgun is reachability: if SSH is pinned to the WG subnet, a tunnel that can't
+    # come up locks the operator out with console-only recovery.
+    if _get("interfaces", "wg_server_iface") and mode == "endpoint":
+        wg_port = _get("network", "wg_server_listen_port") or "51820"
+        warnings.append(f"[interfaces] wg_server_iface is set on an endpoint (a WireGuard server): the "
+                        f"firewall opens udp/{wg_port} to any source for peer handshakes — keep an SSH "
+                        f"path independent of this tunnel (LAN / a trusted static IP / console), or a "
+                        f"lockout is console-only to recover")
 
     relay_ep = _get("monitoring", "relay_endpoint")
     if relay_ep:

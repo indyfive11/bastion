@@ -399,3 +399,78 @@ def test_active_template_rels_excludes_inactive_layers():
     # unset layers -> all layers (back-compat)
     allrels = cli.active_template_rels({"machine": {}}, "edge")
     assert "dnsmasq.conf" in allrels and "backend.conf" in allrels
+
+
+def test_endpoint_wg_server_listen_accept_renders_and_is_gated():
+    """M-A: an ENDPOINT that hosts a WireGuard server (wg_server_iface set) opens its listen port as
+    an any-source `udp dport <port> accept`; a client endpoint (no wg_server_iface) renders NO such
+    accept. False-green guarded — the assertions FAIL if the accept were always-on or absent-when-set,
+    or if a blank port ever rendered `udp dport  accept`. Endpoint-only: empty in edge mode."""
+    from bastion import state, templates
+    tmpl = TEMPLATES / "nftables-endpoint.nft"
+
+    # (1) endpoint + wg_server_iface + explicit port -> any-source accept on that port; valid nft
+    cfg = state.load_conf(EXAMPLE)
+    cfg["machine"]["mode"] = "endpoint"
+    cfg["interfaces"]["wg_server_iface"] = "wg0"
+    cfg["network"]["wg_server_listen_port"] = "51900"
+    out = templates.render_file(tmpl, cfg)
+    assert "udp dport 51900 accept" in out
+    assert templates.find_placeholders(out) == set()
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"endpoint wg accept failed nft -c: {err}"
+
+    # (2) blank port + iface set -> defaults to WireGuard's 51820 (closes L28 for endpoint)
+    cfg["network"]["wg_server_listen_port"] = ""
+    out = templates.render_file(tmpl, cfg)
+    assert "udp dport 51820 accept" in out
+    assert "dport  accept" not in out and "dport { } accept" not in out
+
+    # (3) FALSE-GREEN GUARD: a client endpoint (no wg_server_iface) renders NO WG listen accept
+    cfg["interfaces"]["wg_server_iface"] = ""
+    out = templates.render_file(tmpl, cfg)
+    assert "udp dport 51820 accept" not in out and "udp dport 51900 accept" not in out
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"client endpoint (no wg server) failed nft -c: {err}"
+
+    # (4) ENDPOINT-ONLY: the producer is empty in edge mode, so the edge template never gains an
+    # any-source opener (it keeps its M3 iface-scoped wg_server_accept).
+    cfg["machine"]["mode"] = "edge"
+    cfg["interfaces"]["wg_server_iface"] = "wg0"
+    assert templates._endpoint_wg_server_accept(cfg) == ""
+
+
+def test_validate_conf_endpoint_wg_server_warn_and_port_range():
+    """M-A: an endpoint with a WG server gets a reachability CAUTION (not an 'ignored' scold), and the
+    new listen-port field is range-checked. Edge / client-endpoint configs get no such warning."""
+    from bastion import state
+
+    def _mk(mode, wg_iface="", wg_port=""):
+        cfg = state.load_conf(EXAMPLE)
+        cfg["machine"]["mode"] = mode
+        cfg["interfaces"]["wg_server_iface"] = wg_iface
+        if wg_port:
+            cfg["network"]["wg_server_listen_port"] = wg_port
+        return cfg
+
+    # endpoint + wg server -> a caution warning naming the opened port; NOT an "ignored" warn
+    errs, warns = state.validate_conf(_mk("endpoint", "wg0"))
+    assert errs == []
+    wg_warn = [w for w in warns if "wg_server_iface is set on an endpoint" in w]
+    assert wg_warn and "udp/51820" in wg_warn[0] and "ignored" not in wg_warn[0].lower()
+
+    # honours a custom port in the warning text
+    _, warns = state.validate_conf(_mk("endpoint", "wg0", "51900"))
+    assert any("udp/51900" in w for w in warns)
+
+    # edge with wg server -> no endpoint-WG caution (edge keeps its scoped accept)
+    _, warns = state.validate_conf(_mk("edge", "wg0"))
+    assert not any("wg_server_iface is set on an endpoint" in w for w in warns)
+
+    # client endpoint (no wg server) -> no caution
+    _, warns = state.validate_conf(_mk("endpoint", ""))
+    assert not any("wg_server_iface is set on an endpoint" in w for w in warns)
+
+    # out-of-range listen port -> hard error
+    errs, _ = state.validate_conf(_mk("endpoint", "wg0", "70000"))
+    assert any("wg_server_listen_port" in e for e in errs)

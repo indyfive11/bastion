@@ -68,6 +68,13 @@ table inet bastion {
         ip saddr @trusted_hosts accept
         ip6 saddr @trusted_hosts6 accept
 
+        # Inbound WireGuard server ([interfaces] wg_server_iface, endpoint mode): any-source accept for
+        # the WG listen port so remote peers can complete a handshake — WireGuard's crypto drops any
+        # non-authenticated packet, so an open UDP port is safe. Blank unless a wg_server_iface is set
+        # (a client endpoint stays locked down). Port from [network] wg_server_listen_port (def 51820).
+        # Sits after the blocklist drops above, so a blocklisted source is dropped first. M-A.
+        {{ network.wg_server_listen_accept }}
+
         # Operator service ports ([network] service_ports): any-source accept so a server that runs
         # bastion can serve its apps. Blank by default — a client endpoint stays fully locked down.
         {{ network.service_ports_tcp_accept }}

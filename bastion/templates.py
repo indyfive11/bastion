@@ -97,6 +97,7 @@ def _derived(config: dict) -> dict:
     net["zones_input_rules"] = _render_zones(config)
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
     net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
+    net["wg_server_listen_accept"] = _endpoint_wg_server_accept(config)  # M-A: endpoint any-source WG accept
     net["internal_iface_drop"] = _internal_iface_drop(config)  # M3b: fail-closed input WAN drop
     net["anti_spoof_rules"] = _anti_spoof_rules(config)   # M2b: gated forward-chain anti-spoof teeth
     net.update(_forward_iface_rules(config))     # M13: blank-safe forward/nat overlay-iface rules
@@ -162,6 +163,29 @@ def _nonwan_iface_accepts(config: dict) -> dict:
     return {"zt_accept_tcp": _rule(zt, "tcp", 9993),
             "zt_accept_udp": _rule(zt, "udp", 9993),
             "wg_server_accept": _rule(wg_server, "udp", 51820)}
+
+
+def _endpoint_wg_server_accept(config: dict) -> str:
+    """M-A: the ENDPOINT-only any-source accept for an inbound WireGuard server's listen port, or ''.
+
+    An endpoint that hosts a WireGuard server (a VPS that peers dial into) must reach its listen port
+    from arbitrary internet peers — so, unlike the edge's iface-scoped ``wg_server_accept`` (M3, which
+    protects a router's WAN), this is an ANY-SOURCE ``udp dport <port> accept``. That is safe for a WG
+    listen port: WireGuard's crypto silently drops any packet that isn't a valid handshake/transport
+    from a configured peer, so an open UDP port exposes no attack surface beyond the WG protocol.
+
+    Endpoint-only (the edge WG server keeps its non-WAN-scoped form — this key is empty in edge mode).
+    Renders '' (the whole line vanishes) when no ``wg_server_iface`` is set, so a *client* endpoint
+    stays fully locked down. Port from ``[network] wg_server_listen_port``, defaulting to WireGuard's
+    default 51820 when a server iface is set but no explicit port is given (this also closes L28 for
+    endpoint: a non-default ListenPort is honoured instead of a hardcoded 51820)."""
+    if str((config.get("machine") or {}).get("mode") or "").strip() != "endpoint":
+        return ""
+    wg_server = str((config.get("interfaces") or {}).get("wg_server_iface") or "").strip()
+    if not wg_server:
+        return ""
+    port = str((config.get("network") or {}).get("wg_server_listen_port") or "").strip() or "51820"
+    return f"udp dport {port} accept"
 
 
 def _internal_iface_drop(config: dict) -> str:
