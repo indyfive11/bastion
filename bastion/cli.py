@@ -426,13 +426,43 @@ def cmd_feeds(args: argparse.Namespace) -> int:
     return rc
 
 
+def _render_nft(config: dict, templates_dir: Path, mode: str) -> str:
+    """Render the mode's nft ruleset from a config dict — pure, no writes, no `nft` load (so the
+    preview never violates the reconciler-is-sole-writer Commandment). Returns "" if the template
+    can't be found/rendered (preview degrades to empty rather than crashing the command)."""
+    nft_rel = "nftables-endpoint.nft" if mode == "endpoint" else "nftables-edge.nft"
+    try:
+        for rel, abs_path in iter_templates(templates_dir):
+            if rel.as_posix() == nft_rel:
+                return templates.render_file(abs_path, config)
+    except Exception:  # noqa: BLE001 — a preview must never break the apply
+        return ""
+    return ""
+
+
+def _rule_delta(old_text: str, new_text: str) -> tuple[list[str], list[str]]:
+    """(added, removed) non-blank rule lines between two rendered nft files, as an order-insensitive
+    multiset diff. Blank lines are dropped so the 8-space empty-`[zones]` placeholder never shows as a
+    spurious removal, and reordering never registers as a change — only real +/- rules do."""
+    from collections import Counter
+    def rules(t: str) -> Counter:
+        return Counter(ln.rstrip() for ln in t.splitlines() if ln.strip())
+    oc, nc = rules(old_text), rules(new_text)
+    return sorted((nc - oc).elements()), sorted((oc - nc).elements())
+
+
 def cmd_zones(args: argparse.Namespace) -> int:
-    """`bastion zones list|add <name> <source> <all|ports...>|remove <name>` — manage the dynamic
-    [zones] source->action input-accept primitive. A zone is `name = <source> -> <action>` where
-    source is `any` / an IP-or-CIDR / `iface:NAME` / `iface:NAME+<CIDR>` (pin a network to one NIC)
-    and action is `all` or a port list. Edits the
-    whole [zones] section (not a single registry Setting), so it validates + writes the conf then
-    runs the shared generate->firewall-reload tail (configspec.apply_firewall_change)."""
+    """`bastion zones list|add <name> <source> <all|ports...>|remove <name> [--dry-run] [--yes]` —
+    manage the dynamic [zones] source->action input-accept primitive. A zone is `name = <source> ->
+    <action>` where source is `any` / an IP-or-CIDR / `iface:NAME` / `iface:NAME+<CIDR>` (pin a network
+    to one NIC) and action is `all` or a port list.
+
+    M-E safe-apply envelope: (1) show the exact +/- nft rule delta this change produces; (2) a live
+    clobber gate — if the running kernel already diverges from /etc/nftables.conf (unmanaged/hand
+    rules), the regen+reload would silently flush them, so warn and (non-interactive) refuse unless
+    --yes; (3) --dry-run previews everything and writes/reloads nothing; (4) after a live apply,
+    re-check that the kernel now matches disk. The preview is a pure template render + text diff — it
+    never loads nft; the only live load stays the existing reconciler/reload path."""
     from . import configspec as cfg
     conf_path = cfg.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
     try:
@@ -440,6 +470,8 @@ def cmd_zones(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print(f"no machine.conf at {conf_path} — run `bastion setup` first", file=sys.stderr)
         return 1
+    import copy as _copy
+    old_config = _copy.deepcopy(config)
     zones = config.get("zones") or {}
 
     if args.op == "list":
@@ -474,9 +506,69 @@ def cmd_zones(args: argparse.Namespace) -> int:
         return 1
     for w in warns:
         print(f"  WARNING: {w}")
+
+    dry_run = getattr(args, "dry_run", False)
+    assume_yes = getattr(args, "yes", False)
+    templates_dir = find_templates_dir(getattr(args, "templates", None))
+    mode = config.get("machine", {}).get("mode", "edge")
+
+    # (1) Preview the exact rule delta (pure render + diff — no live touch).
+    added, removed = _rule_delta(_render_nft(old_config, templates_dir, mode),
+                                 _render_nft(config, templates_dir, mode))
+    if added or removed:
+        print("  ruleset delta:")
+        for r in added:
+            print(f"    + {r.strip()}")
+        for r in removed:
+            print(f"    - {r.strip()}")
+    else:
+        print("  ruleset delta: (none — no change to the rendered ruleset)")
+
+    # (2) Clobber gate — is the live kernel already out of sync with /etc/nftables.conf? Reuses the H6
+    #     differential-canonicalization check. None off-live/--root or when undeterminable.
+    ctx = build_context(args)
+    try:
+        stale = _ruleset_stale(ctx)
+    except Exception:  # noqa: BLE001 — triage must never crash the command
+        stale = None
+    clobber = bool(stale and stale[0])
+    if clobber:
+        print(f"  ⚠ live kernel ruleset differs from /etc/nftables.conf ({stale[1]}) — the reload "
+              f"will DISCARD those live-only rules (inspect with `bastion doctor`).", file=sys.stderr)
+
+    if dry_run:
+        print("  --dry-run: machine.conf NOT written, firewall NOT reloaded.")
+        return 0
+
+    # (3) Confirm gate — only a pending clobber blocks; a clean box applies with zero friction.
+    if clobber and not assume_yes:
+        if sys.stdin.isatty():
+            if input("  apply anyway and discard those live-only rules? type 'yes': ").strip() != "yes":
+                print("aborted — nothing changed.")
+                return 1
+        else:
+            print("refusing to clobber live-only rules on a non-interactive run — re-run with --yes "
+                  "to proceed, or reconcile first (`bastion doctor`).", file=sys.stderr)
+            return 1
+
     state.write_conf(config, conf_path)
     print(f"wrote {conf_path}")
-    return cfg.apply_firewall_change(conf_path, getattr(args, "root", None))
+    rc = cfg.apply_firewall_change(conf_path, getattr(args, "root", None))
+    if rc != 0:
+        return rc
+
+    # (4) Post-apply verify (live) — the kernel should now match disk.
+    if ctx.system.is_live:
+        try:
+            post = _ruleset_stale(build_context(args))
+        except Exception:  # noqa: BLE001
+            post = None
+        if post and post[0]:
+            print(f"  ⚠ post-apply: live kernel still differs from /etc/nftables.conf ({post[1]}) — "
+                  f"the reload may not have fully applied; check `bastion doctor`.", file=sys.stderr)
+        elif post is not None:
+            print("  verified: live kernel now matches /etc/nftables.conf.")
+    return rc
 
 
 def cmd_dnsblock(args: argparse.Namespace) -> int:
@@ -1544,6 +1636,10 @@ def build_parser() -> argparse.ArgumentParser:
     zon.add_argument("name", nargs="?", help="zone name (add/remove)")
     zon.add_argument("source", nargs="?", help="any | <IP/CIDR> | iface:NAME | iface:NAME+<CIDR> (add)")
     zon.add_argument("action", nargs="*", help="all | a port list e.g. 8096 53/udp (add)")
+    zon.add_argument("--dry-run", action="store_true",
+                     help="preview the rule delta + clobber check; write and reload nothing")
+    zon.add_argument("--yes", action="store_true",
+                     help="proceed even if the live kernel has unmanaged rules the reload would flush")
     zon.add_argument("--conf"); zon.add_argument("--root")
     zon.set_defaults(func=cmd_zones)
 

@@ -65,6 +65,39 @@ bastion zones remove lan                            # drop a zone
 On an **edge** box the WAN-facing drop fires first, so zones apply to LAN/overlay traffic only. A bad
 zone (malformed source, out-of-range port) is rejected before anything is written.
 
+### Safe apply: preview, clobber gate, and the SSH-exposure warning
+
+`zones add`/`remove` wrap the change in a safety envelope so a single command is enough to apply a
+rule *and* know it did the right thing:
+
+- **Rule-delta preview.** Every `add`/`remove` prints the exact `+`/`-` nftables rules the change
+  produces — a pure template render and diff that never loads `nft`:
+
+  ```sh
+  bastion zones add wg 10.0.0.0/24 22 --dry-run
+  #   ruleset delta:
+  #     + ip saddr 10.0.0.0/24 tcp dport { 22 } accept
+  #   --dry-run: machine.conf NOT written, firewall NOT reloaded.
+  ```
+
+  `--dry-run` runs the preview and the checks below, then writes and reloads **nothing** — the safe
+  way to see what a rule would do before committing to it.
+
+- **Clobber gate.** `bastion generate` rebuilds `/etc/nftables.conf` entirely from `machine.conf`, so
+  a reload replaces the whole ruleset. If the **live kernel has drifted** from the file — a rule added
+  by hand or another tool that `machine.conf` doesn't describe — the reload would silently discard it.
+  Before applying, the command checks for that drift (the same live-vs-disk check behind `bastion
+  doctor`'s "ruleset current" row). On drift it warns and, on a non-interactive run, **refuses unless
+  you pass `--yes`**; a clean, in-sync box applies with no prompt. After a live apply it re-checks that
+  the kernel now matches disk.
+
+- **SSH-exposure warning.** A zone that grants SSH — or `all` ports — to a **public subnet**, `any`, or
+  an internet-wide range is flagged (on `generate` and on `zones add`), because the syntax checks alone
+  never inspect reachability: `zones add x 0.0.0.0/0 -> 22` is a valid rule that opens SSH to the whole
+  internet. A local `iface:` source and a single pinned public `/32` (the jump-host pattern) stay
+  quiet. It is **advisory** — a public-IP VPS deliberately pinning a trusted public admin range is a
+  legitimate config — so confirm it's intended, or pin the source tighter.
+
 ### Pinning a network to one interface (`iface:NAME+<CIDR>`)
 
 `iface:NAME+<CIDR>` renders `iifname "NAME" ip[6] saddr <CIDR>` — the accept fires **only** for that

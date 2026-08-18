@@ -88,10 +88,12 @@ bastion zones add vms iface:virbr0 all            # trust a whole bridge
 bastion zones remove lan
 ```
 
-Each `add`/`remove` regenerates and reloads the firewall. Ports can carry a transport
-(`53/udp`); tcp and udp render as separate lines automatically. On an edge box the WAN drop
-fires first, so zones govern LAN/overlay traffic. Full semantics:
-**[options/zones-and-ownership.md](options/zones-and-ownership.md)**.
+Each `add`/`remove` previews the exact `+`/`-` nftables rule, then regenerates and reloads the
+firewall; add `--dry-run` to see that delta and apply nothing. If the live kernel has drifted from
+`/etc/nftables.conf`, the apply warns before flushing those rules, and a zone that opens SSH to a
+public range is flagged. Ports can carry a transport (`53/udp`); tcp and udp render as separate lines
+automatically. On an edge box the WAN drop fires first, so zones govern LAN/overlay traffic. Full
+semantics: **[options/zones-and-ownership.md](options/zones-and-ownership.md)**.
 
 > For a *risky* zones change (e.g. one that could drop your own access), apply it behind the
 > deadman — see recipe 5.

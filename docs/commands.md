@@ -47,8 +47,8 @@ Anything that loads nft rules, installs units, or installs packages needs **root
 | `bastion firewall status` | Show the live nftables ruleset state. |
 | `bastion firewall reload` | Re-apply the rendered ruleset (`nft -f`). |
 | `bastion zones list` | Show the `[zones]` inbound-access rules (`source -> action`). |
-| `bastion zones add <name> <source> <all\|ports…>` | Add/replace a zone, then generate + reload. `source` = `any` / IP-or-CIDR / `iface:NAME`; ports are space-separated (`8096 53/udp`). |
-| `bastion zones remove <name>` | Delete a zone, then generate + reload. |
+| `bastion zones add <name> <source> <all\|ports…> [--dry-run] [--yes]` | Add/replace a zone: preview the exact `+`/`-` nftables rule, then generate + reload. `source` = `any` / IP-or-CIDR / `iface:NAME`; ports are space-separated (`8096 53/udp`). `--dry-run` previews only (writes/reloads nothing). If the live kernel has drifted from `/etc/nftables.conf`, the apply warns and refuses non-interactively unless `--yes`. Warns if the source exposes SSH — or every port — to a public/internet-wide range. |
+| `bastion zones remove <name> [--dry-run] [--yes]` | Delete a zone: preview the removed rule, then generate + reload. Same `--dry-run`/`--yes`/clobber-gate behavior as `add`. |
 | `bastion switch [--minutes N]` | **Deadman cutover.** Print the manual rollback one-liner, snapshot, apply (generate + reload), then arm an auto-revert timer (default 10 min) that runs `net-rollback` unless `bastion confirm` cancels it. `--dry-run` previews only. Live-only; needs root. |
 
 See **[options/zones-and-ownership.md](options/zones-and-ownership.md)** for zones, ownership mode

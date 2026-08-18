@@ -329,8 +329,15 @@ bastion zones add lan 192.168.1.0/24 8096 8989          # LAN reaches media port
 bastion zones add wg  10.0.0.0/24 22                    # a WireGuard subnet reaches SSH
 bastion zones add vms iface:virbr0 all                  # trust the libvirt bridge entirely
 bastion zones add media "iface:eth0+192.168.1.0/24" 8096  # a port for the LAN — but only over eth0
+bastion zones add wg 10.0.0.0/24 22 --dry-run          # preview the exact rule delta, apply nothing
 bastion zones remove lan
 ```
+
+Every `zones add`/`remove` previews the exact `+`/`-` nftables rule it will produce before applying.
+`--dry-run` shows that delta (and a warning if the source exposes SSH — or every port — to a public
+or internet-wide range) and writes nothing. If the **live kernel has drifted** from
+`/etc/nftables.conf` (unmanaged rules a regenerate would flush), the apply warns and, on a
+non-interactive run, refuses unless you pass `--yes`.
 
 **Ownership mode** (`[machine] firewall_scope`) decides how much of the kernel ruleset bastion
 claims. The default `exclusive` owns the whole ruleset (`flush ruleset`); **`cooperative`** manages

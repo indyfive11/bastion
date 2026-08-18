@@ -186,6 +186,67 @@ def test_zones_remove_unknown_no_change(staged, capsys):
     assert "no change" in capsys.readouterr().out
 
 
+# --------------------------------------------------------------------------- M-E safe-apply envelope
+def test_zones_add_shows_rule_delta(staged, capsys):
+    assert cli.main(["zones", "add", "mon", "192.168.9.9", "9090", "--root", str(staged)]) == 0
+    out = capsys.readouterr().out
+    assert "ruleset delta:" in out
+    assert "+ ip saddr 192.168.9.9 tcp dport { 9090 } accept" in out
+
+
+def test_zones_dry_run_writes_nothing(staged, capsys):
+    assert cli.main(["zones", "add", "mon", "192.168.9.9", "9090", "--dry-run", "--root", str(staged)]) == 0
+    out = capsys.readouterr().out
+    assert "+ ip saddr 192.168.9.9 tcp dport { 9090 } accept" in out
+    assert "NOT written" in out and "NOT reloaded" in out
+    assert "mon" not in _conf_of(staged).get("zones", {})          # nothing persisted
+
+
+def test_zones_remove_delta_not_a_clobber(staged, capsys):
+    """A legitimate remove shows the removed rule in the delta but must NOT trip the clobber gate
+    (which is about live-kernel drift, not operator-intended removals)."""
+    assert cli.main(["zones", "add", "lan", "192.168.1.0/24", "8096", "--root", str(staged)]) == 0
+    capsys.readouterr()
+    assert cli.main(["zones", "remove", "lan", "--root", str(staged)]) == 0
+    out = capsys.readouterr().out
+    assert "- ip saddr 192.168.1.0/24 tcp dport { 8096 } accept" in out
+    assert "DISCARD those live-only rules" not in out              # no clobber warning on a normal remove
+
+
+def test_zones_clobber_gate_refuses_noninteractive(staged, monkeypatch, capsys):
+    """When the live kernel diverges (H6 _ruleset_stale True), a non-interactive add refuses and
+    writes nothing unless --yes is given."""
+    monkeypatch.setattr(cli, "_ruleset_stale", lambda ctx: (True, "inet bastion"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    assert cli.main(["zones", "add", "mon", "192.168.9.9", "9090", "--root", str(staged)]) == 1
+    assert "mon" not in _conf_of(staged).get("zones", {})          # refused → nothing written
+    assert "refusing to clobber" in capsys.readouterr().err
+    # --yes overrides the gate and the change lands.
+    assert cli.main(["zones", "add", "mon", "192.168.9.9", "9090", "--yes", "--root", str(staged)]) == 0
+    assert _conf_of(staged)["zones"]["mon"] == "192.168.9.9 -> 9090"
+
+
+def _warns(zones, ssh="22", mode="endpoint"):
+    cfg = {"machine": {"mode": mode}, "ports": {"ssh": ssh}, "zones": zones}
+    _errs, warns = state.validate_conf(cfg)
+    return [w for w in warns if "exposes" in w]
+
+
+def test_zones_public_ssh_exposure_warning():
+    # WARN: default route / any / public subnet granting SSH; ALL-ports variant.
+    assert any("ENTIRE internet" in w and "SSH (tcp/22)" in w for w in _warns({"z": "0.0.0.0/0 -> 22"}))
+    assert any("ENTIRE internet" in w for w in _warns({"z": "any -> 22"}))
+    assert any("public subnet (8.8.8.0/24)" in w for w in _warns({"z": "8.8.8.0/24 -> 22"}))
+    assert any("ALL listening services" in w for w in _warns({"z": "0.0.0.0/0 -> all"}))
+    assert any("SSH (tcp/1111)" in w for w in _warns({"z": "0.0.0.0/0 -> 1111"}, ssh="1111"))
+    # NO WARN: local iface, pinned public /32 (jump host), private subnet, udp-only, non-ssh port.
+    assert not _warns({"z": "iface:lan -> 22"})
+    assert not _warns({"z": "1.1.1.1/32 -> 22"})
+    assert not _warns({"z": "192.168.1.0/24 -> 22"})
+    assert not _warns({"z": "0.0.0.0/0 -> 22/udp"})               # ssh is tcp; udp/22 does not grant it
+    assert not _warns({"z": "0.0.0.0/0 -> 8096"})                 # public, but not the ssh port
+
+
 def test_layer_disable_delists(staged):
     assert cli.main(["layer", "disable", "l4", "--root", str(staged)]) == 0
     assert "l4" not in _conf_of(staged)["machine"]["layers"].split(",")

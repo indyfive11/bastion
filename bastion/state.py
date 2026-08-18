@@ -305,6 +305,42 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
                 elif psep and proto.lower() not in ("tcp", "udp"):
                     errors.append(f"[zones] {name} action entry {tok!r} — proto must be tcp or udp")
 
+        # M-E ROOT 2: warn when a zone exposes SSH (or every port) to a PUBLIC or any-source. The
+        # syntactic checks above never inspect reachability, so `zones add x 0.0.0.0/0 -> 22` (SSH open
+        # to the internet) or removing your only admin zone lands silently. Advisory, not an error — a
+        # public-IP VPS pinning a trusted public admin IP is legitimate (hard-refuse is deferred, M-D).
+        # Reuse the source parse: an iface-only source is a local NIC (skip); a single pinned public
+        # /32 (the jump-host pattern) stays quiet; only a public *subnet* (>1 host) or any/default-route
+        # warns — that is the real "who can reach SSH" breadth axis.
+        ssh_port = ssh or "22"
+        eff_cidr, world_wide = None, (src == "any")
+        if src.startswith("iface:"):
+            _, plus, cpart = src[len("iface:"):].partition("+")
+            if plus and cpart.strip():
+                eff_cidr = cpart.strip()
+        elif src != "any":
+            eff_cidr = src
+        is_public_subnet = False
+        if eff_cidr:
+            try:
+                netw = ipaddress.ip_network(eff_cidr, strict=False)
+                if netw.prefixlen == 0:
+                    world_wide = True
+                elif not netw.is_private and netw.num_addresses > 1:
+                    is_public_subnet = True
+            except ValueError:
+                pass
+        if world_wide or is_public_subnet:
+            grants_all = action == "all"
+            grants_ssh = grants_all or any(
+                tok.partition("/")[0] == ssh_port and tok.partition("/")[2].lower() in ("", "tcp")
+                for tok in action.replace(",", " ").split())
+            if grants_ssh:
+                who = "the ENTIRE internet" if world_wide else f"a public subnet ({eff_cidr})"
+                what = "ALL listening services" if grants_all else f"SSH (tcp/{ssh_port})"
+                warnings.append(f"[zones] {name} exposes {what} to {who} — confirm this is intended; "
+                                f"pin the source to a trusted host/subnet if not")
+
     for key in ("lan", "wan", "zt_iface", "wg_vps_iface", "wg_server_iface"):
         val = _get("interfaces", key)
         if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):
