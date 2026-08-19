@@ -20,9 +20,61 @@ from pathlib import Path
 # section.key — both are identifier-like; whitespace inside the braces is tolerated.
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\}\}")
 
+# systemd dependency directives whose values are unit names. An EMPTY template instance
+# ("foo@.service") in one of these resolves to the REFERENCING unit's own name, so the
+# ordering/dependency silently targets a real-but-meaningless unit and orders against nothing
+# (the L33 defect class). :func:`empty_instance_deps` scans rendered unit text for it so a
+# generate-time guard can go RED, instead of the silent path that shipped it.
+_UNIT_DEP_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:After|Before|Wants|Requires|Requisite|BindsTo|PartOf|Conflicts|Upholds)\s*=(.*)$",
+    re.MULTILINE,
+)
+# A token with an EMPTY instance: some non-space name, then "@" IMMEDIATELY followed by ".<suffix>".
+# The "." must come right after "@", so a NON-empty instance ("foo@bar.service") never matches.
+_EMPTY_INSTANCE_TOKEN_RE = re.compile(
+    r"\S*@\.(?:service|socket|timer|target|mount|path|slice|device|swap|automount|scope)\b"
+)
+
 
 class UnresolvedPlaceholderError(Exception):
     """Raised when a template references a placeholder absent from the config."""
+
+
+def empty_instance_deps(rendered_unit_text: str) -> list[str]:
+    """Return dependency tokens with an EMPTY systemd template instance (``foo@.service``).
+
+    Scans only the values of unit DEPENDENCY directives (``After=``/``Wants=``/``Requires=``/…),
+    across the WHOLE space-separated value (the offender may not be the first token — e.g.
+    edge-watchdog's ``After=network.target nftables.service wg-quick@.service``), so a harmless
+    ``@.`` elsewhere (an ``ExecStart=`` argument, a comment, or a template unit's own *file name*)
+    is never flagged. systemd resolves such an instance-less dependency to the referencing unit's
+    own name, silently ordering against nothing (L33). Empty list ⇒ clean.
+    """
+    offenders: list[str] = []
+    for m in _UNIT_DEP_DIRECTIVE_RE.finditer(rendered_unit_text):
+        offenders.extend(t.group(0) for t in _EMPTY_INSTANCE_TOKEN_RE.finditer(m.group(1)))
+    return offenders
+
+
+def _watchdog_wg_after(config: dict) -> str:
+    """The wg-quick ordering tokens for edge-watchdog's ``After=`` line (L33).
+
+    Emits ``" wg-quick@<iface>.service"`` (LEADING space) for each configured WireGuard interface
+    the watchdog should order after — BOTH the inbound server iface (``wg_server_iface``) and the
+    upstream relay iface (``wg_vps_iface``), deduped — so the unit orders after whichever WG
+    interfaces actually exist. A box may host a WG *server* without an upstream relay (a 1.5.16
+    endpoint), or a relay without a server, so both roles are covered. Returns ``""`` when neither
+    is set, so the ``After=`` line simply ends after ``nftables.service`` with no trailing token —
+    and NEVER renders the empty-instance ``wg-quick@.service`` that the old hardcoded
+    ``wg-quick@{{ interfaces.wg_vps_iface }}.service`` produced when ``wg_vps_iface`` was blank.
+    """
+    ifaces = config.get("interfaces") or {}
+    names: list[str] = []
+    for key in ("wg_server_iface", "wg_vps_iface"):
+        name = str(ifaces.get(key) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return "".join(f" wg-quick@{name}.service" for name in names)
 
 
 def find_placeholders(text: str) -> set[tuple[str, str]]:
@@ -98,6 +150,7 @@ def _derived(config: dict) -> dict:
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
     net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
     net["wg_server_listen_accept"] = _endpoint_wg_server_accept(config)  # M-A: endpoint any-source WG accept
+    net["watchdog_wg_ordering"] = _watchdog_wg_after(config)  # L33: blank-safe wg-quick After= tokens
     net["internal_iface_drop"] = _internal_iface_drop(config)  # M3b: fail-closed input WAN drop
     net["anti_spoof_rules"] = _anti_spoof_rules(config)   # M2b: gated forward-chain anti-spoof teeth
     net.update(_forward_iface_rules(config))     # M13: blank-safe forward/nat overlay-iface rules

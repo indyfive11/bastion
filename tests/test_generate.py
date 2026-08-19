@@ -1,11 +1,110 @@
 """Integration tests for `bastion generate`, including the Phase 2 gate."""
+import shutil
 from pathlib import Path
 
-from bastion import cli
+from bastion import cli, state, templates
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLE = REPO / "bastion" / "machine.conf.example"
 TEMPLATES = REPO / "bastion" / "templates"
+WATCHDOG = TEMPLATES / "systemd" / "edge-watchdog.service"
+
+
+# --- L33: edge-watchdog After= wg-quick ordering (blank-safe, both iface roles) ---
+
+def test_watchdog_wg_after_matrix():
+    """_watchdog_wg_after covers BOTH iface roles, dedupes, and vanishes when neither is set."""
+    from bastion.templates import _watchdog_wg_after
+    # both blank -> empty string (no trailing token, no empty instance)
+    assert _watchdog_wg_after({"interfaces": {"wg_server_iface": "", "wg_vps_iface": ""}}) == ""
+    assert _watchdog_wg_after({"interfaces": {}}) == ""
+    # server only (the 1.5.16 endpoint WG-server case) -> orders after wg0
+    assert _watchdog_wg_after(
+        {"interfaces": {"wg_server_iface": "wg0", "wg_vps_iface": ""}}) == " wg-quick@wg0.service"
+    # relay only -> orders after the relay
+    assert _watchdog_wg_after(
+        {"interfaces": {"wg_server_iface": "", "wg_vps_iface": "wg_vps"}}) == " wg-quick@wg_vps.service"
+    # both set -> both tokens, server first (deterministic order)
+    assert _watchdog_wg_after({"interfaces": {"wg_server_iface": "wg0", "wg_vps_iface": "wg_vps"}}) \
+        == " wg-quick@wg0.service wg-quick@wg_vps.service"
+    # same iface for both roles -> a SINGLE token (dedup, no wg-quick@wg0.service twice)
+    assert _watchdog_wg_after(
+        {"interfaces": {"wg_server_iface": "wg0", "wg_vps_iface": "wg0"}}) == " wg-quick@wg0.service"
+
+
+def test_watchdog_render_never_empty_instance():
+    """RED-PROVER: a blank-iface box must NOT render `wg-quick@.service`.
+
+    This FAILS against the old hardcoded `wg-quick@{{ interfaces.wg_vps_iface }}.service` template
+    (blank wg_vps_iface -> empty instance). generate-check on the example can never reach this — the
+    example sets wg_vps_iface — so this blank-iface fixture is the actual L33 regression guard.
+    """
+    cfg = {"machine": {"mode": "endpoint"}, "interfaces": {"wg_server_iface": "wg0", "wg_vps_iface": ""}}
+    out = templates.render_file(WATCHDOG, cfg)
+    after = next(ln for ln in out.splitlines() if ln.startswith("After="))
+    assert "wg-quick@.service" not in after           # the L33 defect
+    assert after == "After=network.target nftables.service wg-quick@wg0.service"  # ordered after the real iface
+    assert templates.find_placeholders(out) == set()  # nothing left unresolved
+    # both blank -> the clause vanishes cleanly, no trailing space, no wg-quick token
+    out2 = templates.render_file(WATCHDOG, {"machine": {"mode": "endpoint"}, "interfaces": {}})
+    after2 = next(ln for ln in out2.splitlines() if ln.startswith("After="))
+    assert after2 == "After=network.target nftables.service"
+
+
+# --- L33: the generalizable empty-@-instance guard ---
+
+def test_empty_instance_deps_detects_and_ignores():
+    """empty_instance_deps flags only empty-instance tokens in DEPENDENCY directive values."""
+    ei = templates.empty_instance_deps
+    # offender last among multiple tokens (edge-watchdog's real shape) -> caught
+    assert ei("After=network.target nftables.service wg-quick@.service") == ["wg-quick@.service"]
+    assert ei("Wants=foo@.service\nRequires=bar@.socket") == ["foo@.service", "bar@.socket"]
+    # NON-empty instance must NOT match (the '.' is not immediately after '@')
+    assert ei("After=wg-quick@wg0.service") == []
+    assert ei("Requires=getty@tty1.service foo@bar.service") == []
+    # a plain (non-template) unit is fine
+    assert ei("After=network.target nftables.service") == []
+    # '@.' outside a dependency directive is harmless and ignored (ExecStart arg, comment, filename)
+    assert ei("ExecStart=/usr/bin/x --unit foo@.service") == []
+    assert ei("# see notify-failure@.service") == []
+    assert ei("Description=notify-failure@.service shim") == []
+
+
+def test_no_shipped_unit_has_empty_instance_dep():
+    """Bound the guard's blast radius: EVERY shipped systemd unit, rendered against the example,
+    has zero empty-instance dependencies (so the guard never false-fails a real generate)."""
+    cfg = state.load_conf(EXAMPLE)
+    units = sorted((TEMPLATES / "systemd").glob("*"))
+    assert units, "no systemd unit templates found"
+    for unit in units:
+        offenders = templates.empty_instance_deps(templates.render_file(unit, cfg))
+        assert offenders == [], f"{unit.name} renders an empty-instance dep: {offenders}"
+
+
+def test_generate_guard_rejects_empty_instance_unit(tmp_path):
+    """END-TO-END RED/GREEN: `generate --check` fails (rc 1) when a rendered unit would carry an
+    empty template instance, and passes once the value is present."""
+    # A blank-wg_vps_iface conf (the real-world trigger), derived from the example.
+    conf = state.load_conf(EXAMPLE)
+    conf.setdefault("interfaces", {})["wg_vps_iface"] = ""
+    conf["interfaces"]["wg_server_iface"] = ""
+    conf_path = tmp_path / "machine.conf"
+    state.write_conf(conf, conf_path)
+
+    # A templates tree whose edge-watchdog reintroduces the OLD hardcoded empty-instance line.
+    broken = tmp_path / "templates"
+    shutil.copytree(TEMPLATES, broken)
+    wd = broken / "systemd" / "edge-watchdog.service"
+    wd.write_text(wd.read_text().replace(
+        "After=network.target nftables.service{{ network.watchdog_wg_ordering }}",
+        "After=network.target nftables.service wg-quick@{{ interfaces.wg_vps_iface }}.service"))
+
+    rc = cli.main(["generate", "--check", "--conf", str(conf_path), "--templates", str(broken)])
+    assert rc == 1                                       # the guard goes RED on the broken unit
+
+    # GREEN: the shipped (fixed) template, same blank conf -> guard passes.
+    rc_ok = cli.main(["generate", "--check", "--conf", str(conf_path), "--templates", str(TEMPLATES)])
+    assert rc_ok == 0
 
 
 def test_generate_check_passes_against_example():

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`edge-watchdog.service` no longer orders against an empty WireGuard unit (L33).** The unit's
+  `After=` hardcoded `wg-quick@{{ interfaces.wg_vps_iface }}.service`, so on the common box with no
+  upstream relay it rendered `wg-quick@.service` — an empty systemd template instance that resolves
+  to the unit's own name and silently orders against nothing; it also never ordered against an
+  endpoint's WireGuard *server* interface. The `After=` clause is now derived, blank-safe, and covers
+  both the server and relay interfaces (deduped, vanishing when neither is set). A new generate-time
+  guard rejects any rendered systemd unit whose dependency carries an empty template instance, so the
+  whole class fails loudly at `generate` instead of shipping silently.
+
 ### Added
 
 - **`man bastion` page, generated from the CLI.** A `tools/gen_manpage.py` generator walks the live

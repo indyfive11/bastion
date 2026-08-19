@@ -36,9 +36,11 @@ def test_l6_install_writes_full_monitoring_surface(tmp_path):
     assert (tmp_path / "etc/systemd/system/edge-watchdog.service").is_file()
     assert (tmp_path / "etc/systemd/system/notify-failure@.service").is_file()
 
-    # edge-watchdog.service had a {{ interfaces.wg_vps_iface }} placeholder — fully resolved.
+    # edge-watchdog.service orders after WireGuard via a derived, blank-safe clause (L33) — fully
+    # resolved, and never the empty-instance `wg-quick@.service` (which orders against nothing).
     wd = (tmp_path / "etc/systemd/system/edge-watchdog.service").read_text()
     assert "{{" not in wd
+    assert "wg-quick@.service" not in wd
 
     st = layers.get("l6").status(ctx)
     assert st.installed is True

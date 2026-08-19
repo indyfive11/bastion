@@ -1,7 +1,7 @@
 [Unit]
 Description=edge-watchdog — standing egress/relay self-heal
 Documentation=man:nft(8)
-After=network.target nftables.service wg-quick@{{ interfaces.wg_vps_iface }}.service
+After=network.target nftables.service{{ network.watchdog_wg_ordering }}
 Wants=network.target
 
 [Service]

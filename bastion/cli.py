@@ -173,6 +173,26 @@ def cmd_generate(args: argparse.Namespace) -> int:
             return 1
         break
 
+    # L33: reject a rendered systemd unit whose dependency carries an EMPTY template instance
+    # ("wg-quick@.service") — systemd resolves it to the referencing unit's own name and silently
+    # orders against nothing. A provable-to-go-red guard over rendered output, so this class can't
+    # ship silently again (generate-check on the example never exercises it — the example sets the
+    # iface, so the empty instance only appears on a real blank-iface box).
+    unit_problems: dict[str, list[str]] = {}
+    for rel, abs_path in iter_templates(templates_dir):
+        rp = rel.as_posix()
+        if rp not in active_rels or not rp.startswith("systemd/"):
+            continue
+        offenders = templates.empty_instance_deps(templates.render_file(abs_path, config))
+        if offenders:
+            unit_problems[rp] = offenders
+    if unit_problems:
+        print("generate: rendered systemd unit(s) have an empty template instance in a dependency "
+              "(would silently order against nothing):", file=sys.stderr)
+        for name, offenders in sorted(unit_problems.items()):
+            print(f"  {name}: {', '.join(offenders)}", file=sys.stderr)
+        return 1
+
     if args.check:
         layers_desc = config.get("machine", {}).get("layers", "(all)")
         print(f"generate --check: OK — all placeholders in {n_active} active-layer templates "
