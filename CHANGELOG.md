@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.5.19] - 2026-08-19
+
+Documentation and a shipped-template correctness fix. Adds a concise getting-started guide and a
+`man bastion` page generated straight from the CLI parser (so it can't drift), and fixes a systemd
+ordering defect that shipped on the majority of deployments: `edge-watchdog.service` ordered against
+an empty WireGuard template instance (`wg-quick@.service`) on any box without an upstream relay — a
+no-op that resolves to the unit's own name. A new generate-time guard makes that whole class fail
+loudly instead of silently.
 
 ### Fixed
 
