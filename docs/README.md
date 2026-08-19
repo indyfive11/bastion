@@ -5,6 +5,8 @@ Reference and how-to docs for [`bastionfw`](../README.md). Start with the projec
 
 ## Start here
 
+- **[Getting started](getting-started.md)** — the 5-minute path from a fresh box to a
+  working firewall: install, run the wizard, check health, open a port, cut over safely.
 - **[Use cases & recipes](use-cases.md)** — end-to-end walkthroughs: stand up an edge
   router, harden a laptop endpoint, expose a service to just the LAN, coexist with
   libvirt/Docker, cut over safely, recover from a lockout.

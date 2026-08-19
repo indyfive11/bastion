@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`man bastion` page, generated from the CLI.** A `tools/gen_manpage.py` generator walks the live
+  argparse parser (every subcommand, flag, and nested `config` verb) and renders `man/bastion.1`, so
+  the man page can never drift from what the CLI actually accepts. `make man` regenerates it and
+  `make man-check` fails the build if the committed page is stale. The AUR package installs it.
+- **`docs/getting-started.md` — a concise 5-minute quickstart.** The fast path from a fresh box to a
+  working firewall (fit → install → wizard → health → open a port → safe cutover), linking the deep
+  docs at each step, so a newcomer isn't dropped straight into the full README. Linked from the README
+  and the docs index.
+
 ## [1.5.18] - 2026-08-18
 
 Makes `bastion zones add`/`remove` a **proven one-command firewall change** instead of an edit that

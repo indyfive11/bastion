@@ -1,0 +1,524 @@
+.TH BASTION 1 "" "bastion 1.5.18" "Bastion Manual"
+.SH NAME
+bastion \- modular, layered Linux firewall framework
+.SH SYNOPSIS
+.B bastion
+[\fB\-\-version\fR] \fICOMMAND\fR [\fIarguments\fR]
+.SH DESCRIPTION
+Bastion is a modular, layered Linux firewall framework built on nftables. It provides an operator CLI, an optional AI analysis layer, and a guided setup wizard, and secures the full spectrum of hosts \(em a defense\-in\-depth endpoint, a routing edge firewall, or a server that already runs another firewall manager (libvirt, Docker).
+.PP
+Configuration lives in \fI/etc/bastion/machine.conf\fR; \fBbastion generate\fR renders it into the live config files. See \fBbastion \fICOMMAND\fB \-\-help\fR for the exact flags of any command.
+.SH COMMANDS
+.SS setup
+interactive setup wizard (detect, configure, install)
+.PP
+\fBbastion setup\fR [options]
+.TP
+\fB\-\-dry\-run\fR
+walk the wizard, show what would be written; write nothing, no API calls
+.TP
+\fB\-\-profile PROFILE\fR
+skip profile selection (full\-edge|basic\-edge|full\-endpoint|minimal\-endpoint|custom)
+.TP
+\fB\-\-no\-ai\fR
+exclude the L3 AI layer from the install (no API key prompt, no edge\-ai units) \(em the rest of the profile is unaffected
+.TP
+\fB\-\-stage\-only\fR
+write + generate the config but do NOT load the firewall or install layers; review it, then apply behind `bastion switch`'s deadman
+.TP
+\fB\-\-bootstrap\fR
+soft recovery: re\-detect from scratch, do NOT trust the existing machine.conf for detected values, and show where it disagrees with the live system (e.g. a wrong SSH port that locked you out)
+.TP
+\fB\-\-set KEY=VALUE\fR
+set a config answer non\-interactively (overrides detection + prompts); repeatable, e.g. \-\-set trusted_hosts=10.0.0.2 \-\-set ssh_port=1111
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of / (staged preview/testing)
+.SS generate
+resolve templates \-> config files
+.PP
+\fBbastion generate\fR [options]
+.TP
+\fB\-\-check\fR
+validate all placeholders resolve; write nothing, make no network calls
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf (default: standard search order)
+.TP
+\fB\-\-templates TEMPLATES\fR
+path to templates/ dir (default: cwd or package dir)
+.TP
+\fB\-\-out OUT\fR
+write under this base dir instead of / (for testing/dry\-run)
+.SS status
+show layer install/active state
+.PP
+\fBbastion status\fR [options]
+.TP
+\fB\-\-health\fR
+also run each layer's health checks
+.TP
+\fB\-\-json\fR
+emit the machine\-readable status projection
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+inspect under this base dir instead of / (chroot/bootstrap/testing)
+.SS tui
+read\-only terminal dashboard (layers, sets, AI, audit)
+.PP
+\fBbastion tui\fR [options]
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+inspect under this base dir instead of / (testing)
+.SS state
+emit the canonical world\-state JSON document (the TUI/GUI contract)
+.PP
+\fBbastion state\fR [options]
+.TP
+\fB\-\-json\fR
+(default) machine\-readable JSON document
+.TP
+\fB\-\-compact\fR
+single\-line JSON instead of indented
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-templates TEMPLATES\fR
+templates dir (for the drift section)
+.TP
+\fB\-\-root ROOT\fR
+inspect under this base dir instead of / (testing)
+.SS config
+view/change machine.conf settings (the control room)
+.PP
+\fBbastion config\fR {list | get | describe | set} [options]
+.TP
+\fBbastion config list\fR
+list settings + current values (Everyday by default)
+.RS
+.TP
+\fB\-\-advanced\fR
+also show Advanced (gated) settings
+.TP
+\fB\-\-group GROUP\fR
+only this section (machine/network/ai/recovery/monitoring/...)
+.TP
+\fB\-\-json\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.RE
+.TP
+\fBbastion config get\fR
+print one setting's current value
+.RS
+.TP
+\fBkey\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.RE
+.TP
+\fBbastion config describe\fR
+explain a setting + what changing it does
+.RS
+.TP
+\fBkey\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.RE
+.TP
+\fBbastion config set\fR
+change a setting (validate \-> write \-> scoped reload)
+.RS
+.TP
+\fBkey\fR
+\&
+.TP
+\fBvalue\fR
+\&
+.TP
+\fB\-\-advanced\fR
+acknowledge an ADVANCED (dangerous) change
+.TP
+\fB\-\-yes\fR
+skip the interactive confirm
+.TP
+\fB\-\-dry\-run\fR
+preview only; write nothing
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.RE
+.SS allow
+add an IP/CIDR to trusted_hosts (full inbound access)
+.PP
+\fBbastion allow\fR \fIvalue\fR [options]
+.TP
+\fBvalue\fR
+IP or CIDR (omit with \-\-list to show current)
+.TP
+\fB\-\-list\fR
+list current trusted hosts
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS deny
+remove an IP/CIDR from trusted_hosts
+.PP
+\fBbastion deny\fR \fIvalue\fR [options]
+.TP
+\fBvalue\fR
+\&
+.TP
+\fB\-\-list\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS dns
+DNS settings (upstream resolver)
+.PP
+\fBbastion dns\fR \fI{upstream}\fR \fIvalue\fR [options]
+.TP
+\fB{upstream}\fR
+the DNS setting to view/change
+.TP
+\fBvalue\fR
+new value (omit to show current)
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS feeds
+manage IP\-blocklist feed sources (edge\-feed\-fetch)
+.PP
+\fBbastion feeds\fR \fI{list | add | remove}\fR \fIurl\fR [options]
+.TP
+\fB{list | add | remove}\fR
+\&
+.TP
+\fBurl\fR
+feed URL for add/remove
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS dnsblock
+manage DNS blocklist feed sources
+.PP
+\fBbastion dnsblock\fR \fI{list | add | remove}\fR \fIurl\fR [options]
+.TP
+\fB{list | add | remove}\fR
+\&
+.TP
+\fBurl\fR
+feed URL for add/remove
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS zones
+manage [zones] source\->action input\-accept rules
+.PP
+\fBbastion zones\fR \fI{list | add | remove}\fR \fIname\fR \fIsource\fR \fIaction\fR [options]
+.TP
+\fB{list | add | remove}\fR
+\&
+.TP
+\fBname\fR
+zone name (add/remove)
+.TP
+\fBsource\fR
+any | <IP/CIDR> | iface:NAME | iface:NAME+<CIDR> (add)
+.TP
+\fBaction\fR
+all | a port list e.g. 8096 53/udp (add)
+.TP
+\fB\-\-dry\-run\fR
+preview the rule delta + clobber check; write and reload nothing
+.TP
+\fB\-\-yes\fR
+proceed even if the live kernel has unmanaged rules the reload would flush
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS layer
+manage an individual layer
+.PP
+\fBbastion layer\fR \fI{status | install | uninstall | enable | disable}\fR \fIname\fR [options]
+.TP
+\fB{status | install | uninstall | enable | disable}\fR
+status/install/uninstall a layer; enable/disable also add/remove it from [machine] layers in machine.conf
+.TP
+\fBname\fR
+layer id, e.g. l0
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of / (staged install/testing)
+.TP
+\fB\-\-templates TEMPLATES\fR
+path to templates/ dir
+.TP
+\fB\-\-scripts SCRIPTS\fR
+path to scripts/ dir
+.TP
+\fB\-\-force\fR
+bypass the prerequisite/dependency check (e.g. force\-uninstall l0 while dependent layers remain)
+.SS firewall
+manage the live nftables ruleset
+.PP
+\fBbastion firewall\fR \fI{reload | status}\fR [options]
+.TP
+\fB{reload | status}\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS ai
+control the L3 AI analysis layer (operator kill switch)
+.PP
+\fBbastion ai\fR \fI{enable | disable | panic | status | proposals | accept | reject | rollback | set\-interval | set\-depth}\fR \fIid\fR [options]
+.TP
+\fB{enable | disable | panic | status | proposals | accept | reject | rollback | set\-interval | set\-depth}\fR
+enable/disable arm the AI timer; panic flushes ai_* now; status shows state; proposals lists the review queue; accept/reject <id> resolve a proposal; rollback <id> undoes one audit record; set\-interval <dur> / set\-depth <level> change config
+.TP
+\fBid\fR
+id for accept/reject/rollback, or value for set\-interval/set\-depth
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS snapshot
+capture known\-good network/firewall state (net\-snapshot)
+.PP
+\fBbastion snapshot\fR [options]
+.TP
+\fB\-\-name NAME\fR
+also save this capture as a named snapshot
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS snapshots
+list the auto snapshot + any named snapshots
+.PP
+\fBbastion snapshots\fR [options]
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS rollback
+restore a snapshot (net\-rollback); pass a name for a named one
+.PP
+\fBbastion rollback\fR \fIname\fR [options]
+.TP
+\fBname\fR
+named snapshot to restore (omit = the auto slot)
+.TP
+\fB\-\-reason REASON\fR
+reason string recorded in the log (default: manual)
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS teardown
+full uninstall: remove all layers + bastion config (the clean counterpart to `setup`)
+.PP
+\fBbastion teardown\fR [options]
+.TP
+\fB\-\-yes\fR
+skip the confirmation prompt
+.TP
+\fB\-\-keep\-config\fR
+keep /etc/bastion + /etc/edge\-* config dirs (remove only layers/units)
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS confirm
+confirm egress is stable, then disarm the watchdog (net\-confirm)
+.PP
+\fBbastion confirm\fR [options]
+.TP
+\fB\-\-force\fR
+disarm the deadman even if the egress probe fails \(em you assert you are present and want to KEEP this config (egress is NOT verified)
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS switch
+cut over to the bastion firewall behind an auto\-reverting deadman
+.PP
+\fBbastion switch\fR [options]
+.TP
+\fB\-\-minutes MINUTES\fR
+auto\-revert after this many minutes unless `bastion confirm` (default: 10)
+.TP
+\fB\-\-dry\-run\fR
+preview only; apply nothing, arm no timer
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS recovery
+operate the bastion\-recovery rescue service
+.PP
+\fBbastion recovery\fR \fI{start | stop | extend | status}\fR [options]
+.TP
+\fB{start | stop | extend | status}\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS update
+refresh threat feeds / DNS blocklist now (run the timer's oneshot)
+.PP
+\fBbastion update\fR \fI{feeds | dnsblock}\fR [options]
+.TP
+\fB{feeds | dnsblock}\fR
+\&
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SS migrate
+carry an older machine.conf forward to the current schema
+.PP
+\fBbastion migrate\fR [options]
+.TP
+\fB\-\-check\fR
+report if a migration is due; don't write
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of / (testing)
+.SS verify
+check live configs match what `bastion generate` would produce
+.PP
+\fBbastion verify\fR [options]
+.TP
+\fB\-\-json\fR
+emit the machine\-readable drift report
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-templates TEMPLATES\fR
+path to templates/ dir
+.TP
+\fB\-\-root ROOT\fR
+inspect under this base dir instead of /
+.SS doctor
+triage a sick box (binaries, drift, persistence, recovery, AI)
+.PP
+\fBbastion doctor\fR [options]
+.TP
+\fB\-\-json\fR
+emit the machine\-readable triage report
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-templates TEMPLATES\fR
+path to templates/ dir
+.TP
+\fB\-\-root ROOT\fR
+inspect under this base dir instead of /
+.SS check
+run connectivity/flow checks (wraps L6 flowcheck/lan\-verify)
+.PP
+\fBbastion check\fR [options]
+.TP
+\fB\-\-full\fR
+also run the LAN forward\-path check (lan\-verify)
+.TP
+\fB\-\-lan\fR
+run only the LAN forward\-path check (lan\-verify); run while a LAN client is generating traffic
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of /
+.SH COMMON OPTIONS
+Most commands accept \fB\-\-root \fIDIR\fR (operate under a staged tree instead of \fI/\fR, touching no live kernel or systemd state) and \fB\-\-conf \fIPATH\fR (use a specific machine.conf). Read\-only inspection commands accept \fB\-\-json\fR.
+.SH FILES
+.TP
+\fI/etc/bastion/machine.conf\fR
+Per\-machine configuration (topology, zones, layer selection). Never contains secrets.
+.TP
+\fI/etc/bastion/machine.env\fR
+Flat variables rendered from machine.conf, read by the operational scripts.
+.TP
+\fI/etc/nftables.conf\fR
+The rendered ruleset. Fully rewritten by \fBbastion generate\fR \(em do not hand\-edit; put rules in \fB[zones]\fR.
+.SH SEE ALSO
+Project documentation at \fIhttps://github.com/indyfive11/bastion\fR, including the getting\-started guide, command reference, and troubleshooting docs.
+.SH AUTHOR
+The Bastion project.

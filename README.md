@@ -13,6 +13,10 @@ system.
 > service, or a configuration-management system. It is a focused defense-in-depth tool built
 > on nftables.
 
+> 🚀 **New here? Start with the [5-minute Getting Started guide](docs/getting-started.md)** —
+> install, run the wizard, check health, and open your first port. This README is the full tour;
+> the guide is the fast path.
+
 ## Highlights
 
 - **Seven composable layers** (L0–L6) — install only what you need.
@@ -423,6 +427,9 @@ bastion never rewrites your resolver config.
 | `bastion update <feeds\|dnsblock>` | refresh threat feeds / DNS blocklist now (don't wait for the timer) |
 | `bastion check [--full\|--lan]` | read-only flow & LAN verification |
 
+Every command also self-documents: `bastion <command> --help`, or the full **`man bastion`** page
+(installed by the package; generated from the CLI itself so it never drifts).
+
 Full per-command reference: **[docs/commands.md](docs/commands.md)**. When something goes wrong:
 **[docs/troubleshooting.md](docs/troubleshooting.md)**. For end-to-end recipes (stand up an
 edge router, coexist with libvirt, recover from a lockout) see **[docs/use-cases.md](docs/use-cases.md)**,
@@ -477,8 +484,12 @@ make it straightforward to adopt on almost any Linux host.
 ```sh
 make leak-check        # leak gate (must pass before every commit)
 make generate-check   # all templates resolve against bastion/machine.conf.example
+make man-check        # man/bastion.1 is in sync with the CLI parser
 python -m pytest -q   # test suite
 ```
+
+The `man bastion` page is generated from the argparse parser — run `make man` after any CLI change
+and commit the regenerated `man/bastion.1` (`make man-check` guards against drift).
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
 

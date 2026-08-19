@@ -1,4 +1,14 @@
-.PHONY: leak-check test test-deps lint install-hook generate-check
+.PHONY: leak-check test test-deps lint install-hook generate-check man man-check
+
+# man — regenerate man/bastion.1 from the live CLI parser (part of the docs-sweep).
+man:
+	@python tools/gen_manpage.py
+
+# man-check — fail if the committed man page is stale vs the current CLI parser.
+man-check:
+	@python tools/gen_manpage.py -o - | diff -u man/bastion.1 - >/dev/null 2>&1 \
+	 && echo "man page up to date" \
+	 || { echo "man/bastion.1 is STALE — run 'make man' and commit"; exit 1; }
 
 # generate-check — Phase 2 gate: every template placeholder resolves against the example.
 generate-check:
