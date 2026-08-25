@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.21] - 2026-08-24
+
+Trusted-proxy (CDN) support for CrowdSec detection (H14, phase 1), surfaced by a live firewall dogfood on
+a Cloudflare-fronted box. When a web vhost sits behind a CDN, CrowdSec parses the CDN's *edge* IP as the
+source — so enforcing such a ban would blackhole the CDN and take the site down. This release adds the
+firewall-side safety (a never-block belt for the proxy ranges) plus a health signal that makes the
+"detection is blind behind the CDN" state loud instead of silent, and documents the nginx-side fix.
+
+### Added
+
+- **`[network] trusted_proxies` — CDN/reverse-proxy edge ranges the reconciler must never ban (H14).**
+  Listed ranges (e.g. Cloudflare's, both v4 and v6) are folded into `edge-reconciler`'s never-block
+  allowlist, so a CrowdSec ban keyed on a proxy edge can never reach `cs_block`/`blk_feed`/`ai_*`. This
+  opens **no** inbound access (unlike `trusted_hosts`) and never renders into the ruleset — it re-renders
+  `machine.env` with no firewall reload. Settable via `bastion config set network.trusted_proxies` or the
+  setup `--set` path.
+- **Detection-blind-behind-a-CDN health signal.** The belt prevents the outage but, on its own, leaves
+  CrowdSec HTTP detection inert behind a CDN (every request looks like a CDN edge → every ban is
+  belt-rejected → `cs_block` stays empty). `edge-reconciler` now counts CDN-edge rejections, logs a
+  warning on every pass when `cs_block` is empty because of them, and records `cdn_blind_suspected` in its
+  audit record; `bastion doctor` surfaces it as `crowdsec CDN detection` (WARN when blind, OK when
+  real-client bans are landing, silent when unknown). "Assert the outcome, not just that the layer is
+  installed."
+- **docs/layers.md — "Behind a CDN / reverse proxy" (L2).** Documents the `trusted_proxies` belt and the
+  required nginx `realip` configuration (`CF-Connecting-IP` for Cloudflare, or `X-Forwarded-For` with
+  `real_ip_recursive on` for a generic proxy) so CrowdSec detects the real client, not the CDN edge —
+  including why the leftmost `X-Forwarded-For` entry must never be trusted.
+
 ## [1.5.20] - 2026-08-24
 
 A CrowdSec integration correctness fix (H9), surfaced by a live firewall dogfood. The reconciler now
