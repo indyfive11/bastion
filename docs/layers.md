@@ -69,6 +69,48 @@ package isn't present, L2 reports `installed: no` and the reconciler simply has 
 decisions to ingest — every other layer is unaffected. Install crowdsec out of band, then
 `bastion layer install l2`.
 
+### Behind a CDN / reverse proxy (Cloudflare etc.)
+
+If a web vhost sits behind a CDN, nginx logs the **CDN's edge IP** as the source, not the real
+visitor. CrowdSec then keys its bans on the CDN edge — and enforcing such a ban would blackhole
+the CDN and **take your site down**. This needs two independent things:
+
+**1. Safety — never ban the CDN (bastion owns this).** List the proxy's edge ranges in
+`[network] trusted_proxies` (comma-separated, **both v4 and v6**). The reconciler folds them into
+its never-block set, so a ban keyed on a CDN edge is refused before it can reach `cs_block`
+(also covers `blk_feed`/`ai_*`). This opens **no** inbound access — it is purely a never-block
+belt, unlike `trusted_hosts`:
+
+```ini
+[network]
+# Cloudflare's current ranges: https://www.cloudflare.com/ips-v4 and /ips-v6 (they rotate).
+trusted_proxies = 173.245.48.0/20, 103.21.244.0/22, 2400:cb00::/32, 2606:4700::/32
+```
+
+Set it live with `bastion config set network.trusted_proxies "…"` (re-renders `machine.env`; the
+reconciler picks it up within ~60s, no firewall reload). Trade-off: bastion will now refuse to ban
+**any** IP inside those ranges, so an attacker hosted *inside* the CDN can't be blocked here.
+
+**2. Efficacy — make CrowdSec see the real client (you own this, at nginx).** The belt stops the
+outage but, on its own, leaves detection **blind**: every request looks like it came from a CDN
+edge, so every ban is belt-rejected and `cs_block` stays empty. `bastion doctor` surfaces this as
+`crowdsec CDN detection … BLIND behind the CDN` (and the reconciler logs it each pass) precisely so
+it doesn't look like protection when it isn't. To fix it, configure nginx's `realip` module so nginx
+rewrites `$remote_addr` to the real client *before* CrowdSec reads the log — for **Cloudflare**, use
+the single, non-forgeable `CF-Connecting-IP` header:
+
+```nginx
+# /etc/nginx/conf.d/realip-cloudflare.conf — keep set_real_ip_from in sync with CF's published ranges
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from 2400:cb00::/32;   # …and every other CF v4/v6 range
+real_ip_header    CF-Connecting-IP;
+```
+
+For a generic (non-CF) proxy chain, use `real_ip_header X-Forwarded-For;` with `real_ip_recursive
+on;` — nginx then walks XFF right-to-left across your `set_real_ip_from` proxies and takes the first
+untrusted address as the client. **Never** trust the leftmost XFF entry: it is attacker-controlled
+and would let anyone forge a ban against any IP they name.
+
 ## L3 — `ai-analysis`
 
 **A sanitized collect → analyze → intents pipeline with a provider-agnostic backend, plus

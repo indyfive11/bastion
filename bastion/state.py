@@ -166,6 +166,11 @@ ENV_MAP: tuple[tuple[str, str, str], ...] = (
     # Inbound mgmt hosts — read by edge-reconciler so a poisoned IP feed can never block the
     # operator's own management source (F3 self-lockout guard; the IP twin of the DNS never-sink).
     ("TRUSTED_HOSTS", "network", "trusted_hosts"),
+    # CDN/reverse-proxy edge ranges (e.g. Cloudflare) — read by edge-reconciler and folded into the
+    # never-block allowlist so a crowdsec ban keyed on a proxy EDGE IP (the source crowdsec sees for a
+    # CDN-fronted vhost) can never blackhole the CDN itself (H14). Belt-only: unlike trusted_hosts this
+    # opens NO inbound access; it never renders into an nft set.
+    ("TRUSTED_PROXIES", "network", "trusted_proxies"),
     ("RELAY_DST", "monitoring", "relay_dst"),
     # Public endpoint of the upstream relay/tunnel — folded into the reconciler's never-block
     # allowlist (the public twin of RELAY_DST, which is the tunnel's inner IP) so a poisoned feed
@@ -241,6 +246,14 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
             ipaddress.ip_network(part, strict=False)
         except ValueError:
             errors.append(f"[network] trusted_hosts entry {part!r} — not a valid IP/CIDR")
+
+    # trusted_proxies: CDN/reverse-proxy edge ranges never-blocked by the reconciler (H14). Same
+    # comma/CIDR grammar as trusted_hosts; belt-only (never rendered into an nft set).
+    for part in (p.strip() for p in _get("network", "trusted_proxies").split(",") if p.strip()):
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            errors.append(f"[network] trusted_proxies entry {part!r} — not a valid IP/CIDR")
 
     # service_ports: `port` or `port/proto` (proto tcp|udp), comma/space-separated. Opens these to
     # LAN/overlay so a server can run bastion without its services being dropped.

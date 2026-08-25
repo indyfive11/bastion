@@ -81,6 +81,16 @@ wg_server_cidr = 10.8.0.0/24
 #wg_server_listen_port = 51820
 # always-accept management IPs (comma-separated, user-entered)
 trusted_hosts = 10.0.1.50, 10.0.1.55
+# CDN / reverse-proxy edge ranges to NEVER firewall-ban (comma-separated IPs/CIDRs). If a vhost sits
+# behind a CDN (e.g. Cloudflare), crowdsec parses the CDN EDGE IP as the source — enforcing that ban
+# would blackhole the CDN and take the site down. Listing the proxy ranges here makes the reconciler
+# refuse to ban them (belt for cs_block/blk_feed/ai_*). This opens NO inbound access — it is purely a
+# never-block belt, unlike trusted_hosts. ★ List BOTH v4 AND v6 ranges or the belt is half-open on the
+# family you omit. ★ This only PREVENTS THE OUTAGE — for crowdsec to actually detect the real client
+# (not the CDN edge) you must configure nginx's realip module; see docs/layers.md (L2, behind a CDN).
+# Note: never-blocking a CDN's whole space also means an attacker hosted inside it can't be banned.
+# Cloudflare's current ranges: https://www.cloudflare.com/ips-v4 and /ips-v6 (they rotate).
+#trusted_proxies = 173.245.48.0/20, 103.21.244.0/22, 2400:cb00::/32, 2606:4700::/32
 # inbound service ports to OPEN to LAN/overlay (any source). For a box that runs bastion AND serves
 # apps (media/*arr/ZeroTier/etc.) the default-drop ruleset would block them — list them here. Tokens
 # are `port` or `port/proto` (proto tcp|udp, default tcp), comma/space-separated. Blank = a locked-down

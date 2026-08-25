@@ -105,10 +105,24 @@ def load_allowlist():
     nets += env_protected_nets()
     return nets
 
-def env_protected_nets():
-    # TRUSTED_HOSTS is comma/space-separated; RELAY_DST/RELAY_ENDPOINT/GATEWAY are single IPs. Parse as
-    # /32 (v4) or /128 (v6). Garbage is ignored — this only ever ADDS protection, never rejects.
+def trusted_proxy_nets():
+    # H14: CDN / reverse-proxy edge ranges (TRUSTED_PROXIES), parsed on their own so the reconciler can
+    # ATTRIBUTE a cs_block rejection to "banned a CDN edge" (the detection-blind signal) rather than an
+    # ordinary allowlist hit. Comma/space-separated IPs/CIDRs; garbage ignored (never rejects).
     nets = []
+    for tok in os.environ.get("TRUSTED_PROXIES", "").replace(",", " ").split():
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            continue
+    return nets
+
+def env_protected_nets():
+    # TRUSTED_HOSTS/TRUSTED_PROXIES are comma/space-separated (IPs or CIDRs); RELAY_DST/RELAY_ENDPOINT/
+    # GATEWAY are single IPs. Garbage is ignored — this only ever ADDS protection, never rejects.
+    # H14: TRUSTED_PROXIES (CDN edges) are folded in first so a ban keyed on a proxy edge IP — the
+    # source crowdsec sees for a CDN-fronted vhost — can never blackhole the CDN itself.
+    nets = list(trusted_proxy_nets())
     raw = os.environ.get("TRUSTED_HOSTS", "").replace(",", " ").split()
     for var in ("RELAY_DST", "RELAY_ENDPOINT", "GATEWAY"):
         v = os.environ.get(var, "").strip()
@@ -180,19 +194,22 @@ def desired_cscli(allow, min_prefix):
                              capture_output=True, text=True, timeout=20)
     except Exception as e:
         log(f"cscli exec failed: {e} -- leaving cs_block untouched")
-        return None, [], 0
+        return None, [], 0, 0
     if out.returncode != 0:
         log(f"cscli rc={out.returncode}: {out.stderr.strip()[:200]} -- leaving cs_block untouched")
-        return None, [], 0
+        return None, [], 0, 0
     body = out.stdout.strip()
     if not body or body == "null":
-        return {}, [], 0                   # genuinely no decisions -> empty desired
+        return {}, [], 0, 0                # genuinely no decisions -> empty desired
     try:
         alerts = json.loads(body)
     except json.JSONDecodeError as e:
         log(f"cscli json parse error: {e} -- leaving cs_block untouched")
-        return None, [], 0
-    desired, rejected, n_simulated = {}, [], 0
+        return None, [], 0, 0
+    # H14: tp_nets lets us count bans that hit a CDN/proxy EDGE (belt-rejected) — the signal that
+    # crowdsec is detecting the proxy, not the real client, behind a CDN. Returns a 4th value.
+    tp_nets = trusted_proxy_nets()
+    desired, rejected, n_simulated, n_cdn_rej = {}, [], 0, 0
     for alert in (alerts or []):
         for dec in (alert.get("decisions") or []):
             # H9: a simulated decision (crowdsec simulation mode) must NEVER be enforced. Checked
@@ -214,13 +231,28 @@ def desired_cscli(allow, min_prefix):
             ok, reason, norm = validate(dec.get("value", ""), allow, min_prefix)
             if not ok:
                 rejected.append({"value": dec.get("value"), "reason": reason})
+                if tp_nets:                # H14: was this rejected ban a CDN/proxy edge?
+                    try:
+                        cand = ipaddress.ip_network(dec.get("value", ""), strict=False)
+                        if any(cand.version == tp.version and cand.overlaps(tp) for tp in tp_nets):
+                            n_cdn_rej += 1
+                    except ValueError:
+                        pass
                 continue
             desired[norm] = max(desired.get(norm, 0), ttl)
     if n_simulated:
         # Make simulation-first VISIBLE: without this, an all-simulated pass empties cs_block and
         # reads identically to "crowdsec is dead". (Counted into the audit record too.)
         log(f"cscli: skipped {n_simulated} simulated decision(s) -- NOT enforced (crowdsec simulation mode)")
-    return desired, rejected, n_simulated
+    if n_cdn_rej and not desired:
+        # H14 detection-blind signal: every enforceable ban hit a trusted-proxy/CDN edge and was
+        # belt-rejected, so cs_block is empty. crowdsec is seeing the proxy edge, not the real client
+        # -> HTTP detection is effectively OFF behind the CDN. Logged EVERY pass (ongoing, not a
+        # one-shot warning), surfaced in the audit record + `bastion doctor`.
+        log(f"cs_block: {n_cdn_rej} ban(s) targeted trusted-proxy/CDN edge IPs (belt-rejected) and "
+            f"cs_block is EMPTY -> crowdsec HTTP detection is BLIND behind the CDN (it sees the proxy "
+            f"edge, not the real client). Configure nginx realip -- see docs/layers.md (L2 behind a CDN).")
+    return desired, rejected, n_simulated, n_cdn_rej
 
 def desired_feed(allow, min_prefix):
     if not os.path.exists(FEED_FILE):
@@ -386,8 +418,9 @@ def _run_reconcile():
     ai_desired, ai_rejected = desired_ai_all(allow, AI_MIN_PREFIX)
     for setname, cfg in SETS.items():
         n_simulated = 0
+        n_cdn_rej = 0
         if cfg["source"] == "cscli":
-            desired, rejected, n_simulated = desired_cscli(allow, cfg["min_prefix"])
+            desired, rejected, n_simulated, n_cdn_rej = desired_cscli(allow, cfg["min_prefix"])
         elif cfg["source"] == "feed":
             desired, rejected = desired_feed(allow, cfg["min_prefix"])
         elif cfg["source"] == "ai":
@@ -420,6 +453,12 @@ def _run_reconcile():
                 # H9: surface simulated-decision skips (reported once, on the v4 record) so a
                 # simulation-first pass is visible, not an indistinguishable empty cs_block.
                 rec["simulated_skipped"] = n_simulated if fam_n == 0 else 0
+                # H14: CDN-blind signal (reported once, on the v4 record). cdn_edge_rejections =
+                # bans that hit a trusted-proxy/CDN edge and were belt-rejected; cdn_blind_suspected
+                # = cs_block ended empty AND every enforceable ban was a CDN edge (crowdsec is seeing
+                # the proxy, not the real client). `raw_count` = enforceable (post-validate) bans.
+                rec["cdn_edge_rejections"] = n_cdn_rej if fam_n == 0 else 0
+                rec["cdn_blind_suspected"] = bool(fam_n == 0 and n_cdn_rej and raw_count == 0)
             if cfg["source"] == "ai":
                 # rollback handle for edge-ctl: id -> (set, exact elements applied). Nanosecond
                 # clock + pid + set name so two passes (or the v4/v6 siblings) can't collide.
@@ -437,6 +476,7 @@ def _run_reconcile():
                                    "applied": ok, "detail": detail}
             if cfg["source"] == "cscli":
                 summary["sets"][nm]["simulated_skipped"] = n_simulated if fam_n == 0 else 0
+                summary["sets"][nm]["cdn_blind_suspected"] = bool(fam_n == 0 and n_cdn_rej and raw_count == 0)
     print(json.dumps(summary, indent=2))
     return 0
 

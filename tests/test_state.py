@@ -92,3 +92,11 @@ def test_render_machine_env_is_shell_safe():
     env = state.render_machine_env(conf)
     # single-quoted, so the shell never evaluates the payload
     assert "EGRESS_PROBE='https://x/$(rm -rf)'" in env
+
+
+def test_render_machine_env_emits_trusted_proxies():
+    # H14: trusted_proxies reaches the reconciler via machine.env (the never-block belt), exactly as
+    # trusted_hosts does. Belt-only — it never renders into an nft set.
+    conf = {"network": {"trusted_proxies": "104.16.0.0/13, 2606:4700::/32"}}
+    env = state.render_machine_env(conf)
+    assert "TRUSTED_PROXIES='104.16.0.0/13, 2606:4700::/32'" in env

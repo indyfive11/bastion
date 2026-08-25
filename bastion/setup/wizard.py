@@ -45,7 +45,7 @@ DEFAULT_PROFILE = {"edge": "full-edge", "endpoint": "full-endpoint"}
 SETTABLE_KEYS: tuple[str, ...] = (
     "mode", "profile", "layers", "firewall_scope",
     "lan_iface", "wan_iface", "lan_cidr", "lan_ip", "gateway",
-    "dhcp_range_start", "dhcp_range_end", "trusted_hosts", "dns_upstream",
+    "dhcp_range_start", "dhcp_range_end", "trusted_hosts", "trusted_proxies", "dns_upstream",
     "ssh_port", "ai_depth", "timer_interval", "ai_backend_cmd", "ai_model", "secrets_file",
 )
 
@@ -138,6 +138,7 @@ _SET_VALIDATORS = {
     "gateway": (_v_ip, "an IP like 192.168.1.1"),
     "ssh_port": (_v_port, "a port in 1–65535"),
     "trusted_hosts": (_v_hosts, "comma-separated IPs/CIDRs"),
+    "trusted_proxies": (_v_hosts, "comma-separated IPs/CIDRs"),
 }
 
 
@@ -257,6 +258,8 @@ def build_machine_conf(detection: detectmod.Detection, profile: str,
         put("network", "dhcp_range_end", answers.get("dhcp_range_end") or d_end)
     if "trusted_hosts" in answers:
         conf.setdefault("network", {})["trusted_hosts"] = answers["trusted_hosts"]
+    if "trusted_proxies" in answers:
+        conf.setdefault("network", {})["trusted_proxies"] = answers["trusted_proxies"]
     if "dns_upstream" in answers:
         put("network", "dns_upstream", answers["dns_upstream"])
 

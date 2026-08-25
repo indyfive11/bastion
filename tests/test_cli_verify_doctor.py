@@ -311,3 +311,52 @@ def test_ruleset_stale_real_kernel_differential(tmp_path):
     assert n(expected) == n(live_ok)      # volatile-set fill does NOT trip a false STALE
     assert n(expected) != n(live_bad)     # a genuinely missing rule IS caught
     assert "192.168.9.9" in n(live_ok)    # trusted_hosts survived normalization on real nft output
+
+
+# --- H14: crowdsec CDN-blind signal (doctor reads the reconciler's cs_block audit) ---------------
+
+class _AuditFake:
+    """Minimal System stand-in for _cdn_blind_from_audit: only exists()/read() on the audit path."""
+    def __init__(self, text=None):
+        self._text = text                     # None => the audit file is absent
+
+    def exists(self, p):
+        return self._text is not None and p == "/var/log/edge-reconciler/audit.jsonl"
+
+    def read(self, p):
+        return self._text
+
+
+def _audit(*recs):
+    return "\n".join(json.dumps(r) for r in recs)
+
+
+def test_cdn_blind_true_when_latest_cs_block_flags_it():
+    text = _audit({"event": "reconcile", "set": "cs_block", "cdn_blind_suspected": True})
+    assert cli._cdn_blind_from_audit(_AuditFake(text)) is True
+
+
+def test_cdn_blind_false_when_real_bans_reach_cs_block():
+    text = _audit({"event": "reconcile", "set": "cs_block", "cdn_blind_suspected": False})
+    assert cli._cdn_blind_from_audit(_AuditFake(text)) is False
+
+
+def test_cdn_blind_none_when_field_absent_pre_h14_reconciler():
+    # H13 transition: an old reconciler writes cs_block records WITHOUT the field -> UNKNOWN, not
+    # False. Absent must never read as "not blind" (distrust-your-negatives).
+    text = _audit({"event": "reconcile", "set": "cs_block"})
+    assert cli._cdn_blind_from_audit(_AuditFake(text)) is None
+
+
+def test_cdn_blind_none_when_no_audit_or_no_cs_block_record():
+    assert cli._cdn_blind_from_audit(_AuditFake(None)) is None            # no audit file
+    text = _audit({"event": "reconcile", "set": "blk_feed", "cdn_blind_suspected": True})
+    assert cli._cdn_blind_from_audit(_AuditFake(text)) is None            # no cs_block record
+
+
+def test_cdn_blind_reads_the_latest_cs_block_record_skipping_garbage():
+    # tail-scan returns the MOST RECENT cs_block record (last wins), and a malformed line is skipped.
+    text = _audit({"event": "reconcile", "set": "cs_block", "cdn_blind_suspected": True}) + \
+        "\nnot-json{\n" + \
+        _audit({"event": "reconcile", "set": "cs_block", "cdn_blind_suspected": False})
+    assert cli._cdn_blind_from_audit(_AuditFake(text)) is False

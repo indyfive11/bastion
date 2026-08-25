@@ -348,3 +348,14 @@ def test_recovery_otp_is_console_only():
     body = (SCRIPTS / "bastion-recovery").read_text()
     assert 'announce "  one-time pass' in body               # C3: OTP via announce (stderr only)
     assert 'log "  one-time pass' not in body                # never via logger -> journal
+
+
+def test_validate_conf_trusted_proxies():
+    # H14: trusted_proxies takes the same comma/CIDR grammar as trusted_hosts — a malformed entry is
+    # an error; valid v4 AND v6 CIDRs are clean. (The example ships it commented out, so the clean
+    # example stays clean — guarded by test_validate_conf_clean_example.)
+    c = _conf(); c["network"]["trusted_proxies"] = "104.16.0.0/13, not-an-ip, 2606:4700::/32"
+    errs, _ = state.validate_conf(c)
+    assert any("trusted_proxies" in e and "not-an-ip" in e for e in errs)
+    c["network"]["trusted_proxies"] = "104.16.0.0/13, 2606:4700::/32"
+    assert [e for e in state.validate_conf(c)[0] if "trusted_proxies" in e] == []

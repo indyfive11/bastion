@@ -136,6 +136,12 @@ SETTINGS: tuple[Setting, ...] = (
        "a port 1–65535", APPLY_GENERATE_FIREWALL),
     _S("network.trusted_hosts", "Trusted hosts", "IPs/CIDRs always allowed full inbound access.",
        EVERYDAY, _v_hosts, "comma-separated IPs/CIDRs", APPLY_GENERATE_FIREWALL, list_sep=","),
+    _S("network.trusted_proxies", "Trusted proxies",
+       "CDN/reverse-proxy edge ranges (e.g. Cloudflare) the reconciler must NEVER firewall-ban, so a "
+       "crowdsec ban keyed on a proxy edge IP can't blackhole the CDN (H14). Belt-only: opens NO "
+       "inbound access (unlike trusted_hosts) and never renders into the ruleset — so it re-renders "
+       "machine.env without a firewall reload.",
+       ADVANCED, _v_hosts, "comma-separated IPs/CIDRs (v4 AND v6)", APPLY_GENERATE, list_sep=","),
     _S("network.service_ports", "Service ports",
        "Inbound ports to open to LAN/overlay so a server can run bastion (blank = locked endpoint).",
        EVERYDAY, _v_service_ports, "ports like 8096, 53/udp (port or port/proto)",

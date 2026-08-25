@@ -1318,6 +1318,27 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 # --- D2: one-shot triage. Encodes the dogfood hunt (missing binaries, drift, firewall not
 #     persisted, recovery missing, AI off, unreadable secret) as a single read-only command. ---
+def _cdn_blind_from_audit(sys_) -> "bool | None":
+    """H14: return the reconciler's latest cs_block `cdn_blind_suspected` (True = every ban hit a
+    trusted-proxy/CDN edge and was belt-rejected, so cs_block is empty → HTTP detection is blind
+    behind the CDN; False = real-client bans are reaching cs_block). None = UNKNOWN — no audit log,
+    no cs_block record, or a pre-H14 reconciler still deployed (record lacks the field, the H13
+    stale-script case). Absent is never treated as 'not blind'. Scans only the tail (the record is
+    always within the last pass) so an append-only audit log isn't re-read in full each run."""
+    audit_f = "/var/log/edge-reconciler/audit.jsonl"
+    if not sys_.exists(audit_f):
+        return None
+    import json as _json
+    for line in reversed(sys_.read(audit_f).splitlines()[-500:]):
+        try:
+            rec = _json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("event") == "reconcile" and rec.get("set") == "cs_block":
+            return rec.get("cdn_blind_suspected")
+    return None
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ctx = build_context(args)
     sys_ = ctx.system
@@ -1406,6 +1427,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 add("OK", "ai secret", f"{env} readable")
             except Exception:                                          # noqa: BLE001
                 add("WARN", "ai secret", f"{env} present but unreadable")
+
+    # H14: crowdsec detection-blind-behind-CDN. If trusted_proxies is set and the reconciler's latest
+    # cs_block pass flagged cdn_blind_suspected (every ban hit a CDN edge → belt-rejected → cs_block
+    # empty), crowdsec is seeing the proxy edge, not the real client — HTTP detection is effectively
+    # off. Assert the OUTCOME (H8 theme: efficacy, not just "layer installed"). Best-effort/live-only;
+    # silent when trusted_proxies is unset or the audit log is absent.
+    if "l2" in layers and ctx.config and sys_.is_live and \
+            ctx.config.get("network", {}).get("trusted_proxies", "").strip():
+        try:
+            blind = _cdn_blind_from_audit(sys_)
+            if blind is True:
+                add("WARN", "crowdsec CDN detection",
+                    "trusted_proxies set but every crowdsec ban hit a CDN edge (belt-rejected) — "
+                    "cs_block is EMPTY, so HTTP detection is BLIND behind the CDN. Configure nginx "
+                    "realip so crowdsec sees the real client (docs/layers.md, L2 behind a CDN).")
+            elif blind is False:
+                add("OK", "crowdsec CDN detection", "real-client bans are reaching cs_block")
+        except Exception as exc:                                       # noqa: BLE001
+            add("WARN", "crowdsec CDN detection", f"could not check ({exc})")
 
     fails = sum(1 for lvl, _, _ in results if lvl == "FAIL")
     warns = sum(1 for lvl, _, _ in results if lvl == "WARN")
