@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.22] - 2026-08-25
+
+Update-path hardening, surfaced by live dogfood post-mortems on two boxes (ES + SLC). Adds a generate-safe
+home for installation-specific never-block entries so `bastion generate` can no longer silently wipe an
+operator's hand-added allowlist entry, and fixes two update-path defects the field surfaced.
+
+### Added
+- `[network] allowlist_extra` — a machine.conf key for installation-specific never-block IPs/CIDRs (your
+  own INBOUND peers/tunnels/mgmt sources). Folded into the reconciler's never-block set like `trusted_hosts`,
+  but with a config home so it survives `bastion generate` (the entries live in machine.env, never in the
+  re-rendered `policy.allowlist`). Belt-only: opens NO inbound access, and is kept out of the H14 cdn_blind
+  signal so a ban on one of these entries is never mis-attributed as CDN blindness.
+
+### Fixed
+- Atomic sbin deploy: `install_script` now writes scripts atomically (temp file + chmod-on-temp +
+  `os.replace`), preserving the `0755` exec bit. Redeploying a script while its systemd timer may exec it
+  can no longer present a truncated or non-executable file (reproduced under concurrent exec before the fix).
+- `bastion generate` now runs `systemctl daemon-reload` when it rewrote a unit file (live root run only) —
+  systemd is no longer left silently running stale unit definitions after a config change. A staged
+  `--root` or non-root run never touches systemd.
+
+### Changed
+- `policy.allowlist` template: corrected the footer that invited hand-appended entries (which `generate`
+  clobbers) to point operators at `[network] allowlist_extra`, and clarified that outbound services (DNS
+  upstream, an AI/API you reach OUT to) are already immune and do not need listing.
+
 ## [1.5.21] - 2026-08-24
 
 Trusted-proxy (CDN) support for CrowdSec detection (H14, phase 1), surfaced by a live firewall dogfood on
