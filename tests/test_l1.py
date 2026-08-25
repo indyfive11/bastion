@@ -65,3 +65,17 @@ def test_reconciler_reads_nft_table_env():
     # endpoint support). Guard against a regression back to a literal.
     body = (SCRIPTS / "edge-reconciler").read_text()
     assert 'os.environ.get("NFT_TABLE"' in body
+
+
+def test_install_script_atomic_and_executable(tmp_path):
+    # install_script must deploy the sbin script atomically AND preserve the 0o755 exec bit. A redeploy
+    # over a script its 60s timer may exec must never leave it truncated or non-executable — the atomic
+    # write (temp + chmod-on-temp + os.replace) is what guarantees that. Regression guard for the fix
+    # that routed install_script through atomic_write_text (which defaults to 0644 for config files).
+    ctx = _ctx(tmp_path, {}, dry_run=False)
+    layers.get("l1").install_script(ctx, "edge-reconciler")
+    out = ctx.system.path(f"{ctx.sbin_dir}/edge-reconciler")
+    assert out.exists()
+    assert (out.stat().st_mode & 0o777) == 0o755          # exec bit preserved (the adversary's catch)
+    assert out.read_text() == (SCRIPTS / "edge-reconciler").read_text()
+    assert not list(out.parent.glob(".*.tmp"))            # no leftover temp from the atomic write

@@ -171,6 +171,12 @@ ENV_MAP: tuple[tuple[str, str, str], ...] = (
     # CDN-fronted vhost) can never blackhole the CDN itself (H14). Belt-only: unlike trusted_hosts this
     # opens NO inbound access; it never renders into an nft set.
     ("TRUSTED_PROXIES", "network", "trusted_proxies"),
+    # Installation-specific never-block CIDRs — the operator's own INBOUND peers/tunnels/mgmt sources
+    # that must never be auto-banned. Folded into the reconciler's never-block allowlist like
+    # trusted_hosts, but with a machine.conf home so `generate` can't clobber them (they never live in
+    # policy.allowlist). Belt-only: opens NO inbound access; never renders into an nft set; folded via
+    # env_protected_nets (NOT trusted_proxy_nets) so it is NOT counted toward the H14 cdn_blind signal.
+    ("ALLOWLIST_EXTRA", "network", "allowlist_extra"),
     ("RELAY_DST", "monitoring", "relay_dst"),
     # Public endpoint of the upstream relay/tunnel — folded into the reconciler's never-block
     # allowlist (the public twin of RELAY_DST, which is the tunnel's inner IP) so a poisoned feed
@@ -254,6 +260,14 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
             ipaddress.ip_network(part, strict=False)
         except ValueError:
             errors.append(f"[network] trusted_proxies entry {part!r} — not a valid IP/CIDR")
+
+    # allowlist_extra: installation-specific never-block CIDRs (operator's own inbound peers). Same
+    # comma/CIDR grammar as trusted_hosts; belt-only (never rendered into an nft set).
+    for part in (p.strip() for p in _get("network", "allowlist_extra").split(",") if p.strip()):
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            errors.append(f"[network] allowlist_extra entry {part!r} — not a valid IP/CIDR")
 
     # service_ports: `port` or `port/proto` (proto tcp|udp), comma/space-separated. Opens these to
     # LAN/overlay so a server can run bastion without its services being dropped.

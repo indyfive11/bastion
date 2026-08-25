@@ -142,6 +142,15 @@ SETTINGS: tuple[Setting, ...] = (
        "inbound access (unlike trusted_hosts) and never renders into the ruleset — so it re-renders "
        "machine.env without a firewall reload.",
        ADVANCED, _v_hosts, "comma-separated IPs/CIDRs (v4 AND v6)", APPLY_GENERATE, list_sep=","),
+    _S("network.allowlist_extra", "Extra never-block hosts",
+       "Installation-specific IPs/CIDRs the reconciler must NEVER firewall-ban — your own INBOUND "
+       "peers/tunnels/mgmt sources (e.g. a second-site tunnel far-end that connects in). The "
+       "generate-safe home for never-block entries: put them here instead of hand-editing "
+       "policy.allowlist, which `generate` overwrites. Belt-only: opens NO inbound access (unlike "
+       "trusted_hosts) and never renders into the ruleset. NOTE: only INBOUND-initiated traffic can be "
+       "banned — outbound services (DNS upstream, an AI/API you reach OUT to) are already immune and "
+       "need not be listed.",
+       ADVANCED, _v_hosts, "comma-separated IPs/CIDRs (v4 AND v6)", APPLY_GENERATE, list_sep=","),
     _S("network.service_ports", "Service ports",
        "Inbound ports to open to LAN/overlay so a server can run bastion (blank = locked endpoint).",
        EVERYDAY, _v_service_ports, "ports like 8096, 53/udp (port or port/proto)",

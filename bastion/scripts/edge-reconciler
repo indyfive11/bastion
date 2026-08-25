@@ -118,12 +118,17 @@ def trusted_proxy_nets():
     return nets
 
 def env_protected_nets():
-    # TRUSTED_HOSTS/TRUSTED_PROXIES are comma/space-separated (IPs or CIDRs); RELAY_DST/RELAY_ENDPOINT/
-    # GATEWAY are single IPs. Garbage is ignored — this only ever ADDS protection, never rejects.
+    # TRUSTED_HOSTS/TRUSTED_PROXIES/ALLOWLIST_EXTRA are comma/space-separated (IPs or CIDRs);
+    # RELAY_DST/RELAY_ENDPOINT/GATEWAY are single IPs. Garbage is ignored — this only ever ADDS
+    # protection, never rejects.
     # H14: TRUSTED_PROXIES (CDN edges) are folded in first so a ban keyed on a proxy edge IP — the
     # source crowdsec sees for a CDN-fronted vhost — can never blackhole the CDN itself.
+    # ALLOWLIST_EXTRA (operator's installation-specific never-block entries) folds in like TRUSTED_HOSTS
+    # but is deliberately NOT part of trusted_proxy_nets(), so a ban on one of these entries is an
+    # ordinary allowlist hit — never counted toward the cdn_blind_suspected signal.
     nets = list(trusted_proxy_nets())
     raw = os.environ.get("TRUSTED_HOSTS", "").replace(",", " ").split()
+    raw += os.environ.get("ALLOWLIST_EXTRA", "").replace(",", " ").split()
     for var in ("RELAY_DST", "RELAY_ENDPOINT", "GATEWAY"):
         v = os.environ.get(var, "").strip()
         if v:

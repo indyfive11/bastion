@@ -573,3 +573,31 @@ def test_validate_conf_endpoint_wg_server_warn_and_port_range():
     # out-of-range listen port -> hard error
     errs, _ = state.validate_conf(_mk("endpoint", "wg0", "70000"))
     assert any("wg_server_listen_port" in e for e in errs)
+
+
+def test_should_daemon_reload_gate():
+    # W2 gate predicate: daemon-reload fires ONLY on a live root run (out is /) as euid 0 that actually
+    # wrote a unit file. Every other combination must be False so generate stays side-effect-free.
+    from bastion.cli import _should_daemon_reload
+    root = Path("/")
+    assert _should_daemon_reload(root, True, 0) is True            # live root + unit written -> reload
+    assert _should_daemon_reload(Path("/tmp/stage"), True, 0) is False   # staged --root tree -> never
+    assert _should_daemon_reload(root, True, 1000) is False        # non-root live run -> never
+    assert _should_daemon_reload(root, False, 0) is False          # config-only generate -> never
+
+
+def test_generate_to_staged_root_never_daemon_reloads(tmp_path, monkeypatch):
+    # A staged --root generate (out != /) writes unit files under the staged tree but must NEVER touch
+    # systemd. Guards the side-effect-free contract cmd_switch + the test suite rely on.
+    import argparse, types
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(a)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    ns = argparse.Namespace(conf=str(EXAMPLE), templates=None, out=str(tmp_path), check=False)
+    assert cli.cmd_generate(ns) == 0
+    assert (tmp_path / "etc/systemd/system").exists()             # unit files WERE written under stage
+    assert not any("daemon-reload" in a[0] for a in calls if a)   # ...but systemd was never reloaded

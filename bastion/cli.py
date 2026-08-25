@@ -123,6 +123,16 @@ def _nft_syntax_check(text: str) -> tuple[bool, str | None]:
         os.unlink(path)
 
 
+def _should_daemon_reload(out_base: Path, units_written: bool, euid: int) -> bool:
+    """W2: after `generate` rewrites unit files, systemd needs `daemon-reload` or it keeps running
+    the old unit definitions (operators were left NeedDaemonReload=yes silently). Gate it HARD so
+    generate stays side-effect-free everywhere it must be: reload only on a LIVE run to the real
+    tree (out_base is /), as root, that actually wrote at least one unit file. A staged `--root`
+    tree (out_base != /) or a non-root run must never touch systemd — cmd_switch (which calls
+    generate then reloads separately) and the test suite rely on that."""
+    return units_written and out_base == Path("/") and euid == 0
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     templates_dir = find_templates_dir(args.templates)
     conf_path = state.find_conf(args.conf)
@@ -202,6 +212,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     # Write step — only active-layer templates.
     out_base = Path(args.out) if args.out else Path("/")
     written = []
+    units_written = False
     for rel, abs_path in iter_templates(templates_dir):
         if rel.as_posix() not in active_rels:
             continue
@@ -211,6 +222,8 @@ def cmd_generate(args: argparse.Namespace) -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(templates.render_file(abs_path, config))
         written.append(str(dest))
+        if rel.as_posix().startswith("systemd/"):
+            units_written = True
 
     env_dest = _join(out_base, "/etc/bastion/machine.env")
     env_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -220,6 +233,11 @@ def cmd_generate(args: argparse.Namespace) -> int:
     print(f"generate: wrote {len(written)} file(s) (mode={mode}):")
     for w in written:
         print(f"  {w}")
+
+    # W2: reload systemd only when we rewrote a unit on a live root run (see _should_daemon_reload).
+    if _should_daemon_reload(out_base, units_written, os.geteuid()):
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+        print("  (ran systemctl daemon-reload — unit files changed on disk)")
     return 0
 
 

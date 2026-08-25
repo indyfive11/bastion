@@ -13,12 +13,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def atomic_write_text(out: Path, text: str) -> None:
+def atomic_write_text(out: Path, text: str, mode: int | None = None) -> None:
     """Write ``text`` to ``out`` atomically: render to a temp file in the same directory,
     fsync it, then ``os.replace`` into place. A crash or power-loss mid-write can then never
     leave a truncated file on disk — the destination is either the old contents or the complete
     new contents. Critical for /etc/nftables.conf, which the pinned nftables.service loads
-    verbatim at boot: a half-written ruleset is a fail-open firewall. Mirrors state.write_conf."""
+    verbatim at boot: a half-written ruleset is a fail-open firewall. Mirrors state.write_conf.
+
+    ``mode`` (e.g. 0o755) is applied to the TEMP file BEFORE the rename, so the destination
+    appears atomically with its final permissions — never a window where it exists at the
+    default 0644. This is what makes it safe to redeploy an executable script (edge-reconciler)
+    while its 60s timer may exec it: a concurrent exec sees the complete old or complete new
+    file with the exec bit, never a truncated or non-executable one."""
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f".{out.name}.tmp")
     try:
@@ -26,6 +32,8 @@ def atomic_write_text(out: Path, text: str) -> None:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, out)
     finally:
         if tmp.exists():
@@ -277,11 +285,12 @@ class Layer(abc.ABC):
         atomic_write_text(out, tmpl.render_file(src, ctx.config))
 
     def install_script(self, ctx: Context, name: str) -> None:
+        # Atomic (temp + chmod-on-temp + os.replace) so a redeploy over a script that its systemd
+        # timer may exec concurrently can never present a truncated or non-executable file — a
+        # concurrent exec sees the complete old or complete new script with 0755, never a torn one.
         src = ctx.scripts_dir / name
         out = ctx.system.path(f"{ctx.sbin_dir}/{name}")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(src.read_text())
-        out.chmod(0o755)
+        atomic_write_text(out, src.read_text(), mode=0o755)
 
     def install_unit(self, ctx: Context, name: str) -> None:
         src = ctx.templates_dir / "systemd" / name

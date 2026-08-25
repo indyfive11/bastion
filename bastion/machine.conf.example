@@ -91,6 +91,14 @@ trusted_hosts = 10.0.1.50, 10.0.1.55
 # Note: never-blocking a CDN's whole space also means an attacker hosted inside it can't be banned.
 # Cloudflare's current ranges: https://www.cloudflare.com/ips-v4 and /ips-v6 (they rotate).
 #trusted_proxies = 173.245.48.0/20, 103.21.244.0/22, 2400:cb00::/32, 2606:4700::/32
+# Extra never-block entries: installation-specific IPs/CIDRs the reconciler must NEVER auto-ban — your
+# own INBOUND peers/tunnels/mgmt sources (a second-site tunnel far-end that connects IN, a partner's
+# fixed public IP that dials in). THIS is the generate-safe home for such entries — put them here, do
+# NOT hand-edit policy.allowlist (which `bastion generate` overwrites). Belt-only: opens NO inbound
+# access (unlike trusted_hosts). ★ NOTE: the firewall only bans INBOUND-initiated traffic — outbound
+# services you REACH OUT to (your DNS upstream, an AI/API provider) are ALREADY immune (return traffic
+# is established-accepted before any block set), so they do NOT need listing here.
+#allowlist_extra = 203.0.113.10/32, 198.51.100.0/24
 # inbound service ports to OPEN to LAN/overlay (any source). For a box that runs bastion AND serves
 # apps (media/*arr/ZeroTier/etc.) the default-drop ruleset would block them — list them here. Tokens
 # are `port` or `port/proto` (proto tcp|udp, default tcp), comma/space-separated. Blank = a locked-down

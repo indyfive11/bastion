@@ -359,3 +359,13 @@ def test_validate_conf_trusted_proxies():
     assert any("trusted_proxies" in e and "not-an-ip" in e for e in errs)
     c["network"]["trusted_proxies"] = "104.16.0.0/13, 2606:4700::/32"
     assert [e for e in state.validate_conf(c)[0] if "trusted_proxies" in e] == []
+
+
+def test_validate_conf_allowlist_extra():
+    # allowlist_extra takes the same comma/CIDR grammar as trusted_hosts — malformed entry is an error;
+    # valid v4 AND v6 CIDRs are clean. (Example ships it commented out, so the clean example stays clean.)
+    c = _conf(); c["network"]["allowlist_extra"] = "203.0.113.10/32, not-an-ip, 198.51.100.0/24"
+    errs, _ = state.validate_conf(c)
+    assert any("allowlist_extra" in e and "not-an-ip" in e for e in errs)
+    c["network"]["allowlist_extra"] = "203.0.113.10/32, 198.51.100.0/24"
+    assert [e for e in state.validate_conf(c)[0] if "allowlist_extra" in e] == []

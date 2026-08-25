@@ -221,3 +221,43 @@ def test_desired_cscli_no_trusted_proxies_never_counts_cdn(rec, allow, monkeypat
     desired, rejected, n_simulated, n_cdn_rej = rec.desired_cscli(allow, FLOOR)
     assert n_cdn_rej == 0                        # no trusted_proxies -> nothing attributed to CDN
     assert len(rejected) == 1                    # still an ordinary allowlist rejection
+
+
+def test_allowlist_extra_folded_into_never_block(rec, monkeypatch):
+    # allowlist_extra: operator's installation-specific never-block entries fold into the reconciler's
+    # never-block set (env-fold, like trusted_hosts) so `generate` re-rendering policy.allowlist can
+    # never lose them and a ban on one can never reach cs_block.
+    monkeypatch.setenv("ALLOWLIST_EXTRA", "203.0.113.10/32, 198.51.100.0/24")
+    for v in ("TRUSTED_PROXIES", "TRUSTED_HOSTS", "RELAY_DST", "RELAY_ENDPOINT", "GATEWAY"):
+        monkeypatch.delenv(v, raising=False)
+    nets = rec.env_protected_nets()
+    assert ipaddress.ip_network("203.0.113.10/32") in nets
+    assert ipaddress.ip_network("198.51.100.0/24") in nets
+    ok, reason, _ = rec.validate("203.0.113.10", nets, FLOOR)
+    assert ok is False and reason.startswith("allowlisted")
+    # kept OUT of the CDN-counter source, so it never pollutes the H14 cdn_blind signal
+    assert ipaddress.ip_network("203.0.113.10/32") not in rec.trusted_proxy_nets()
+
+
+def test_allowlist_extra_not_counted_as_cdn_edge(rec, monkeypatch):
+    # H14-isolation regression: a ban on an allowlist_extra entry is an ORDINARY allowlist rejection,
+    # never counted toward cdn_blind (only trusted_proxies drives that signal). Guards against a future
+    # refactor folding allowlist_extra through trusted_proxy_nets() and falsely reporting "CDN-blind".
+    monkeypatch.setenv("ALLOWLIST_EXTRA", "203.0.113.0/24")
+    for v in ("TRUSTED_PROXIES", "TRUSTED_HOSTS", "RELAY_DST", "RELAY_ENDPOINT", "GATEWAY"):
+        monkeypatch.delenv(v, raising=False)
+    allow = rec.env_protected_nets()             # includes the allowlist_extra range
+    payload = [{"decisions": [
+        {"type": "ban", "scope": "Ip", "value": "203.0.113.7", "duration": "3h", "simulated": False},
+    ]}]
+
+    class P:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: P())
+    desired, rejected, n_simulated, n_cdn_rej = rec.desired_cscli(allow, FLOOR)
+    assert desired == {}                         # belt-rejected (allowlist_extra hit)
+    assert n_cdn_rej == 0                         # NOT miscounted as a CDN-edge rejection
+    assert len(rejected) == 1

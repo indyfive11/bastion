@@ -8,9 +8,10 @@
 # WireGuard handshake) from being blocked.
 #
 # This shipped template contains ONLY the universal RFC1918 + loopback + CGNAT floors.
-# Installation-specific entries (your relay endpoint, chosen DNS upstreams, AI API range)
-# are appended by the installer/wizard from machine.conf — they are NEVER committed here,
-# because committing a real public IP is a leak (see Makefile leak-check).
+# Do NOT hand-append installation-specific entries here: `bastion generate` re-renders this file
+# from the template and would silently erase them. Instead set `[network] allowlist_extra` in
+# machine.conf — the reconciler folds those in at runtime from machine.env (they never live in this
+# file, so generate can't clobber them and a real public IP is never committed; see leak-check).
 
 # --- loopback ---
 127.0.0.0/8
@@ -25,7 +26,9 @@
 fe80::/10
 fc00::/7
 
-# --- installation-specific entries are added below by the installer, e.g.: ---
-#   <relay/tunnel far-end public IP>/32        (anti-stranding for your upstream relay)
-#   <chosen DNS upstream IP>/32                (so the resolver path is never blocked)
-#   <AI API provider range>/NN                 (anti-stranding so the analyzer can always reach its API)
+# --- installation-specific entries: do NOT hand-append here (generate overwrites this file). ---
+#   Set them via `[network] allowlist_extra` in machine.conf — folded in at runtime by the reconciler.
+#   Only an INBOUND-initiating peer needs this (e.g. a tunnel far-end that CONNECTS IN to this box).
+#   Outbound services you reach OUT to (DNS upstream, an AI/API provider) are already immune per the
+#   blast-radius note above (established,related is accepted before the block sets) — do not list them.
+#   (Your relay/tunnel far-end is already auto-protected via RELAY_ENDPOINT from machine.conf.)

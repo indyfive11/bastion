@@ -100,3 +100,11 @@ def test_render_machine_env_emits_trusted_proxies():
     conf = {"network": {"trusted_proxies": "104.16.0.0/13, 2606:4700::/32"}}
     env = state.render_machine_env(conf)
     assert "TRUSTED_PROXIES='104.16.0.0/13, 2606:4700::/32'" in env
+
+
+def test_render_machine_env_emits_allowlist_extra():
+    # allowlist_extra reaches the reconciler via machine.env (the generate-safe never-block belt), so an
+    # operator's inbound-peer entry survives a `generate` that re-renders policy.allowlist. Belt-only.
+    conf = {"network": {"allowlist_extra": "203.0.113.10/32, 198.51.100.0/24"}}
+    env = state.render_machine_env(conf)
+    assert "ALLOWLIST_EXTRA='203.0.113.10/32, 198.51.100.0/24'" in env
