@@ -168,26 +168,42 @@ def split_by_family(desired):
 
 # ---------- sources (return dict {normalized_cidr: ttl_seconds} or None on hard error) ----
 def desired_cscli(allow, min_prefix):
+    # cscli's default `decisions list` INCLUDES crowdsec SIMULATED decisions (simulation-mode
+    # scenarios). Those must NEVER be enforced into cs_block, or "simulation" silently becomes
+    # enforcement. They are filtered IN-CODE below (see the `simulated` check), NOT via `--no-simu`:
+    # that flag is absent on older crowdsec, where adding it would make cscli error -> the rc!=0
+    # path returns None -> cs_block is left untouched -> the whole L2 layer silently no-ops. The
+    # in-code filter is version-portable and is the single source of truth. Returns
+    # (desired, rejected, n_simulated).
     try:
         out = subprocess.run(["cscli", "decisions", "list", "-o", "json"],
                              capture_output=True, text=True, timeout=20)
     except Exception as e:
         log(f"cscli exec failed: {e} -- leaving cs_block untouched")
-        return None, []
+        return None, [], 0
     if out.returncode != 0:
         log(f"cscli rc={out.returncode}: {out.stderr.strip()[:200]} -- leaving cs_block untouched")
-        return None, []
+        return None, [], 0
     body = out.stdout.strip()
     if not body or body == "null":
-        return {}, []                      # genuinely no decisions -> empty desired
+        return {}, [], 0                   # genuinely no decisions -> empty desired
     try:
         alerts = json.loads(body)
     except json.JSONDecodeError as e:
         log(f"cscli json parse error: {e} -- leaving cs_block untouched")
-        return None, []
-    desired, rejected = {}, []
+        return None, [], 0
+    desired, rejected, n_simulated = {}, [], 0
     for alert in (alerts or []):
         for dec in (alert.get("decisions") or []):
+            # H9: a simulated decision (crowdsec simulation mode) must NEVER be enforced. Checked
+            # FIRST so it's excluded regardless of type/scope and counted separately from
+            # allowlist/floor rejections. crowdsec marshals `Simulated *bool` -> JSON true/false/
+            # null; `is True` skips only a genuine simulated decision (false/absent -> enforce,
+            # which is correct for older crowdsec that has no simulation field, and avoids a
+            # string-"false" truthiness trap wrongly dropping a real ban).
+            if dec.get("simulated") is True:
+                n_simulated += 1
+                continue
             if dec.get("type") != "ban":
                 continue
             if dec.get("scope") not in ("Ip", "Range"):
@@ -200,7 +216,11 @@ def desired_cscli(allow, min_prefix):
                 rejected.append({"value": dec.get("value"), "reason": reason})
                 continue
             desired[norm] = max(desired.get(norm, 0), ttl)
-    return desired, rejected
+    if n_simulated:
+        # Make simulation-first VISIBLE: without this, an all-simulated pass empties cs_block and
+        # reads identically to "crowdsec is dead". (Counted into the audit record too.)
+        log(f"cscli: skipped {n_simulated} simulated decision(s) -- NOT enforced (crowdsec simulation mode)")
+    return desired, rejected, n_simulated
 
 def desired_feed(allow, min_prefix):
     if not os.path.exists(FEED_FILE):
@@ -365,8 +385,9 @@ def _run_reconcile():
     # AI source feeds 3 sets from ONE spool -> read it once, partition by action.
     ai_desired, ai_rejected = desired_ai_all(allow, AI_MIN_PREFIX)
     for setname, cfg in SETS.items():
+        n_simulated = 0
         if cfg["source"] == "cscli":
-            desired, rejected = desired_cscli(allow, cfg["min_prefix"])
+            desired, rejected, n_simulated = desired_cscli(allow, cfg["min_prefix"])
         elif cfg["source"] == "feed":
             desired, rejected = desired_feed(allow, cfg["min_prefix"])
         elif cfg["source"] == "ai":
@@ -395,6 +416,10 @@ def _run_reconcile():
                    "desired_count": len(fam_des),
                    "rejected_count": len(rejected) if fam_n == 0 else 0,
                    "rejected": rejected[:50] if fam_n == 0 else [], "applied": ok, "detail": detail}
+            if cfg["source"] == "cscli":
+                # H9: surface simulated-decision skips (reported once, on the v4 record) so a
+                # simulation-first pass is visible, not an indistinguishable empty cs_block.
+                rec["simulated_skipped"] = n_simulated if fam_n == 0 else 0
             if cfg["source"] == "ai":
                 # rollback handle for edge-ctl: id -> (set, exact elements applied). Nanosecond
                 # clock + pid + set name so two passes (or the v4/v6 siblings) can't collide.
@@ -410,6 +435,8 @@ def _run_reconcile():
                 audit(rec)
             summary["sets"][nm] = {"desired": len(fam_des), "rejected": rec["rejected_count"],
                                    "applied": ok, "detail": detail}
+            if cfg["source"] == "cscli":
+                summary["sets"][nm]["simulated_skipped"] = n_simulated if fam_n == 0 else 0
     print(json.dumps(summary, indent=2))
     return 0
 

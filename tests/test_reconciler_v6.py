@@ -93,3 +93,51 @@ def test_current_set_parses_v6_prefix(rec, monkeypatch):
 
     monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: P())
     assert rec.current_set("ai_block6") == {"2001:db8::/64", "2001:db8:1::1"}
+
+
+def test_desired_cscli_excludes_simulated(rec, allow, monkeypatch):
+    # H9: crowdsec's `cscli decisions list` INCLUDES simulated decisions by default; the reconciler
+    # must NOT enforce them into cs_block (else simulation-first silently becomes enforcement).
+    # Real (simulated:false) and no-field (older crowdsec) bans ARE enforced; simulated:true is
+    # excluded and counted. Fixture matches real cscli JSON: top-level list of alerts, each with a
+    # `decisions` array, crowdsec's exact key case (type "ban", scope "Ip"), values /32 outside the
+    # allowlist. Asserting the REAL ban is PRESENT proves the fixture reaches the enforce path (so a
+    # subtly-wrong shape can't make the "simulated absent" assertion pass vacuously).
+    payload = [{"simulated": False, "decisions": [
+        {"type": "ban", "scope": "Ip", "value": "203.0.113.10", "duration": "3h59m59s", "simulated": False},
+        {"type": "ban", "scope": "Ip", "value": "203.0.113.20", "duration": "3h59m59s", "simulated": True},
+        {"type": "ban", "scope": "Ip", "value": "203.0.113.30", "duration": "3h59m59s"},
+    ]}]
+
+    class P:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: P())
+    desired, rejected, n_simulated = rec.desired_cscli(allow, {4: 24, 6: 64})
+    assert "203.0.113.10/32" in desired       # real decision -> enforced (proves fixture reaches enforce path)
+    assert "203.0.113.30/32" in desired       # no `simulated` field (older crowdsec) -> enforced
+    assert "203.0.113.20/32" not in desired    # simulated:true -> excluded
+    assert n_simulated == 1
+    assert rejected == []                      # a simulated skip is NOT a validation rejection
+
+
+def test_desired_cscli_simulated_not_counted_as_rejection(rec, allow, monkeypatch):
+    # A simulated decision that would ALSO fail validation (allowlisted) must be counted as a
+    # simulated-skip, not an allowlist rejection — the simulated check runs FIRST. Guards the
+    # audit-accounting (rejected_count vs simulated_skipped stay distinct).
+    payload = [{"decisions": [
+        {"type": "ban", "scope": "Ip", "value": "10.0.0.5", "duration": "3h", "simulated": True},
+    ]}]
+
+    class P:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: P())
+    desired, rejected, n_simulated = rec.desired_cscli(allow, {4: 24, 6: 64})
+    assert desired == {}
+    assert n_simulated == 1
+    assert rejected == []                      # counted as simulated, NOT as an allowlist rejection
