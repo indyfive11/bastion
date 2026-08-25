@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.20] - 2026-08-24
+
+A CrowdSec integration correctness fix (H9), surfaced by a live firewall dogfood. The reconciler now
+filters CrowdSec *simulated* decisions so they are never enforced into the `cs_block` set — making
+crowdsec's simulation mode genuinely non-enforcing on a box whose reconciler is running, and reporting
+a count so a simulation-first pass is visible rather than an indistinguishable empty set.
+
+### Fixed
+
+- **`edge-reconciler` no longer enforces CrowdSec simulated decisions (H9).** `cscli decisions list`
+  includes simulation-mode decisions by default, and the reconciler enforced every returned ban into
+  `cs_block` — so on a box whose reconciler timer is running, crowdsec "simulation" silently became
+  enforcement. The reconciler now skips any decision flagged `simulated` (checked first, at the
+  decision level, filtered version-portably in-code rather than via a `--no-simu` flag that older
+  crowdsec lacks and which would otherwise error into a silent no-op) and reports a `simulated_skipped`
+  count on the reconcile audit record and summary, plus a log line — so a simulation-first rollout is
+  visible, not an empty `cs_block` indistinguishable from a dead engine.
+
 ## [1.5.19] - 2026-08-19
 
 Documentation and a shipped-template correctness fix. Adds a concise getting-started guide and a
