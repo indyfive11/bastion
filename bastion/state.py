@@ -377,6 +377,10 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
     if ipv6_fwd and ipv6_fwd.lower() not in ("yes", "no"):
         errors.append(f"[network] ipv6_forward={ipv6_fwd!r} — must be 'yes' or 'no'")
 
+    wg_wan = _get("network", "wg_server_wan")
+    if wg_wan and wg_wan.lower() not in ("yes", "no"):
+        errors.append(f"[network] wg_server_wan={wg_wan!r} — must be 'yes' or 'no'")
+
     prefer_v4 = _get("network", "prefer_ipv4")
     if prefer_v4:
         if prefer_v4.lower() not in ("off", "soft", "hard"):

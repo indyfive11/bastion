@@ -76,9 +76,14 @@ wg_server_cidr = 10.8.0.0/24
 # Inbound WireGuard server listen port (ENDPOINT mode only — e.g. a VPS peers dial into). When a
 # wg_server_iface is set on an endpoint, the firewall opens this UDP port to ANY source so remote
 # peers can handshake (WG's crypto drops unauthenticated packets). Blank => WireGuard's default 51820.
-# Ignored in edge mode (the edge WG-server accept stays iface-scoped). Must match the ListenPort in
-# /etc/wireguard/<iface>.conf. M-A.
+# In edge mode the WG-server accept stays iface-scoped UNLESS wg_server_wan=yes (below). Must match
+# the ListenPort in /etc/wireguard/<iface>.conf. M-A.
 #wg_server_listen_port = 51820
+# EDGE opt-in (H17): make the inbound WG-server listen port reachable from the WAN — for a single-NIC
+# PUBLIC / host-firewall box a remote (e.g. CGNAT dial-only) peer must dial INTO over the public NIC.
+# Renders a WAN-scoped accept ABOVE the fail-closed WAN drop (port from wg_server_listen_port, def
+# 51820). no (default) keeps the normal iface-scoped edge behavior. Safe: WG crypto drops unauth pkts.
+#wg_server_wan = no
 # always-accept management IPs (comma-separated, user-entered)
 trusted_hosts = 10.0.1.50, 10.0.1.55
 # CDN / reverse-proxy edge ranges to NEVER firewall-ban (comma-separated IPs/CIDRs). If a vhost sits

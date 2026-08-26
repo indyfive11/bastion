@@ -233,6 +233,14 @@ SETTINGS: tuple[Setting, ...] = (
        "=> WireGuard's default 51820 when a wg_server_iface is set. Endpoint-only: on an edge box the "
        "WG-server accept stays iface-scoped and this field is ignored.",
        ADVANCED, _v_port, "a port 1–65535 (blank = 51820)", APPLY_GENERATE_FIREWALL, scope="endpoint"),
+    _S("network.wg_server_wan", "WG server WAN-reachable (edge)",
+       "Edge opt-in (H17): open the inbound WG-server listen port to WAN dial-ins, for a single-NIC "
+       "PUBLIC / host-firewall box a remote (e.g. CGNAT dial-only) peer must dial INTO over the public "
+       "NIC. Renders a WAN-iface-scoped accept ABOVE the fail-closed WAN drop; port from "
+       "wg_server_listen_port (default 51820). no (default) = the WG accept stays iface-scoped below "
+       "the drop (normal edge). Safe: WG crypto drops non-authenticated packets.",
+       ADVANCED, _v_choice("yes", "no"), "yes | no", APPLY_GENERATE_FIREWALL, choices=("yes", "no"),
+       scope="edge"),
     _S("ai.backend_cmd", "AI backend command", "Executable the analyzer shells out to.", ADVANCED,
        lambda v: bool(v.strip()), "a path to an executable", APPLY_GENERATE, layer_gate="l3"),
     _S("ai.model", "AI model", "Model id passed to the backend.", ADVANCED,

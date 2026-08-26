@@ -601,3 +601,47 @@ def test_generate_to_staged_root_never_daemon_reloads(tmp_path, monkeypatch):
     assert cli.cmd_generate(ns) == 0
     assert (tmp_path / "etc/systemd/system").exists()             # unit files WERE written under stage
     assert not any("daemon-reload" in a[0] for a in calls if a)   # ...but systemd was never reloaded
+
+
+def test_h17_edge_wg_wan_accept_helper():
+    # H17: [network] wg_server_wan=yes makes an edge box's inbound WG-server listen port reachable from
+    # WAN dial-ins (single-NIC public / host-firewall), as a WAN-iface-scoped accept. OFF by default,
+    # and — the must-fix — `no` renders "" (never a naive truthy check that fails OPEN on "no").
+    from bastion.templates import _edge_wg_wan_accept
+    E = {"machine": {"mode": "edge"},
+         "interfaces": {"wan": "eth1", "wg_server_iface": "wg0"}, "network": {}}
+    assert _edge_wg_wan_accept(E) == ""                                        # absent -> off
+    assert _edge_wg_wan_accept({**E, "network": {"wg_server_wan": "no"}}) == ""   # explicit no -> off
+    assert _edge_wg_wan_accept({**E, "network": {"wg_server_wan": "yes"}}) == \
+        'iifname "eth1" udp dport 51820 accept'                               # yes -> WAN-scoped
+    assert _edge_wg_wan_accept({**E, "network": {"wg_server_wan": "yes",
+        "wg_server_listen_port": "51999"}}) == 'iifname "eth1" udp dport 51999 accept'  # honors port
+    # fail-closed: no wg_server_iface, or no wan -> "" even with the opt-in on
+    assert _edge_wg_wan_accept({"machine": {"mode": "edge"}, "interfaces": {"wan": "eth1"},
+                                "network": {"wg_server_wan": "yes"}}) == ""
+    assert _edge_wg_wan_accept({"machine": {"mode": "edge"}, "interfaces": {"wg_server_iface": "wg0"},
+                                "network": {"wg_server_wan": "yes"}}) == ""
+    # endpoint mode: this edge-only key is inert (endpoint uses its own any-source accept, M-A)
+    assert _edge_wg_wan_accept({"machine": {"mode": "endpoint"},
+        "interfaces": {"wan": "eth1", "wg_server_iface": "wg0"},
+        "network": {"wg_server_wan": "yes"}}) == ""
+
+
+def test_h17_edge_wg_wan_accept_renders_above_fail_closed_drop():
+    # The opt-in accept MUST render above internal_iface_drop (else shadowed) and below the block-set
+    # drops (so a banned source still can't reach it); the full ruleset stays nft-valid; and it is
+    # ABSENT by default (zero change to existing edge boxes).
+    cfg = state.load_conf(EXAMPLE)                          # edge: wan eth1, wg_server_iface wg0
+    cfg["machine"] = dict(cfg["machine"]); cfg["machine"]["mode"] = "edge"
+    cfg["network"] = dict(cfg["network"]); cfg["network"]["wg_server_wan"] = "yes"
+    out = templates.render_file(TEMPLATES / "nftables-edge.nft", cfg)
+    assert templates.find_placeholders(out) == set()
+    accept = 'iifname "eth1" udp dport 51820 accept'
+    assert accept in out
+    assert out.index("@cs_block") < out.index(accept) < out.index("iifname != {"), \
+        "WG-WAN accept must sit below the ban-drops and above the fail-closed drop"
+    ran, ok, *err = _nft_check(out)
+    assert ok, f"H17 render failed nft -c: {err}"
+    # default-off: the stock example (no opt-in) renders no such WAN-scoped accept
+    base = templates.render_file(TEMPLATES / "nftables-edge.nft", state.load_conf(EXAMPLE))
+    assert 'iifname "eth1" udp dport 51820 accept' not in base

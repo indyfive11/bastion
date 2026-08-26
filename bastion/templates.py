@@ -150,6 +150,7 @@ def _derived(config: dict) -> dict:
     net["lan_ssh_accept"] = _lan_ssh_accept(config)
     net.update(_nonwan_iface_accepts(config))   # M3: iface-scoped ZT/WG control-port accepts
     net["wg_server_listen_accept"] = _endpoint_wg_server_accept(config)  # M-A: endpoint any-source WG accept
+    net["wg_server_wan_accept"] = _edge_wg_wan_accept(config)  # H17: edge opt-in WG-server WAN accept (above drop)
     net["watchdog_wg_ordering"] = _watchdog_wg_after(config)  # L33: blank-safe wg-quick After= tokens
     net["internal_iface_drop"] = _internal_iface_drop(config)  # M3b: fail-closed input WAN drop
     net["anti_spoof_rules"] = _anti_spoof_rules(config)   # M2b: gated forward-chain anti-spoof teeth
@@ -239,6 +240,43 @@ def _endpoint_wg_server_accept(config: dict) -> str:
         return ""
     port = str((config.get("network") or {}).get("wg_server_listen_port") or "").strip() or "51820"
     return f"udp dport {port} accept"
+
+
+def _edge_wg_wan_accept(config: dict) -> str:
+    """H17 facet: the EDGE opt-in that makes an inbound WireGuard server's listen port reachable from
+    the WAN — for a single-NIC PUBLIC / host-firewall box where a CGNAT dial-only peer must dial INTO
+    this box's WG listener over the public NIC.
+
+    The edge input chain's fail-closed WAN drop (:func:`_internal_iface_drop`, M3b) renders ABOVE the
+    normal iface-scoped ``wg_server_accept``, so a WAN dial-in to the WG port is dropped. When
+    ``[network] wg_server_wan = yes`` (default no), this renders a WAN-iface-scoped accept the edge
+    template places ABOVE that drop (but BELOW the block-set drops, so bans still apply).
+
+    Scoped to ``interfaces.wan`` — the NARROWEST shape that admits the dial-in without opening the port
+    on any other iface (a multi-NIC edge that opts in exposes it only on its uplink). Its only failure
+    mode under a mis-named WAN is 'peer can't connect' (loud), never silent exposure — so it does NOT
+    reintroduce the M3 fail-open hazard. Safe like the endpoint case: WG crypto drops any packet that
+    isn't a valid handshake from a configured peer, so an open UDP port exposes no surface beyond the
+    WG protocol.
+
+    OFF by default and fail-CLOSED: renders '' unless mode is edge AND ``wg_server_wan`` is explicitly
+    truthy AND both a ``wan`` and a ``wg_server_iface`` are set — never a bare fragment. Port from
+    ``[network] wg_server_listen_port`` (default 51820). (Endpoint mode keeps its own any-source accept,
+    :func:`_endpoint_wg_server_accept`, which needs no opt-in — it has no WAN drop to sit above.)"""
+    if str((config.get("machine") or {}).get("mode") or "").strip() != "edge":
+        return ""
+    net = config.get("network") or {}
+    # OFF by default; only an explicit truthy opens the port (NEVER "non-empty == true" — that would
+    # fail OPEN on `wg_server_wan = no`). configspec validates it to yes|no; the on-list is belt.
+    if str(net.get("wg_server_wan", "no")).strip().lower() not in ("yes", "true", "1", "on"):
+        return ""
+    ifaces = config.get("interfaces") or {}
+    wan = str(ifaces.get("wan") or "").strip()
+    wg_server = str(ifaces.get("wg_server_iface") or "").strip()
+    if not wan or not wg_server:
+        return ""
+    port = str(net.get("wg_server_listen_port") or "").strip() or "51820"
+    return f'iifname "{wan}" udp dport {port} accept'
 
 
 def _internal_iface_drop(config: dict) -> str:

@@ -57,6 +57,12 @@ table inet edge {
         ip6 saddr @ai_tarpit6 ct state new limit rate over 2/minute burst 5 packets drop
 
         iifname "{{ interfaces.wan }}" jump wan_in
+        # H17 opt-in ([network] wg_server_wan=yes): make an inbound WG-server listen port reachable
+        # from the WAN — for a single-NIC PUBLIC / host-firewall box a CGNAT dial-only peer dials INTO.
+        # Rendered ABOVE the fail-closed drop below (else it'd be shadowed) but BELOW the block-set
+        # drops above (so a banned source still can't reach it). Blank unless the opt-in is set. WG
+        # crypto makes an open UDP port safe. See templates._edge_wg_wan_accept.
+        {{ network.wg_server_wan_accept }}
         # Fail-CLOSED WAN drop (M3b): drop everything NOT on one of the box's own internal ifaces,
         # rather than only the named WAN. A mis-detected/renamed WAN can no longer expose the
         # any-source accepts below (service_ports/zones) to the internet. Falls back to the literal
