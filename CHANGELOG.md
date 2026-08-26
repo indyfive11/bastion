@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.24] - 2026-08-26
+
+Lets a single-NIC PUBLIC / host-firewall edge box accept inbound WireGuard dial-ins on its public NIC —
+the shape a remote CGNAT dial-only peer must reach. Surfaced by the dfw↔ES mesh leg during live fleet work.
+
+### Added
+- **`[network] wg_server_wan` (edge opt-in, default `no`).** When `yes`, the edge firewall opens the
+  inbound WG-server listen port (`wg_server_listen_port`, default 51820) to WAN dial-ins by rendering a
+  WAN-interface-scoped accept **above** the fail-closed WAN drop (and below the block-set drops, so a
+  banned source still cannot reach it). Off by default — zero change to existing edge boxes — and
+  fail-closed: the accept renders only in edge mode with an explicit `yes` and both a `wan` and a
+  `wg_server_iface` set, so `wg_server_wan = no` never opens the port. Safe like the endpoint case:
+  WireGuard's crypto drops any packet that isn't a valid handshake from a configured peer. For a normal
+  multi-NIC router leave it `no` (the WG accept stays interface-scoped below the drop).
+
 ## [1.5.23] - 2026-08-26
 
 Alarm-path hardening for the L6 notifier (`notify-alert`), surfaced by live dogfood as SLC + ES brought
