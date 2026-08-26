@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.23] - 2026-08-26
+
+Alarm-path hardening for the L6 notifier (`notify-alert`), surfaced by live dogfood as SLC + ES brought
+their ntfy paths online. Makes a phone page trustworthy: a delivery that never sent is now recorded, an
+alert carries its severity (so a smoke test is distinguishable from a real fire), and a shared ntfy topic
+tells you which box paged — all while preserving the `exit 0` contract and the no-arch-leak boundary.
+
+### Added
+- **Severity dimension.** `NOTIFY_SEVERITY` — a strict allowlist {info, warning, critical, test} (default
+  warning) mapped to the ntfy Priority header (test=low … critical=urgent). `test` renders an unmistakable
+  external template. An unknown or crafted value falls to warning, so only an allowlisted label ever crosses
+  to an external sink. `NOTIFY_DRYRUN=1` prints exactly what would be sent and sends nothing (phone-free test).
+- **Per-box opaque site tag.** `ALERT_SITE_TAG` — an operator-set persona codename (never a hostname, role,
+  or topology fact) injected into the external alert title only (`Service alert [tag] — <severity>`); empty
+  or unset preserves the legacy untagged title. Prompted by `bastion setup` and documented in the annotated
+  conf example, so it survives `bastion layer install l6`/regeneration.
+
+### Fixed
+- **`notify-alert` no longer swallows a delivery failure.** The external sinks (internal ntfy, public ntfy,
+  email) ended `>/dev/null 2>&1 || true`, so a page that never sent (DNS down, endpoint unreachable, topic or
+  recipient rejected) was indistinguishable from one that did. Each sink now records a distinct on-box journal
+  line `SINK <label> FAILED rc=N`; the `exit 0` contract is kept (the record is fixed, not the exit code).
+- **`notify-alert` distinguishes an unreadable config from an absent one.** A conf that exists but is
+  unreadable (mode 600 sourced by a non-root caller) silently left every sink unset — journal-only, paging
+  nothing. It now emits a loud journal line, distinct from the deliberate no-op when no conf exists.
+
 ## [1.5.22] - 2026-08-25
 
 Update-path hardening, surfaced by live dogfood post-mortems on two boxes (ES + SLC). Adds a generate-safe
