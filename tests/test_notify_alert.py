@@ -98,3 +98,68 @@ def test_f2_absent_conf_stays_a_silent_noop(tmp_path):
     proc = _run(_script_copy(tmp_path, conf), tmp_path / "log")
     assert proc.returncode == 0, proc.stderr
     assert "unreadable" not in (tmp_path / "log").read_text()
+
+
+# --- severity (Popper) + opaque site tag (Hobbes), via the phone-free DRYRUN stdout surface ---
+
+def _dryrun(tmp_path, env_extra=None, conf_text=None):
+    conf = tmp_path / "conf"
+    if conf_text is not None:
+        conf.write_text(conf_text)
+    env = {"NOTIFY_DRYRUN": "1"}
+    if env_extra:
+        env.update(env_extra)
+    return _run(_script_copy(tmp_path, conf), tmp_path / "log", env)
+
+
+@pytest.mark.parametrize("sev,ext,prio", [
+    ("test", "TEST", "low"),
+    ("info", "info", "default"),
+    ("warning", "warning", "high"),
+    ("critical", "critical", "urgent"),
+])
+def test_severity_maps_to_external_label_and_priority(tmp_path, sev, ext, prio):
+    proc = _dryrun(tmp_path, {"NOTIFY_SEVERITY": sev})
+    assert proc.returncode == 0, proc.stderr
+    assert f"SEV={sev}" in proc.stdout
+    assert f"PRIO={prio}" in proc.stdout
+    assert f"— {ext}" in proc.stdout                   # external title carries the allowlisted label
+
+
+def test_severity_default_is_warning(tmp_path):
+    proc = _dryrun(tmp_path)                            # no NOTIFY_SEVERITY
+    assert "SEV=warning" in proc.stdout
+    assert "PRIO=high" in proc.stdout
+
+
+def test_severity_unknown_falls_to_warning_and_does_not_leak(tmp_path):
+    # a crafted severity carrying topology must NEVER reach the external template
+    leak = "CRITICAL host=slc.example.test /srv/liberty-data"
+    proc = _dryrun(tmp_path, {"NOTIFY_SEVERITY": leak})
+    assert proc.returncode == 0, proc.stderr
+    assert "SEV=warning" in proc.stdout                 # fell to warning
+    assert "EXT_TITLE=Service alert — warning" in proc.stdout
+    assert "slc.example.test" not in proc.stdout        # no caller bytes crossed to external
+    assert "/srv/liberty-data" not in proc.stdout
+
+
+def test_dryrun_sends_nothing_and_exits_0(tmp_path):
+    # a topic is set + curl would FAIL, but DRYRUN must short-circuit before any sink runs
+    proc = _dryrun(tmp_path, {"NOTIFY_SEVERITY": "critical", "CURL_RC": "6"},
+                   conf_text="NTFY_TOPIC=t\n")
+    assert proc.returncode == 0, proc.stderr
+    assert "EXT_TITLE=" in proc.stdout
+    assert "FAILED" not in (tmp_path / "log").read_text()   # no sink attempted -> no failure record
+
+
+def test_site_tag_appears_in_external_title(tmp_path):
+    proc = _dryrun(tmp_path, {"NOTIFY_SEVERITY": "critical"},
+                   conf_text='ALERT_SITE_TAG="Hobbes"\n')
+    assert proc.returncode == 0, proc.stderr
+    assert "EXT_TITLE=Service alert [Hobbes] — critical" in proc.stdout
+
+
+def test_no_site_tag_is_legacy_untagged_title(tmp_path):
+    proc = _dryrun(tmp_path, {"NOTIFY_SEVERITY": "warning"})   # no ALERT_SITE_TAG
+    title_line = proc.stdout.split("EXT_TITLE=", 1)[1].splitlines()[0]
+    assert title_line == "Service alert — warning"             # no bracket, legacy shape

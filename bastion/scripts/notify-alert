@@ -28,6 +28,18 @@ fi
 HOST="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
 NOW="$(date '+%FT%T %Z')"
 
+# --- SEVERITY (crosses to EXTERNAL sinks — STRICT ALLOWLIST, never caller free-text) -----
+# One case sets the internal word + the external label + the ntfy priority together, so the
+# allowlists can never drift and SEV/EXT_SEV/PRIO are ALWAYS set (keeps `exit 0` under set -u).
+# An unknown/crafted NOTIFY_SEVERITY falls to warning — an attacker's bytes never reach EXT_SEV,
+# which is the only severity value that crosses to an external sink.
+case "${NOTIFY_SEVERITY:-warning}" in
+  test)      SEV=test;     EXT_SEV="TEST";     PRIO=low     ;;
+  info)      SEV=info;     EXT_SEV="info";     PRIO=default ;;
+  critical)  SEV=critical; EXT_SEV="critical"; PRIO=urgent  ;;
+  warning|*) SEV=warning;  EXT_SEV="warning";  PRIO=high    ;;
+esac
+
 # --- DETAILED message (internal-only) -----------------------------------
 if [ "$#" -ge 1 ] && [ -n "${1:-}" ]; then
   D_TITLE="$1"
@@ -40,13 +52,30 @@ else
   D_BODY="(no message body)"
 fi
 DETAIL="host: ${HOST}
+severity: ${SEV}
 time: ${NOW}
 
 ${D_BODY}"
 
 # --- EXTERNAL template (degraded-only — NO architectural detail) ---------
-EXT_TITLE="Service alert — degraded"
-EXT_BODY="Time: ${NOW}. Status: degraded. Action: see runbook for recovery."
+# Opaque per-box site tag: ALERT_SITE_TAG is an operator-set persona codename (NOT a hostname,
+# role, or topology fact) sourced from the conf. Empty/unset => omitted => legacy title. It enters
+# ONLY the external title; the journal + internal sinks already carry ${HOST}, untouched.
+EXT_ID="${ALERT_SITE_TAG:+[${ALERT_SITE_TAG}] }"
+if [ "$SEV" = test ]; then
+  EXT_TITLE="Service alert ${EXT_ID}— TEST"
+  EXT_BODY="Time: ${NOW}. Severity: TEST (drill/smoke — no action needed)."
+else
+  EXT_TITLE="Service alert ${EXT_ID}— ${EXT_SEV}"
+  EXT_BODY="Time: ${NOW}. Severity: ${EXT_SEV}. Status: degraded. Action: see runbook for recovery."
+fi
+
+# DRYRUN: print exactly what WOULD be sent externally and send nothing — phone-free RED/GREEN
+# (used to verify severity mapping + the leak-guard without paging anyone).
+if [ -n "${NOTIFY_DRYRUN:-}" ]; then
+  printf 'SEV=%s\nPRIO=%s\nEXT_TITLE=%s\nEXT_BODY=%s\n' "$SEV" "$PRIO" "$EXT_TITLE" "$EXT_BODY"
+  exit 0
+fi
 
 # Record a DELIVERY failure for one sink in the on-box journal (full detail permitted on-box).
 # A page that never sent (DNS down, endpoint unreachable, topic/recipient rejected) must not be
@@ -69,7 +98,7 @@ if [ -n "${INTERNAL_NTFY_URL:-}" ]; then
   curl -fsS --max-time 15 \
     ${INTERNAL_NTFY_AUTH:+-H "Authorization: ${INTERNAL_NTFY_AUTH}"} \
     -H "Title: ${D_TITLE}" \
-    -H "Priority: high" \
+    -H "Priority: ${PRIO}" \
     -H "Tags: warning,floppy_disk" \
     -d "${DETAIL}" \
     "${INTERNAL_NTFY_URL}" >/dev/null 2>&1; rc=$?
@@ -80,7 +109,7 @@ fi
 if [ -n "${NTFY_TOPIC:-}" ]; then
   curl -fsS --max-time 15 \
     -H "Title: ${EXT_TITLE}" \
-    -H "Priority: high" \
+    -H "Priority: ${PRIO}" \
     -H "Tags: warning" \
     -d "${EXT_BODY}" \
     "${NTFY_SERVER:-https://ntfy.sh}/${NTFY_TOPIC}" >/dev/null 2>&1; rc=$?

@@ -32,6 +32,9 @@ class Field:
 
 # Prompt order mirrors the annotated example. NTFY_SERVER is only asked when a topic is set.
 FIELDS: tuple[Field, ...] = (
+    Field("ALERT_SITE_TAG",
+          "Opaque site tag for external alerts — a persona codename so you can tell which box "
+          "paged (NOT a hostname/role/topology; blank = untagged)", "", False),
     Field("NTFY_TOPIC", "Public ntfy topic (degraded-only alerts; blank = disable ntfy)", "", False),
     Field("NTFY_SERVER", "ntfy server", "https://ntfy.sh", False),
     Field("ALERT_EMAIL", "Alert email (degraded-only; blank = disable email)", "", False),

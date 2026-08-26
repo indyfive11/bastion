@@ -7,6 +7,13 @@
 #   see runbook" template. Full detail (host, device, unit, status) goes ONLY to the local
 #   journal and the INTERNAL_NTFY channel, which must live on an operator-controlled network.
 
+# --- OPAQUE site tag (external title only) ------------------------------
+# A persona codename so a shared ntfy topic tells you WHICH box paged (e.g. "[Popper] — critical").
+# HARD RULE: opaque handle ONLY — NEVER a hostname, role, region, or any topology fact. An
+# eavesdropper must learn only "a node named <tag> is degraded", nothing architectural. Empty =
+# untagged (exactly today's behavior). Enters only the external title; journal/internal carry the host.
+ALERT_SITE_TAG=""             # e.g. a fleet persona handle; empty disables the tag
+
 # --- EXTERNAL: public ntfy push (degraded-only template) ---------------
 # Keep the topic private — treat it like a capability URL.
 NTFY_SERVER="https://ntfy.sh"
