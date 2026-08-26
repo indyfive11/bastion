@@ -13,7 +13,17 @@
 set -u
 
 CONF=/etc/bastion/notify-alert.conf
-[ -r "$CONF" ] && . "$CONF"
+if [ -r "$CONF" ]; then
+  . "$CONF"
+elif [ -e "$CONF" ]; then
+  # Conf present but UNREADABLE (e.g. mode 600 sourced by a non-root caller — exactly how
+  # popper-boot.sh invokes this for its "box is DOWN" page). Sinks then stay unset and we page
+  # nothing, silently. That is a DIFFERENT failure from "no conf at all" (a deliberate no-op),
+  # so make it LOUD in the on-box journal instead of collapsing both into the same quiet branch.
+  command -v logger >/dev/null 2>&1 && \
+    logger -t notify-alert -p daemon.err \
+      "notify-alert: CONF $CONF exists but is unreadable by uid $(id -u) — sinks unconfigured, journal-only"
+fi
 
 HOST="$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)"
 NOW="$(date '+%FT%T %Z')"
@@ -38,6 +48,15 @@ ${D_BODY}"
 EXT_TITLE="Service alert — degraded"
 EXT_BODY="Time: ${NOW}. Status: degraded. Action: see runbook for recovery."
 
+# Record a DELIVERY failure for one sink in the on-box journal (full detail permitted on-box).
+# A page that never sent (DNS down, endpoint unreachable, topic/recipient rejected) must not be
+# indistinguishable from one that did. This fixes the RECORD only — the script still exits 0 so a
+# notifier hiccup never cascades. Never touches an external sink, so no arch detail leaves the box.
+_sink_fail() {  # $1=sink label  $2=rc
+  command -v logger >/dev/null 2>&1 && \
+    logger -t notify-alert -p daemon.err "notify-alert: SINK $1 FAILED rc=$2"
+}
+
 # 1) Local journal — always, full detail (never leaves the box).
 if command -v logger >/dev/null 2>&1; then
   printf '%s\n%s\n' "${D_TITLE}" "${DETAIL}" \
@@ -53,7 +72,8 @@ if [ -n "${INTERNAL_NTFY_URL:-}" ]; then
     -H "Priority: high" \
     -H "Tags: warning,floppy_disk" \
     -d "${DETAIL}" \
-    "${INTERNAL_NTFY_URL}" >/dev/null 2>&1 || true
+    "${INTERNAL_NTFY_URL}" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && _sink_fail internal-ntfy "$rc"
 fi
 
 # 3) Public ntfy — EXTERNAL: degraded-only template ONLY.
@@ -63,12 +83,14 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
     -H "Priority: high" \
     -H "Tags: warning" \
     -d "${EXT_BODY}" \
-    "${NTFY_SERVER:-https://ntfy.sh}/${NTFY_TOPIC}" >/dev/null 2>&1 || true
+    "${NTFY_SERVER:-https://ntfy.sh}/${NTFY_TOPIC}" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && _sink_fail ntfy "$rc"
 fi
 
 # 4) External email — EXTERNAL: degraded-only template ONLY.
 if [ -n "${ALERT_EMAIL:-}" ] && command -v mail >/dev/null 2>&1; then
-  printf '%s\n' "${EXT_BODY}" | mail -s "${EXT_TITLE}" "${ALERT_EMAIL}" >/dev/null 2>&1 || true
+  printf '%s\n' "${EXT_BODY}" | mail -s "${EXT_TITLE}" "${ALERT_EMAIL}" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && _sink_fail mail "$rc"
 fi
 
 exit 0
