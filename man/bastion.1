@@ -1,4 +1,4 @@
-.TH BASTION 1 "" "bastion 1.5.19" "Bastion Manual"
+.TH BASTION 1 "" "bastion 1.5.25" "Bastion Manual"
 .SH NAME
 bastion \- modular, layered Linux firewall framework
 .SH SYNOPSIS
@@ -445,6 +445,22 @@ path to machine.conf
 .TP
 \fB\-\-root ROOT\fR
 operate under this base dir instead of /
+.SS upgrade
+redeploy drifted /usr/local/sbin scripts from the installed package (run after `pacman \-U`/wheel upgrade; fixes silent\-stale sbin)
+.PP
+\fBbastion upgrade\fR [options]
+.TP
+\fB\-\-check\fR
+report which scripts would be redeployed; write nothing (exit 1 if any drift)
+.TP
+\fB\-\-conf CONF\fR
+path to machine.conf
+.TP
+\fB\-\-templates TEMPLATES\fR
+path to templates/ dir
+.TP
+\fB\-\-root ROOT\fR
+operate under this base dir instead of / (testing/staging)
 .SS migrate
 carry an older machine.conf forward to the current schema
 .PP

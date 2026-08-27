@@ -1108,6 +1108,77 @@ def cmd_update(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    """Redeploy the operational scripts (/usr/local/sbin) from the installed package, for every
+    script whose deployed copy has drifted from — or is missing vs — the package copy.
+
+    Closes the H13 'silent-stale sbin' gap: a bare `pacman -U`/wheel upgrade refreshes the package
+    data but leaves the DEPLOYED root copies untouched, so security code (the reconciler's decision
+    filter, the kill switch) keeps running the OLD bytes while `bastion --version` reads new. The
+    surgical fix — per-script `install_script` (atomic temp+chmod+replace) — is what the expert
+    `bastion layer install <owning-layer>` does, minus the rest of that layer's install(): NO
+    firewall reload, NO nft render, NO service re-enable. It never writes nft (reconciler stays the
+    sole writer) and is strictly safer than a full re-install.
+
+    SCOPE: package-static sbin scripts ONLY. Rendered config + systemd units come from machine.conf
+    via `bastion generate` (which auto-reloads systemd); this verb DETECTS that drift and points at
+    generate but never runs it (generate can clobber hand-added allowlist entries). Logrotate
+    drop-ins are refreshed only by a full `bastion layer install`. `--check` reports what would be
+    redeployed and touches nothing. Exit 0 ⇒ sbin verified current; 1 ⇒ drift found/remaining or a
+    check could not be completed."""
+    ctx = build_context(args)
+    sys_ = ctx.system
+    check = getattr(args, "check", False)
+    if not check and not _require_root(sys_, "bastion upgrade"):
+        return 1
+
+    drift, problems = _artifact_drift_scan(ctx)
+    for p in problems:                      # F4: undeterminable is loud, never silent-"clean".
+        print(f"  [WARN] could not check {p}", file=sys.stderr)
+
+    rc = 0
+    if not drift:
+        if problems:
+            print("bastion upgrade: no drift found in the layers that COULD be checked "
+                  "(see warnings above — some could not be determined).")
+            rc = 1
+        else:
+            print("bastion upgrade: all installed-layer scripts match the package — "
+                  "nothing to redeploy.")
+    else:
+        print(f"bastion upgrade: {'would redeploy' if check else 'redeploying'} "
+              f"{len(drift)} script(s):")
+        for script, status, layer in drift:
+            tag = "" if check else " — done"
+            print(f"  {script} ({status}) [{layer.name}]{tag}")
+            if not check:
+                layer.install_script(ctx, script)
+        if check:
+            rc = 1                          # drift present ⇒ action needed (hook/CI signal).
+        else:
+            # Verify the EFFECT, don't trust that install_script "ran" (distrust-your-negatives).
+            remaining, _ = _artifact_drift_scan(ctx)
+            if remaining:
+                print(f"bastion upgrade: WARNING — {len(remaining)} script(s) STILL drifted after "
+                      f"redeploy: {', '.join(s for s, _, _ in remaining)}", file=sys.stderr)
+                rc = 1
+            else:
+                print(f"bastion upgrade: {len(drift)} script(s) redeployed; "
+                      f"sbin now matches the package.")
+
+    # F3: never let the operator read this as full currency while rendered config/units still
+    # differ — surface that drift and point at generate (which owns + reloads them).
+    try:
+        cdrift, _n = _drift_report(ctx, find_templates_dir(getattr(args, "templates", None)))
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"  [WARN] could not check config/unit drift ({exc})", file=sys.stderr)
+    else:
+        if cdrift:
+            print(f"bastion upgrade: NOTE — {len(cdrift)} rendered config/unit file(s) also differ "
+                  f"from machine.conf — run `bastion generate` to refresh them (it reloads systemd).")
+    return rc
+
+
 # --- B3: drift detection. Compare each active-layer managed config (and machine.env) to what
 #     `bastion generate` would produce right now, so hand-edits / stale files / a failed reload
 #     surface instead of silently diverging from machine.conf. ---
@@ -1144,33 +1215,49 @@ def _drift_report(ctx: Context, templates_dir: Path) -> tuple[list[tuple[str, st
     return drift, n_ok
 
 
-def _artifact_drift(ctx: Context) -> list[tuple[str, str]]:
-    """Installed operational scripts (/usr/local/sbin) that differ from — or are missing vs — the
-    package's shipped copy, for each INSTALLED layer (F6). This is the 'upgraded the wheel but never
-    re-ran `bastion layer install`, so the live sbin scripts/units are stale' gap: the package data
-    moved but the deployed copies didn't. Returns [(script, 'STALE'|'MISSING')]."""
-    out: list[tuple[str, str]] = []
-    try:
-        scripts_dir = find_scripts_dir(None)
-    except Exception:                                    # noqa: BLE001
-        return out
+def _artifact_drift_scan(ctx: Context):
+    """The shared oracle behind `doctor`'s artifact-drift row and `bastion upgrade`. Returns
+    ``(drift, problems)``:
+      drift    = [(script, 'STALE'|'MISSING', layer)] — deployed sbin copy differs from / is
+                 missing vs the package copy, for each INSTALLED layer.
+      problems = human strings for things that could NOT be determined (a layer whose status()
+                 threw, a package copy that isn't on disk). Distrust-your-negatives: an empty
+                 drift list is only "clean" when problems is ALSO empty — a swallowed error must
+                 never read as "nothing to redeploy".
+
+    Sources its "new" bytes from ``ctx.scripts_dir`` — the SAME path `Layer.install_script` deploys
+    FROM — so the redeployer and the drift check can never disagree about which package copy is
+    canonical (they would under a `--scripts` override that only one side honored)."""
+    drift: list[tuple[str, str, object]] = []
+    problems: list[str] = []
+    scripts_dir = ctx.scripts_dir
     sys_ = ctx.system
     for layer in layermod.all_layers():
         try:
-            if not layer.status(ctx).installed:
-                continue
-        except Exception:                                # noqa: BLE001
+            installed = layer.status(ctx).installed
+        except Exception as exc:                         # noqa: BLE001
+            problems.append(f"{getattr(layer, 'name', '?')}: status check failed ({exc})")
+            continue
+        if not installed:
             continue
         for script in getattr(layer, "scripts", ()):
             src = scripts_dir / script
             if not src.is_file():
+                problems.append(f"{script}: package copy not found at {src}")
                 continue
             dst = sys_.path(f"{ctx.sbin_dir}/{script}")
             if not dst.exists():
-                out.append((script, "MISSING"))
+                drift.append((script, "MISSING", layer))
             elif dst.read_bytes() != src.read_bytes():
-                out.append((script, "STALE"))
-    return out
+                drift.append((script, "STALE", layer))
+    return drift, problems
+
+
+def _artifact_drift(ctx: Context) -> list[tuple[str, str]]:
+    """Doctor's view of the drift oracle: [(script, 'STALE'|'MISSING')] only (undeterminable cases
+    are surfaced by `bastion upgrade`, not doctor's one-line row). See `_artifact_drift_scan`."""
+    drift, _problems = _artifact_drift_scan(ctx)
+    return [(script, status) for script, status, _layer in drift]
 
 
 # H6 — live-kernel-vs-rendered-file staleness detection.
@@ -1424,7 +1511,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if stale:
             shown = ", ".join(f"{n} ({s})" for n, s in stale[:6])
             add("WARN", "artifact drift", f"{len(stale)} installed script(s) differ from the package "
-                f"— re-run `bastion layer install` after an upgrade ({shown})")
+                f"— run `bastion upgrade` to redeploy them ({shown})")
         else:
             add("OK", "artifact drift", "installed scripts match the package")
 
@@ -1807,6 +1894,15 @@ def build_parser() -> argparse.ArgumentParser:
     upd.add_argument("--conf", help="path to machine.conf")
     upd.add_argument("--root", help="operate under this base dir instead of /")
     upd.set_defaults(func=cmd_update)
+
+    upg = sub.add_parser("upgrade", help="redeploy drifted /usr/local/sbin scripts from the "
+                         "installed package (run after `pacman -U`/wheel upgrade; fixes silent-stale sbin)")
+    upg.add_argument("--check", action="store_true",
+                     help="report which scripts would be redeployed; write nothing (exit 1 if any drift)")
+    upg.add_argument("--conf", help="path to machine.conf")
+    upg.add_argument("--templates", help="path to templates/ dir")
+    upg.add_argument("--root", help="operate under this base dir instead of / (testing/staging)")
+    upg.set_defaults(func=cmd_upgrade)
 
     mig = sub.add_parser("migrate", help="carry an older machine.conf forward to the current schema")
     mig.add_argument("--check", action="store_true", help="report if a migration is due; don't write")
