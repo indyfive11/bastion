@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.25] - 2026-08-26
+
+Closes the H13 "silent-stale sbin" gap surfaced by the SLC/ES upgrade post-mortems: a `pacman -U` (or any
+wheel upgrade) refreshes the package but leaves the DEPLOYED `/usr/local/sbin` scripts untouched, so
+security code (the reconciler's decision filter, the kill switch) keeps running the OLD bytes while
+`bastion --version` reads new. Until now the fix was the expert-only `bastion layer install <owning-layer>`.
+
+### Added
+- **`bastion upgrade [--check]`.** Redeploys every operational script whose deployed `/usr/local/sbin` copy
+  has drifted from — or is missing vs — the installed package copy, per-script via the atomic
+  `install_script` primitive. **No firewall reload, no nft render, no service re-enable** — it never writes
+  nft (the reconciler stays the sole writer) and is strictly safer than a full `layer install`. After
+  redeploying it re-checks that the drift is actually gone (verifies the effect, not just that it ran), and
+  it surfaces any remaining rendered config/unit drift with a pointer to `bastion generate` — so a green
+  result never falsely implies full currency. `--check` reports what would be redeployed and writes nothing.
+  Exit `0` = sbin verified current; `1` = drift found/remaining, or a check could not be completed (an
+  undeterminable layer WARNs loudly rather than reading as "clean"). Scope: package-static sbin scripts only
+  — rendered config + systemd units come from `bastion generate`; logrotate drop-ins are refreshed by a full
+  `layer install`.
+- **`bastion doctor`** artifact-drift hint now points at `bastion upgrade` (the one-shot fix) instead of the
+  per-layer `layer install` trick.
+
 ## [1.5.24] - 2026-08-26
 
 Lets a single-NIC PUBLIC / host-firewall edge box accept inbound WireGuard dial-ins on its public NIC —
