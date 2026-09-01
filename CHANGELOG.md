@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.26] - 2026-09-01
+
+Fixes two related firewall-apply defects surfaced on a live box (dfw) during a failover drill: `bastion allow
+<ip>/32` failed deep in `nft -c`, and — more dangerously — a *failed* apply had already written `machine.conf`,
+leaving config claiming a rule the live firewall never enforced (silent config-vs-live drift).
+
+### Fixed
+- **`bastion allow <ip>/CIDR` (even a `/32`) no longer fails to apply (H23).** The `trusted_hosts` /
+  `trusted_hosts6` nft sets were declared without `flags interval`, so any prefix element was rejected by
+  `nft -c` — although the config validator already accepts an IP *or* CIDR. The sets now carry `flags
+  interval` + `auto-merge`, so a `/32`, a CIDR, and an overlapping IP+CIDR (a trusted mesh `/24` plus a
+  specific peer inside it) all apply cleanly. (Cosmetic: a live `nft list set` may show auto-merged ranges;
+  `machine.conf` remains the source of truth and add/remove operate on it.)
+- **A failed apply no longer leaves `machine.conf` ahead of the live firewall (H24).** `apply_change` now
+  renders the staged config through `generate --check` (the same `nft -c` gate the reload would hit) *before*
+  persisting `machine.conf`; if it would fail, the change is refused and nothing is written — config stays
+  equal to the live ruleset on any apply failure, not just the H23 case. Stored-only (`APPLY_NONE`) keys skip
+  the pre-check.
+
 ## [1.5.25] - 2026-08-26
 
 Closes the H13 "silent-stale sbin" gap surfaced by the SLC/ES upgrade post-mortems: a `pacman -U` (or any
