@@ -92,3 +92,50 @@ def test_list_helpers():
     assert cfg.list_add("10.0.0.1", "10.0.0.1", ",") == "10.0.0.1"      # idempotent
     assert cfg.list_remove("10.0.0.1, 10.0.0.2", "10.0.0.1", ",") == "10.0.0.2"
     assert cfg.list_add("https://a", "https://b", " ") == "https://a https://b"
+
+
+def test_h24_failed_render_leaves_conf_unchanged(tmp_path, monkeypatch):
+    # H24: apply_change must NOT persist machine.conf when the staged render would fail — a failed
+    # apply must leave config == live, never a silent half-applied drift. Simulate ANY render/nft -c
+    # failure via the pre-check's generate --check and assert the conf on disk is untouched.
+    from bastion import cli
+    conf = tmp_path / "machine.conf"
+    state.write_conf(state.load_conf(EXAMPLE), conf)
+    before = conf.read_text()
+    monkeypatch.setattr(cli, "cmd_generate", lambda args: 1)
+    res = cfg.apply_change("network.trusted_hosts", "10.9.9.9", conf=str(conf),
+                           assume_yes=True, out=lambda *a: None)
+    assert res.rc == 1
+    assert res.wrote is False
+    assert conf.read_text() == before          # not written — no config-vs-live drift
+
+
+def test_h24_successful_render_writes(tmp_path, monkeypatch):
+    # H24 positive: a clean staged render lets the change persist and apply as before.
+    from bastion import cli
+    conf = tmp_path / "machine.conf"
+    state.write_conf(state.load_conf(EXAMPLE), conf)
+    monkeypatch.setattr(cli, "cmd_generate", lambda args: 0)   # pre-check + _run_apply both clean
+    res = cfg.apply_change("network.trusted_hosts", "10.9.9.9", conf=str(conf), root=str(tmp_path),
+                           assume_yes=True, out=lambda *a: None)
+    assert res.rc == 0 and res.wrote is True
+    assert "10.9.9.9" in state.load_conf(conf).get("network", {}).get("trusted_hosts", "")
+
+
+def test_h24_apply_none_key_skips_precheck(tmp_path, monkeypatch):
+    # H24 refinement: an APPLY_NONE (stored-only) key must NOT be gated by the render pre-check —
+    # an unrelated latent render problem must not false-refuse an inert config write. Monkeypatch
+    # generate to FAIL and assert it is never called for an APPLY_NONE key (which still persists).
+    from bastion import cli
+    conf = tmp_path / "machine.conf"
+    state.write_conf(state.load_conf(EXAMPLE), conf)     # example has l3 active
+    calls = []
+
+    def _boom(args):
+        calls.append(1)
+        return 1
+    monkeypatch.setattr(cli, "cmd_generate", _boom)
+    res = cfg.apply_change("ai.expert_canary_seconds", "5", conf=str(conf), root=str(tmp_path),
+                           advanced=True, assume_yes=True, out=lambda *a: None)
+    assert res.rc == 0 and res.wrote is True
+    assert calls == []                          # pre-check skipped for APPLY_NONE

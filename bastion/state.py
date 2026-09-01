@@ -283,7 +283,8 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
     # source network (restrict a network to one NIC). An optional `to <dest>` (IP/CIDR) pins the
     # destination; action ∈ {all, service_ports-style port list}. The general source->action
     # input-accept primitive — rendered inline (templates._render_zones), so a CIDR source needs no
-    # named set (sidesteps the trusted_hosts `flags interval` bug). Malformed entries block generate.
+    # named set (renders inline, so it needs no named set; trusted_hosts itself now carries
+    # `flags interval`, H23). Malformed entries block generate.
     for name, raw in (config.get("zones") or {}).items():
         src_raw, sep, act_raw = str(raw).partition("->")
         source, action = src_raw.strip(), act_raw.strip()

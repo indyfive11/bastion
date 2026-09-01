@@ -414,6 +414,19 @@ def apply_change(key: str, value: str, *, conf: str | None = None, root: str | N
         out(f"    bastion config set {key} {value} --advanced")
         return ConfigChangeResult(key, old, new, rc=1)
 
+    # H24: ATOMIC APPLY — never leave machine.conf ahead of the live firewall. Before persisting,
+    # render the STAGED config through `generate --check` (same `nft -c` gate `_run_apply` will hit)
+    # against a throwaway temp conf, writing nothing. If it would fail, refuse WITHOUT writing — so
+    # config == live on ANY apply failure (not just the H23 trusted_hosts CIDR case that surfaced it).
+    # Skipped for APPLY_NONE (stored-only keys), mirroring _run_apply's own guard, else an unrelated
+    # latent render problem in some other active template could false-refuse an inert config-only key.
+    if setting.apply != APPLY_NONE:
+        pre_rc = _staged_render_check(cli, staged)
+        if pre_rc != 0:
+            out("  refused — the change would produce an invalid config/ruleset (see the generate "
+                "error above); machine.conf NOT written, firewall NOT reloaded (config == live).")
+            return ConfigChangeResult(key, old, new, rc=1)
+
     state.write_conf(staged, conf_path)
     out(f"  wrote {conf_path}")
     res = ConfigChangeResult(key, old, new, rc=0, wrote=True)
@@ -422,6 +435,30 @@ def apply_change(key: str, value: str, *, conf: str | None = None, root: str | N
     res.rc = rc
     out("  done" if rc == 0 else f"  apply step returned rc={rc}")
     return res
+
+
+def _staged_render_check(cli, staged: dict) -> int:
+    """H24: render `staged` through `generate --check` (which runs placeholder resolution + the same
+    `nft -c` syntax check `_run_apply` would hit) via a throwaway temp conf, writing nothing but the
+    temp file. Returns generate's rc (0 = the change would apply cleanly). The temp conf lives in the
+    SYSTEM tempdir — NEVER under the repo tree, which the leak-check walks — and is always removed.
+    generate's own error goes to stderr (so the operator sees the real reason); its success line goes
+    to stdout and is swallowed here (it names the temp path and would only confuse)."""
+    import contextlib
+    import io
+    import os
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="bastion-precheck-", suffix=".conf")
+    os.close(fd)
+    try:
+        state.write_conf(staged, Path(tmp))
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cli.cmd_generate(argparse.Namespace(conf=tmp, templates=None, out=None, check=True))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def apply_firewall_change(conf_path: Path, root: str | None, *, out=print) -> int:

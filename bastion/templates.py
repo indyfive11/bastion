@@ -109,7 +109,13 @@ def _derived(config: dict) -> dict:
       a load error). Each is ``""`` when that family has no configured hosts. An empty
       ``elements = { }`` is an nftables *syntax error*, so when a family is blank the whole line
       must vanish, not render empty braces. (Blank ``trusted_hosts`` is a valid operator choice —
-      the wizard offers "blank = none".)
+      the wizard offers "blank = none".) The sets are declared ``flags interval`` + ``auto-merge``
+      (H23) so a CIDR/prefix element — even a ``/32`` — is accepted (the validator already permits
+      IP *or* CIDR, state.py); ``auto-merge`` folds an overlapping IP+CIDR (e.g. a trusted mesh
+      ``/24`` plus a specific peer inside it) into one interval instead of an nft "conflicting
+      intervals" load error, at the cost of the live ``nft list set`` showing merged ranges that
+      differ cosmetically from the ``machine.conf`` token list (machine.conf stays the source of
+      truth — add/remove mutate the conf string, not the live set).
     * ``network.ipv6_forward_block`` — the IPv6 forwarding lines for the edge sysctl drop-in
       (``templates/sysctl-forward.conf``): empty when ``[network] ipv6_forward`` is off, else
       ``net.ipv6.conf.all.forwarding = 1`` plus an ``accept_ra = 2`` on the WAN (see
@@ -130,8 +136,8 @@ def _derived(config: dict) -> dict:
       ``[zones]`` section (the general source→action primitive), rendered as one block under a single
       placeholder (the engine has no loops). A zone is ``name = <source> -> <action>`` where source
       is ``any`` / an IP-or-CIDR / ``iface:NAME`` and action is ``all`` or a service-ports-style port
-      list. Rendered as INLINE rules (``ip saddr <cidr> tcp dport { ... } accept``), which need no
-      ``flags interval`` and so sidestep the ``trusted_hosts`` named-set CIDR bug. ``""`` when no
+      list. Rendered as INLINE rules (``ip saddr <cidr> tcp dport { ... } accept``), which use no
+      named set at all (the ``trusted_hosts`` set now carries ``flags interval``, H23). ``""`` when no
       ``[zones]`` section is present. See :func:`_render_zones`.
     """
     net = dict(config.get("network") or {})

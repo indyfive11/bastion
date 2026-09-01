@@ -195,6 +195,25 @@ def test_real_nft_templates_render_valid_with_blank_trusted_hosts():
         assert templates.find_placeholders(out) == set()
 
 
+def test_real_nft_templates_render_valid_with_cidr_trusted_hosts():
+    # H23 regression: `bastion allow <ip>/32` (or any CIDR) failed `nft -c` because trusted_hosts
+    # was declared without `flags interval`. The shipped example uses BARE IPs, so no nft -c test
+    # caught it. Render both rulesets with a bare IP + a /32 + a CIDR + an OVERLAPPING CIDR+IP
+    # (a trusted mesh /24 plus a specific peer inside it — auto-merge folds it rather than erroring
+    # with "conflicting intervals") and assert `nft -c` accepts them.
+    from bastion import state, templates
+    cfg = state.load_conf(EXAMPLE)
+    # one trusted_hosts string carries both families; the template splits v4/v6 by family.
+    cfg["network"]["trusted_hosts"] = ("10.0.1.50, 10.0.1.55/32, 10.0.2.0/24, 10.0.2.9, "
+                                       "fd00::2, fd00:dead::/64")
+    for tmpl in ("nftables-edge.nft", "nftables-endpoint.nft"):
+        out = templates.render_file(TEMPLATES / tmpl, cfg)
+        assert "flags interval" in out and "auto-merge" in out, tmpl
+        assert templates.find_placeholders(out) == set()
+        ran, ok, *err = _nft_check(out)
+        assert ok, f"{tmpl} (CIDR trusted_hosts) failed nft -c: {err}"
+
+
 def _nft_check(text: str):
     """Run `nft -c -f -` in an unprivileged netns if available; return (ran, ok). Skips cleanly when
     nft/unshare aren't present (CI bare runners) — the render+placeholder asserts still gate syntax."""

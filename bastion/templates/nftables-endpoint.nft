@@ -24,11 +24,15 @@ table inet bastion {
 
     set trusted_hosts {
         type ipv4_addr
+        flags interval
+        auto-merge
         {{ network.trusted_hosts_elements }}
     }
 
     set trusted_hosts6 {
         type ipv6_addr
+        flags interval
+        auto-merge
         {{ network.trusted_hosts6_elements }}
     }
 
