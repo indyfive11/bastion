@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.28] - 2026-09-02
+
+### Fixed
+- **`bastion upgrade` now deploys a newly-added layer script (and `doctor` no longer false-greens it).**
+  The artifact-drift scan skipped any layer whose `status()` read "not installed" — but a release that
+  *adds* a script to an already-installed layer flips that layer to "not installed (missing: <new
+  script>)", so `bastion upgrade` would never deploy the new script (it could not, because the script
+  was missing — circular) and `doctor`'s artifact-drift row stayed green because it had skipped the
+  layer. The scan now also inspects any layer that is *partially present* (at least one of its scripts
+  already on disk), so a newly-added script is detected as `MISSING` and redeployed; a layer with none
+  of its scripts deployed is still skipped (`pacman -U` never deletes an sbin copy, so "no scripts"
+  means the operator never installed that layer). Surfaced dogfooding the v1.5.27 update on a live box.
+
 ## [1.5.27] - 2026-09-02
 
 ### Fixed
