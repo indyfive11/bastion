@@ -1021,11 +1021,14 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
-    """Confirm egress is genuinely up + stable (net-confirm), then cancel a `bastion switch`/setup
-    deadman if one is armed — the operator running this IS the 'I still have access' signal a cutover
-    waits for (P4). Cancel only on a clean net-confirm, so a confirm with egress still down lets the
-    deadman revert. Does NOT stop the standing L6 edge-watchdog — that self-heal keeps running (F15);
-    only the transient cutover deadman timer is disarmed.
+    """Confirm the box is genuinely reachable, then cancel a `bastion switch`/setup deadman if one is
+    armed — the operator running this IS the 'I still have access' signal a cutover waits for (P4).
+    Two-part check: egress stable (net-confirm) AND, in edge mode, a FRESH inbound connection proven
+    (net-confirm-ingress) — because egress alone can't see an INGRESS lockout (a reshape that blocks
+    inbound SSH is egress-stable), and a pre-switch SSH session rides through on established/related so
+    it is not proof of new ingress (H25). Cancel only when the required checks pass, so a confirm that
+    can't prove reachability lets the deadman revert. Does NOT stop the standing L6 edge-watchdog —
+    that self-heal keeps running (F15); only the transient cutover deadman timer is disarmed.
 
     `--force` is the present-operator override: the egress probe gates the DEFAULT disarm, but a
     present operator whose egress is down for a reason unrelated to the change (fresh install before
@@ -1065,17 +1068,39 @@ def cmd_confirm(args: argparse.Namespace) -> int:
         return 0
 
     rc = _run_sbin(ctx, "net-confirm")
-    if rc == 0 and sys_.is_live and sys_.is_root:
+    if rc != 0:
+        if sys_.is_live and sys_.is_root and sys_.exists(f"{ctx.sbin_dir}/net-confirm"):
+            # net-confirm actually ran (installed + root + live) and reported egress down → teach the
+            # escape hatch. Gate on the script existing so a "not installed" rc=1 doesn't misfire it.
+            print("bastion confirm: egress not verified, so the deadman stays armed (it will auto-"
+                  "revert). If you are PRESENT with admin access and want to KEEP this config anyway — "
+                  "e.g. a fresh install, or an ISP/probe-host outage unrelated to your change — re-run: "
+                  "bastion confirm --force", file=sys.stderr)
+        return rc
+
+    # Egress is up. In EDGE mode, ALSO require proof that a FRESH inbound connection (accepted AFTER
+    # the deadman armed) reached us through the NEW ruleset — egress stability says nothing about an
+    # INGRESS lockout (a trusted_hosts/zones reshape that blocks inbound SSH), and a pre-switch SSH
+    # session rides through on conntrack established/related so its presence is not proof either (H25).
+    # Endpoint mode has no inbound-SSH access path to prove, so it keeps the egress-only contract. Gate
+    # on the helper EXISTING so an install predating it degrades to egress-only, not refuse-every-confirm.
+    if ctx.mode != "endpoint" and sys_.exists(f"{ctx.sbin_dir}/net-confirm-ingress"):
+        rc = _run_sbin(ctx, "net-confirm-ingress")
+        if rc != 0:
+            if sys_.is_live and sys_.is_root:
+                print("bastion confirm: egress is up, but a FRESH inbound connection could NOT be "
+                      "proven — the deadman stays armed (it will auto-revert). This is the ingress-"
+                      "lockout guard: a change that blocks inbound SSH still looks fine from egress "
+                      "alone. To KEEP this config, RECONNECT with a NEW SSH session and re-run `bastion "
+                      "confirm` (a session opened after the switch proves inbound works). If you are "
+                      "PRESENT at the console with no new SSH to make, re-run: bastion confirm --force",
+                      file=sys.stderr)
+            return rc
+
+    # Egress up and (edge) fresh-ingress proven → cancel the pending net-rollback.
+    if sys_.is_live and sys_.is_root:
         # Stop the transient timer (no-op if none armed); cancels the pending net-rollback.
         sys_.run("systemctl", "stop", unit)
-    elif (rc != 0 and sys_.is_live and sys_.is_root
-          and sys_.exists(f"{ctx.sbin_dir}/net-confirm")):
-        # net-confirm actually ran (installed + root + live) and reported egress down → teach the
-        # escape hatch. Gate on the script existing so a "not installed" rc=1 doesn't misfire the hint.
-        print("bastion confirm: egress not verified, so the deadman stays armed (it will auto-"
-              "revert). If you are PRESENT with admin access and want to KEEP this config anyway — "
-              "e.g. a fresh install, or an ISP/probe-host outage unrelated to your change — re-run: "
-              "bastion confirm --force", file=sys.stderr)
     return rc
 
 

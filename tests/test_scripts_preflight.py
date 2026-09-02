@@ -43,6 +43,7 @@ def _run(script: str, path: str, *args: str) -> subprocess.CompletedProcess:
 CASES = [
     ("flowcheck", (), "curl", "curl"),
     ("net-confirm", (), "curl", "curl"),
+    ("net-confirm-ingress", (), "getconf", "getconf"),
     ("edge-feed-fetch", (), "curl", "curl"),
     ("edge-dnsblock-update", (), "curl", "curl"),
     ("edge-watchdog", ("once",), "curl", "curl"),

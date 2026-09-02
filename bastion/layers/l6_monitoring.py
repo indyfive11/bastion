@@ -35,7 +35,7 @@ class L6Monitoring(Layer):
     # /proc/net/nf_conntrack is absent (modern kernels build CONFIG_NF_CONNTRACK_PROCFS off,
     # so `conntrack -L` over netlink is the only way to read the table the nft ruleset populates).
     scripts = ("edge-watchdog", "net-snapshot", "net-rollback", "flowcheck",
-               "lan-verify", "net-confirm", "notify-alert", "notify-failure")
+               "lan-verify", "net-confirm", "net-confirm-ingress", "notify-alert", "notify-failure")
     units = ("edge-watchdog.service", "notify-failure@.service")
     template_dests = ()      # notify-alert.conf is operator/secret config (Phase-5 wizard)
 
@@ -100,6 +100,8 @@ class L6Monitoring(Layer):
             HealthCheck("flowcheck installed", sys.exists(f"{ctx.sbin_dir}/flowcheck")),
             HealthCheck("lan-verify installed", sys.exists(f"{ctx.sbin_dir}/lan-verify")),
             HealthCheck("net-confirm installed", sys.exists(f"{ctx.sbin_dir}/net-confirm")),
+            HealthCheck("net-confirm-ingress installed",
+                        sys.exists(f"{ctx.sbin_dir}/net-confirm-ingress")),
             HealthCheck("notify-alert installed", sys.exists(f"{ctx.sbin_dir}/notify-alert")),
             HealthCheck("notify-failure@ unit installed",
                         sys.exists("/etc/systemd/system/notify-failure@.service")),

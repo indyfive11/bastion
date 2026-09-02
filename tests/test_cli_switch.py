@@ -135,6 +135,50 @@ def test_confirm_keeps_deadman_when_egress_still_down(tmp_path, monkeypatch):
     assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)
 
 
+def test_confirm_edge_disarms_when_egress_and_ingress_ok(tmp_path, monkeypatch):
+    # H25: edge mode now ALSO runs net-confirm-ingress; when BOTH pass, the deadman disarms.
+    _seed_sbin(tmp_path, "net-confirm", "net-confirm-ingress")
+    sys_ = LiveRecordingSystem(tmp_path)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 0
+    assert "net-confirm-ingress" in _basenames(sys_.calls)          # ingress check ran
+    assert ("systemctl", "stop", "bastion-switch-deadman.timer") in sys_.calls
+
+
+def test_confirm_edge_keeps_deadman_when_ingress_unproven(tmp_path, monkeypatch, capsys):
+    # H25: egress up but a fresh inbound can't be proven => keep the net armed (it will auto-revert),
+    # and teach the reconnect-or-force recovery path. This is the ingress-lockout guard.
+    _seed_sbin(tmp_path, "net-confirm", "net-confirm-ingress")
+    sys_ = LiveRecordingSystem(tmp_path, fail=("net-confirm-ingress",))
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 1
+    assert not any(c[:2] == ("systemctl", "stop") for c in sys_.calls)   # NOT disarmed
+    err = capsys.readouterr().err
+    assert "RECONNECT" in err and "--force" in err
+
+
+def test_confirm_endpoint_skips_ingress_check(tmp_path, monkeypatch):
+    # Endpoint mode has no inbound-SSH access path to prove — keep the egress-only contract even
+    # though the helper is installed, so a laptop confirm never force-reverts on absent ingress.
+    _seed_sbin(tmp_path, "net-confirm", "net-confirm-ingress")
+    sys_ = LiveRecordingSystem(tmp_path)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "endpoint"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 0
+    assert "net-confirm-ingress" not in _basenames(sys_.calls)       # ingress check SKIPPED
+    assert ("systemctl", "stop", "bastion-switch-deadman.timer") in sys_.calls
+
+
+def test_confirm_edge_falls_back_to_egress_only_when_helper_absent(tmp_path, monkeypatch):
+    # Upgrade-path safety: an install that predates net-confirm-ingress must degrade to the old
+    # egress-only disarm, NOT refuse every confirm because the new helper isn't deployed yet.
+    _seed_sbin(tmp_path, "net-confirm")                             # ingress helper NOT seeded
+    sys_ = LiveRecordingSystem(tmp_path)
+    _wire(monkeypatch, sys_, {"machine": {"mode": "edge"}})
+    assert cli.cmd_confirm(cli.build_parser().parse_args(["confirm"])) == 0
+    assert "net-confirm-ingress" not in _basenames(sys_.calls)
+    assert ("systemctl", "stop", "bastion-switch-deadman.timer") in sys_.calls
+
+
 class DeadmanSystem(LiveRecordingSystem):
     """Models the deadman timer lifecycle so `bastion confirm --force` is testable: `systemctl
     is-active` reflects whether the timer is armed, and `systemctl stop <unit>.timer` disarms it

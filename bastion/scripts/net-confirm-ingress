@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# net-confirm-ingress — prove a FRESH inbound connection reached this box THROUGH the new ruleset,
+# i.e. that a `bastion switch`/setup cutover did NOT lock inbound out. Exit 0 = fresh ingress proven
+# (the caller `bastion confirm` may disarm the deadman); non-zero = cannot prove it, so the caller
+# leaves the rollback net armed (fail-safe: uncertainty keeps the net — same contract as net-confirm).
+#
+# WHY egress (net-confirm) is not enough: an INGRESS lockout (a trusted_hosts/zones reshape that
+# blocks inbound SSH) leaves egress perfectly stable, so an egress-only confirm would disarm the
+# deadman and KEEP a ruleset the operator can no longer reach. And a live SSH session is NOT proof
+# either: a session opened BEFORE the switch rides through on conntrack established/related regardless
+# of whether the NEW rules would admit a NEW connection. The only real proof is a session that was
+# ACCEPTED AFTER the cutover armed — it necessarily traversed the new ruleset.
+#
+# HOW: the operator runs `sudo bastion confirm` from inside that very SSH session, so this helper's
+# process ancestry is  sshd -> shell -> sudo -> bastion -> (this script). We walk our own /proc
+# ancestry to the session sshd and compare its start time to when the deadman armed. Session started
+# at/after arm  =>  a fresh inbound got in under the new rules  =>  ingress proven.
+#
+# Read-only: reads /proc + queries systemd. Writes no nft (edge-reconciler is the sole nft writer).
+[ -r /etc/bastion/machine.env ] && . /etc/bastion/machine.env
+DEADMAN_UNIT=${SWITCH_DEADMAN_UNIT:-bastion-switch-deadman}
+
+log(){ logger -t bastion "net-confirm-ingress: $*"; }
+need(){ local b miss=''
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+  [ -z "$miss" ] && return 0
+  printf 'bastion %s: missing required command(s):%s — install them and re-run\n' "${0##*/}" "$miss" >&2
+  command -v logger >/dev/null 2>&1 && logger -t bastion "${0##*/}: missing required command(s):$miss"
+  exit 1
+}
+need systemctl date awk getconf
+
+# When did the deadman arm? The transient .timer goes active at arm time; an EMPTY value means no
+# deadman is armed (systemctl show reports "" rc=0 for a unit that does not exist) — nothing to
+# protect, so ingress proof is not required and we pass.
+arm_ts=$(systemctl show "${DEADMAN_UNIT}.timer" -p ActiveEnterTimestamp --value 2>/dev/null)
+if [ -z "$arm_ts" ]; then
+  log "no ${DEADMAN_UNIT} deadman armed; ingress proof not required"
+  exit 0
+fi
+arm_epoch=$(date -d "$arm_ts" +%s 2>/dev/null)
+if [ -z "$arm_epoch" ]; then
+  log "could not parse deadman arm time '$arm_ts'; keeping the net armed (fail-safe)"
+  exit 1
+fi
+
+# /proc/<pid>/stat start time -> epoch:  btime + starttime_ticks / USER_HZ.
+CLK=$(getconf CLK_TCK 2>/dev/null); [ -n "$CLK" ] || CLK=100
+btime=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null)
+if [ -z "$btime" ]; then
+  log "no btime in /proc/stat; cannot compute session age — keeping the net armed (fail-safe)"
+  exit 1
+fi
+
+# Parse fields 4 (ppid) and 22 (starttime) from /proc/<pid>/stat. comm (field 2) is parenthesized and
+# may itself contain spaces or ')', so split on the LAST ')': everything after it is fields 3.. .
+proc_field(){ # $1=pid  $2=index-from-field-3 (ppid=2, starttime=20) -> prints that field, "" if gone
+  local raw rest idx=$2                       # save idx BEFORE `set --` overwrites the positionals
+  raw=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  rest=${raw##*) }
+  # shellcheck disable=SC2086
+  set -- $rest
+  eval "printf '%s' \"\${$idx}\""
+}
+proc_comm(){ local raw; raw=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; raw=${raw#*(}; printf '%s' "${raw%)*}"; }
+
+# Walk our own ancestry looking for the session sshd (openssh >=9.8 splits it into "sshd-session").
+pid=$$
+sshd_start=""
+for _ in $(seq 1 32); do
+  comm=$(proc_comm "$pid") || break
+  case "$comm" in
+    sshd|sshd-session)
+      st=$(proc_field "$pid" 20)
+      [ -n "$st" ] && sshd_start=$(( btime + st / CLK ))
+      break ;;
+  esac
+  ppid=$(proc_field "$pid" 2)
+  [ -z "$ppid" ] && break
+  [ "$ppid" = "0" ] || [ "$ppid" = "1" ] && break
+  pid=$ppid
+done
+
+if [ -z "$sshd_start" ]; then
+  log "no SSH session in this process's ancestry (console/serial, or run under tmux/screen/at whose server is not the sshd child) — cannot prove a fresh inbound; keeping the net armed (fail-safe)"
+  exit 1
+fi
+
+if [ "$sshd_start" -ge "$arm_epoch" ]; then
+  log "fresh inbound SSH session (accepted $(date -d "@$sshd_start" '+%H:%M:%S') >= armed $(date -d "@$arm_epoch" '+%H:%M:%S')); ingress proven, safe to disarm"
+  exit 0
+fi
+log "this SSH session predates the cutover (accepted $(date -d "@$sshd_start" '+%H:%M:%S') < armed $(date -d "@$arm_epoch" '+%H:%M:%S')); it rode through on established/related and is NOT proof of new ingress — keeping the net armed"
+exit 1
