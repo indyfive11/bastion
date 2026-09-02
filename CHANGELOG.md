@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.27] - 2026-09-02
+
+### Fixed
+- **`bastion confirm` is now ingress-aware, so a deadman cutover that blocks inbound SSH auto-reverts.**
+  The `bastion switch`/setup deadman was disarmed on egress reachability alone (`net-confirm`), but an
+  ingress lockout — a `trusted_hosts`/zones reshape that blocks inbound SSH — leaves egress perfectly
+  stable, so `confirm` would keep a ruleset the operator could no longer reach. In edge mode `confirm`
+  now also requires proof of a *fresh* inbound connection (new `net-confirm-ingress`): it walks its own
+  process ancestry to the session `sshd` and checks that session was accepted *after* the cutover armed
+  (a pre-switch session rides through on conntrack established/related and is not proof). If ingress
+  can't be proven it refuses and points to the recovery path — reconnect with a new SSH session and
+  re-run `confirm`, or `bastion confirm --force` when present at the console. Endpoint mode keeps the
+  egress-only contract; `--force` is unchanged. Installs that predate the helper degrade to egress-only
+  (no refuse-every-confirm regression); `bastion upgrade` redeploys the new helper.
+
 ## [1.5.26] - 2026-09-01
 
 Fixes two related firewall-apply defects surfaced on a live box (dfw) during a failover drill: `bastion allow
