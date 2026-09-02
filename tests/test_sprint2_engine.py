@@ -151,6 +151,71 @@ def test_upgrade_reinstalls_missing_script(tmp_path, capsys, monkeypatch):
     assert "bastion-recovery (MISSING)" in out
 
 
+def test_upgrade_deploys_newly_added_script_to_partially_present_layer(tmp_path, capsys, monkeypatch):
+    # H26: a release ADDS a script to an already-installed layer. A real layer's status() gates on ALL
+    # its scripts, so the new (not-yet-deployed) script flips status() to "not installed" — but the
+    # layer is clearly PRESENT (its existing scripts are on disk). `bastion upgrade` MUST still deploy
+    # the newly-added script (the old behavior skipped the layer → the script never landed, circular).
+    from types import SimpleNamespace
+    from bastion.layers.base import Layer, LayerStatus
+
+    real_install_script = Layer.install_script
+    scripts = ("bastion-recovery", "net-confirm")           # two real package scripts
+
+    def status(ctx):                                         # mimic a real layer: installed iff ALL present
+        allp = all((tmp_path / f"usr/local/sbin/{s}").exists() for s in scripts)
+        return LayerStatus("lx", "x", installed=allp, active=False)
+
+    lx = SimpleNamespace(name="lx", scripts=scripts, status=status,
+                         install_script=lambda ctx, name: real_install_script(lx, ctx, name))
+    monkeypatch.setattr(cli.layermod, "all_layers", lambda: [lx])
+    # deploy ONLY the pre-existing script; net-confirm is the "newly added" one
+    real_install_script(lx, _staged_ctx(tmp_path), "bastion-recovery")
+    assert not (tmp_path / "usr/local/sbin/net-confirm").exists()
+    rc = cli.main(["upgrade", "--conf", str(EXAMPLE), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (tmp_path / "usr/local/sbin/net-confirm").read_bytes() == (SCRIPTS / "net-confirm").read_bytes()
+    assert "net-confirm (MISSING)" in out
+
+
+def test_upgrade_does_not_resurrect_absent_layer(tmp_path, capsys, monkeypatch):
+    # H26 boundary preserved: a layer with NONE of its scripts on disk is genuinely not installed —
+    # upgrade must NOT deploy its scripts (pacman -U never DELETES an sbin copy, so "no scripts" means
+    # the operator never installed this layer, not that it drifted).
+    from types import SimpleNamespace
+    from bastion.layers.base import LayerStatus
+
+    lx = SimpleNamespace(name="lx", scripts=("net-confirm",),
+                         status=lambda ctx: LayerStatus("lx", "x", installed=False, active=False))
+    monkeypatch.setattr(cli.layermod, "all_layers", lambda: [lx])
+    rc = cli.main(["upgrade", "--conf", str(EXAMPLE), "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0 and "nothing to redeploy" in out
+    assert not (tmp_path / "usr/local/sbin/net-confirm").exists()   # not resurrected
+
+
+def test_doctor_flags_newly_added_missing_script_no_false_green(tmp_path, capsys, monkeypatch):
+    # H26 false-green: after `pacman -U` adds a script (present in the package) but before it is
+    # deployed, doctor's artifact-drift row must FLAG it, not read "installed scripts match" because
+    # it skipped the partially-present layer.
+    from types import SimpleNamespace
+    from bastion.layers.base import Layer, LayerStatus
+
+    real_install_script = Layer.install_script
+    scripts = ("bastion-recovery", "net-confirm")
+
+    def status(ctx):
+        allp = all((tmp_path / f"usr/local/sbin/{s}").exists() for s in scripts)
+        return LayerStatus("lx", "x", installed=allp, active=False)
+
+    lx = SimpleNamespace(name="lx", scripts=scripts, status=status,
+                         install_script=lambda ctx, name: real_install_script(lx, ctx, name))
+    monkeypatch.setattr(cli.layermod, "all_layers", lambda: [lx])
+    real_install_script(lx, _staged_ctx(tmp_path), "bastion-recovery")   # only the old script
+    assert dict(cli._artifact_drift(_staged_ctx(tmp_path))).get("net-confirm") == "MISSING"
+
+
 def test_upgrade_clean_is_noop(tmp_path, capsys):
     _install_l0(tmp_path)                                    # fresh install already matches package
     rc = cli.main(["upgrade", "--conf", str(EXAMPLE), "--root", str(tmp_path)])

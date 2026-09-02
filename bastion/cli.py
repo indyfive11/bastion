@@ -1263,9 +1263,19 @@ def _artifact_drift_scan(ctx: Context):
         except Exception as exc:                         # noqa: BLE001
             problems.append(f"{getattr(layer, 'name', '?')}: status check failed ({exc})")
             continue
-        if not installed:
+        scripts = getattr(layer, "scripts", ())
+        # H26: do NOT gate solely on status().installed. A real layer's status() is all-scripts-present,
+        # so a release that ADDS a script to an installed layer flips it to "not installed (missing:
+        # <new script>)" — and skipping here would mean `bastion upgrade` NEVER deploys that new script
+        # (it can't, because the script is missing → circular), while doctor's drift row false-greens
+        # (the layer was skipped, not verified). Scan any layer that is installed OR PARTIALLY PRESENT
+        # (>=1 of its scripts already on disk); only a layer with NONE of its scripts deployed is
+        # genuinely absent and skipped — preserving the H13 boundary that pacman -U (which never DELETES
+        # an sbin copy) must not resurrect the scripts of a layer the operator never installed.
+        present = any(sys_.exists(f"{ctx.sbin_dir}/{s}") for s in scripts)
+        if not installed and not present:
             continue
-        for script in getattr(layer, "scripts", ()):
+        for script in scripts:
             src = scripts_dir / script
             if not src.is_file():
                 problems.append(f"{script}: package copy not found at {src}")
