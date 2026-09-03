@@ -1,4 +1,4 @@
-.TH BASTION 1 "" "bastion 1.5.25" "Bastion Manual"
+.TH BASTION 1 "" "bastion 1.5.29" "Bastion Manual"
 .SH NAME
 bastion \- modular, layered Linux firewall framework
 .SH SYNOPSIS
@@ -269,6 +269,40 @@ any | <IP/CIDR> | iface:NAME | iface:NAME+<CIDR> (add)
 .TP
 \fBaction\fR
 all | a port list e.g. 8096 53/udp (add)
+.TP
+\fB\-\-dry\-run\fR
+preview the rule delta + clobber check; write and reload nothing
+.TP
+\fB\-\-yes\fR
+proceed even if the live kernel has unmanaged rules the reload would flush
+.TP
+\fB\-\-conf CONF\fR
+\&
+.TP
+\fB\-\-root ROOT\fR
+\&
+.SS forwards
+manage [forwards] ingress DNAT/port\-forward rules (edge)
+.PP
+\fBbastion forwards\fR \fI{list | add | remove}\fR \fIname\fR \fIportspec\fR \fIdest\fR [options]
+.TP
+\fB{list | add | remove}\fR
+\&
+.TP
+\fBname\fR
+forward name (add/remove)
+.TP
+\fBportspec\fR
+WAN <proto>/<port> e.g. udp/51822 (add)
+.TP
+\fBdest\fR
+destination <ip>:<port> e.g. 10.8.0.1:51821 (add)
+.TP
+\fB\-\-via VIA\fR
+egress interface for the forwarded flow (required with \-\-snat)
+.TP
+\fB\-\-snat SNAT\fR
+fixed SNAT source IP (the box's own address on \-\-via)
 .TP
 \fB\-\-dry\-run\fR
 preview the rule delta + clobber check; write and reload nothing

@@ -4,7 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
-## [1.5.28] - 2026-09-02
+## [1.5.29] - 2026-09-03
+
+### Added
+- **`[forwards]` — an edge ingress DNAT / port-forward primitive, with a `bastion forwards`
+  CLI verb.** A forward is `name = <proto>/<wan_dport> -> <dest_ip>:<dest_dport> [via <iface>]
+  [snat <ip>]`: it DNATs a WAN port to an internal or mesh host, so a public-facing edge box can
+  publish a service (or relay a port into an overlay a CGNAT-blocked peer can't reach directly).
+  Rendered as a first-class template primitive — a new `prerouting`/`dstnat` chain in the
+  `edge_nat` table, a forward-chain rate-limited accept placed **below** the block-set drops (so a
+  banned/crowdsec source is still dropped first — the DNAT preserves the original source address),
+  and an optional **fixed** `snat` in postrouting for a flow leaving an overlay/mesh interface (a
+  fixed source-NAT survives an interface flap, e.g. a WireGuard restart, where `masquerade` would
+  drop the conntrack entry and tear the session down). Because it lives in the rendered ruleset, it
+  survives regen, the edge-watchdog self-heal, and reboot with no hand rules. `bastion forwards
+  list|add|remove` reuses the `zones` safe-apply envelope (exact rule-delta preview, live-clobber
+  gate, `--dry-run`, post-apply verify); `--snat` requires `--via`, and the destination must be a
+  routable unicast IPv4 host. Edge-only (endpoint mode has no NAT table).
 
 ### Fixed
 - **`bastion upgrade` now deploys a newly-added layer script (and `doctor` no longer false-greens it).**
