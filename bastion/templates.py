@@ -161,6 +161,7 @@ def _derived(config: dict) -> dict:
     net["internal_iface_drop"] = _internal_iface_drop(config)  # M3b: fail-closed input WAN drop
     net["anti_spoof_rules"] = _anti_spoof_rules(config)   # M2b: gated forward-chain anti-spoof teeth
     net.update(_forward_iface_rules(config))     # M13: blank-safe forward/nat overlay-iface rules
+    net.update(_render_forwards(config))         # H27: edge ingress DNAT/port-forward primitive
     mach = dict(config.get("machine") or {})
     mach["firewall_preamble"] = _firewall_preamble(config)
     return {**config, "network": net, "machine": mach}
@@ -495,6 +496,104 @@ def _render_zones(config: dict) -> str:
     seen: set[str] = set()
     deduped = [r for r in rules if not (r in seen or seen.add(r))]
     return "\n        ".join(deduped)
+
+
+def _parse_forward(raw: str) -> dict | None:
+    """Parse a ``[forwards]`` value ``<proto>/<wan_dport> -> <dest_ip>:<dest_dport> [via <iface>]
+    [snat <ip>]`` into a field dict, or ``None`` if structurally malformed.
+
+    Lenient/structural only — :func:`bastion.state.validate_conf` is the gate that surfaces bad
+    fields (proto, port ranges, IPs) and blocks ``generate`` first, so a clean conf never reaches the
+    renderer with a bad token. ``None`` here means "skip this entry" (fail-closed: render no rule)
+    rather than emit a broken one, exactly like the malformed-``[zones]`` skip in :func:`_render_zones`.
+    ``proto`` is lowercased. ``dest`` is split on the LAST ``:`` so the port is separated cleanly."""
+    lhs, sep, rhs = raw.partition("->")
+    if not sep:
+        return None
+    proto, pslash, wan_dport = lhs.strip().partition("/")
+    if not pslash:
+        return None
+    proto, wan_dport = proto.strip().lower(), wan_dport.strip()
+    toks = rhs.strip().split()
+    if not toks:
+        return None
+    dest, via, snat = toks[0], "", ""
+    i = 1
+    while i < len(toks):
+        if toks[i] == "via" and i + 1 < len(toks):
+            via = toks[i + 1]; i += 2
+        elif toks[i] == "snat" and i + 1 < len(toks):
+            snat = toks[i + 1]; i += 2
+        else:
+            return None  # unexpected trailing token — validate_conf reports it
+    dest_ip, dcolon, dest_dport = dest.rpartition(":")
+    dest_ip, dest_dport = dest_ip.strip(), dest_dport.strip()
+    if not (dcolon and proto and wan_dport and dest_ip and dest_dport):
+        return None
+    return {"proto": proto, "wan_dport": wan_dport, "dest_ip": dest_ip,
+            "dest_dport": dest_dport, "via": via, "snat": snat}
+
+
+def _render_forwards(config: dict) -> dict:
+    """H27: the EDGE ingress DNAT / port-forward primitive — render the dynamic ``[forwards]`` section
+    into three nft rule blocks (the engine has no loops, so one string per placeholder):
+
+    * ``forwards_dnat_rules`` — into a ``prerouting``/``dstnat`` chain in ``table ip edge_nat``:
+      ``iifname "<wan>" <proto> dport <wan_dport> dnat to <dest_ip>:<dest_dport>``. WAN-iface-scoped so
+      a LAN client never triggers the DNAT.
+    * ``forwards_forward_rules`` — into ``chain forward``, BELOW the block-set drops (a DNAT rewrites
+      only the daddr, so ``ip saddr`` is still the original source there and a banned peer is dropped
+      first): a ``ct state new`` rate-limit then the accept, matching the post-DNAT daddr/dport.
+    * ``forwards_snat_rules`` — into ``postrouting`` BEFORE the catch-all masquerade: a FIXED
+      ``snat to <ip>`` (not masquerade — masquerade drops conntrack on the egress iface's
+      ``NETDEV_DOWN``, e.g. a wg restart, tearing the forwarded session down). Only for an entry that
+      sets both ``snat`` and ``via`` (validate_conf enforces ``snat`` ⇒ ``via``).
+
+    EDGE-ONLY and fail-CLOSED: returns all-blank unless ``machine.mode == edge`` and a non-empty
+    ``[forwards]`` is present. A blank ``interfaces.wan`` makes the WHOLE entry vanish (all three
+    groups) — never a bare ``iifname ""``/``oifname ""`` (nft-fatal), the same M13/``_zone_prefix``
+    guard. A malformed entry (validation bypassed) is skipped, never rendered as a broken rule. Rules
+    are de-duplicated, order preserved. Each string joins at the 8-space chain-body indent."""
+    blank = {"forwards_dnat_rules": "", "forwards_snat_rules": "", "forwards_forward_rules": ""}
+    if str((config.get("machine") or {}).get("mode") or "").strip() != "edge":
+        return blank
+    forwards = config.get("forwards") or {}
+    if not forwards:
+        return blank
+    wan = str((config.get("interfaces") or {}).get("wan") or "").strip()
+    dnat: list[str] = []
+    snat: list[str] = []
+    fwd: list[str] = []
+    for raw in forwards.values():
+        spec = _parse_forward(str(raw))
+        if not spec:
+            continue  # malformed; validate_conf blocks generate before we get here
+        proto, wan_dport = spec["proto"], spec["wan_dport"]
+        dest_ip, dest_dport = spec["dest_ip"], spec["dest_dport"]
+        via, snat_ip = spec["via"], spec["snat"]
+        # Fail-closed belt (validate already gates these): a bad proto/port would render an nft-fatal
+        # rule, so skip rather than take the box's firewall down on a validation-bypassing conf.
+        if proto not in ("tcp", "udp") or not (wan_dport.isdigit() and dest_dport.isdigit()):
+            continue
+        if not wan:
+            continue  # blank WAN → entry vanishes entirely (never `iifname ""`)
+        dnat.append(f'iifname "{wan}" {proto} dport {wan_dport} dnat to {dest_ip}:{dest_dport}')
+        match = f'iifname "{wan}" ip daddr {dest_ip} {proto} dport {dest_dport}'
+        if via:
+            match += f' oifname "{via}"'
+        fwd.append(f"{match} ct state new limit rate over 25/second burst 50 packets drop")
+        fwd.append(f"{match} accept")
+        if snat_ip and via:
+            snat.append(f'oifname "{via}" ip daddr {dest_ip} {proto} dport {dest_dport} snat to {snat_ip}')
+
+    def _dedup(xs: list[str]) -> list[str]:
+        seen: set[str] = set()
+        return [x for x in xs if not (x in seen or seen.add(x))]
+
+    join = "\n        ".join
+    return {"forwards_dnat_rules": join(_dedup(dnat)),
+            "forwards_snat_rules": join(_dedup(snat)),
+            "forwards_forward_rules": join(_dedup(fwd))}
 
 
 def _firewall_preamble(config: dict) -> str:

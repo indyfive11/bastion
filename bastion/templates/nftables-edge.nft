@@ -149,6 +149,12 @@ table inet edge {
         icmpv6 type echo-request limit rate 10/second accept
         icmpv6 type echo-reply accept
 
+        # H27 ingress port-forward accept ([forwards]) — admits a DNAT'd flow (its daddr is already
+        # rewritten to the internal/mesh target). Rendered BELOW the block-set drops above so a banned
+        # source is still dropped first (the DNAT preserves saddr); rate-limited on ct-new. Blank
+        # unless [forwards] is set (edge mode). See templates._render_forwards.
+        {{ network.forwards_forward_rules }}
+
         # LAN <-> tunnels (inter-subnet) — one bidirectional pair per CONFIGURED overlay iface; a
         # blank zt/wg iface vanishes instead of rendering `iifname ""` (nft-fatal). templates._forward_iface_rules (M13).
         {{ network.forward_tunnel_rules }}
@@ -167,11 +173,23 @@ table inet edge {
 }
 
 table ip edge_nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        # H27 ingress port-forward DNAT ([forwards]) — rewrites a WAN dport to an internal/mesh
+        # host:port. WAN-iface-scoped so a LAN client never triggers it. Blank (an empty accept-policy
+        # dstnat chain is a harmless no-op) unless [forwards] is set (edge mode). templates._render_forwards.
+        {{ network.forwards_dnat_rules }}
+    }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         # Overlay/relay masquerade — one line per CONFIGURED overlay CIDR/iface; a blank zt_cidr /
         # wg_server_cidr / wg_vps_iface vanishes instead of an empty `ip saddr` (nft-fatal). M13.
         {{ network.nat_masq_rules }}
+        # H27 fixed SNAT for a forwarded flow egressing an overlay/mesh iface (a masquerade would drop
+        # conntrack on the iface's NETDEV_DOWN — e.g. a wg restart — tearing the session down). Renders
+        # BEFORE the catch-all masquerade below (nat verdicts are terminal); blank unless a [forwards]
+        # entry sets `snat <ip> via <iface>`. templates._render_forwards.
+        {{ network.forwards_snat_rules }}
         oifname "{{ interfaces.wan }}" masquerade
     }
 }

@@ -489,53 +489,18 @@ def _rule_delta(old_text: str, new_text: str) -> tuple[list[str], list[str]]:
     return sorted((nc - oc).elements()), sorted((oc - nc).elements())
 
 
-def cmd_zones(args: argparse.Namespace) -> int:
-    """`bastion zones list|add <name> <source> <all|ports...>|remove <name> [--dry-run] [--yes]` —
-    manage the dynamic [zones] source->action input-accept primitive. A zone is `name = <source> ->
-    <action>` where source is `any` / an IP-or-CIDR / `iface:NAME` / `iface:NAME+<CIDR>` (pin a network
-    to one NIC) and action is `all` or a port list.
+def _apply_section_edit(args: argparse.Namespace, old_config: dict, config: dict,
+                        conf_path: Path) -> int:
+    """Shared safe-apply envelope for the dynamic-section verbs (`bastion zones` / `bastion forwards`).
 
-    M-E safe-apply envelope: (1) show the exact +/- nft rule delta this change produces; (2) a live
-    clobber gate — if the running kernel already diverges from /etc/nftables.conf (unmanaged/hand
-    rules), the regen+reload would silently flush them, so warn and (non-interactive) refuse unless
-    --yes; (3) --dry-run previews everything and writes/reloads nothing; (4) after a live apply,
-    re-check that the kernel now matches disk. The preview is a pure template render + text diff — it
-    never loads nft; the only live load stays the existing reconciler/reload path."""
+    The caller loads the conf, mutates the section, and passes the before/after configs. This then:
+    validate the mutated conf (refuse on error, print warnings); preview the exact +/- nft rule delta
+    (pure render + text diff, no live touch); a live clobber gate (if the running kernel already
+    diverges from /etc/nftables.conf, the regen+reload would flush those rules — warn and, on a
+    non-interactive run, refuse unless --yes); honor --dry-run; then write + regen/reload
+    (apply_firewall_change) + a post-apply verify that the kernel now matches disk. Extracted verbatim
+    from cmd_zones so both section verbs share one audited apply path."""
     from . import configspec as cfg
-    conf_path = cfg.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
-    try:
-        config = state.load_conf(conf_path)
-    except FileNotFoundError:
-        print(f"no machine.conf at {conf_path} — run `bastion setup` first", file=sys.stderr)
-        return 1
-    import copy as _copy
-    old_config = _copy.deepcopy(config)
-    zones = config.get("zones") or {}
-
-    if args.op == "list":
-        if not zones:
-            print("(no zones defined)")
-        for name, spec in zones.items():
-            print(f"{name} = {spec}")
-        return 0
-
-    if not args.name:
-        print(f"usage: bastion zones {args.op} <name> ...", file=sys.stderr)
-        return 1
-
-    if args.op == "remove":
-        if args.name not in zones:
-            print(f"{args.name} is not a defined zone — no change")
-            return 0
-        del config["zones"][args.name]
-        if not config["zones"]:
-            del config["zones"]
-    else:  # add
-        if not args.source or not args.action:
-            print("usage: bastion zones add <name> <source> <all|ports...>", file=sys.stderr)
-            return 1
-        config.setdefault("zones", {})[args.name] = f"{args.source} -> {' '.join(args.action)}"
-
     errs, warns = state.validate_conf(config)
     if errs:
         print("refused — the change would make machine.conf invalid:", file=sys.stderr)
@@ -607,6 +572,109 @@ def cmd_zones(args: argparse.Namespace) -> int:
         elif post is not None:
             print("  verified: live kernel now matches /etc/nftables.conf.")
     return rc
+
+
+def cmd_zones(args: argparse.Namespace) -> int:
+    """`bastion zones list|add <name> <source> <all|ports...>|remove <name> [--dry-run] [--yes]` —
+    manage the dynamic [zones] source->action input-accept primitive. A zone is `name = <source> ->
+    <action>` where source is `any` / an IP-or-CIDR / `iface:NAME` / `iface:NAME+<CIDR>` (pin a network
+    to one NIC) and action is `all` or a port list.
+
+    M-E safe-apply envelope: (1) show the exact +/- nft rule delta this change produces; (2) a live
+    clobber gate — if the running kernel already diverges from /etc/nftables.conf (unmanaged/hand
+    rules), the regen+reload would silently flush them, so warn and (non-interactive) refuse unless
+    --yes; (3) --dry-run previews everything and writes/reloads nothing; (4) after a live apply,
+    re-check that the kernel now matches disk. The preview is a pure template render + text diff — it
+    never loads nft; the only live load stays the existing reconciler/reload path."""
+    from . import configspec as cfg
+    conf_path = cfg.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
+    try:
+        config = state.load_conf(conf_path)
+    except FileNotFoundError:
+        print(f"no machine.conf at {conf_path} — run `bastion setup` first", file=sys.stderr)
+        return 1
+    import copy as _copy
+    old_config = _copy.deepcopy(config)
+    zones = config.get("zones") or {}
+
+    if args.op == "list":
+        if not zones:
+            print("(no zones defined)")
+        for name, spec in zones.items():
+            print(f"{name} = {spec}")
+        return 0
+
+    if not args.name:
+        print(f"usage: bastion zones {args.op} <name> ...", file=sys.stderr)
+        return 1
+
+    if args.op == "remove":
+        if args.name not in zones:
+            print(f"{args.name} is not a defined zone — no change")
+            return 0
+        del config["zones"][args.name]
+        if not config["zones"]:
+            del config["zones"]
+    else:  # add
+        if not args.source or not args.action:
+            print("usage: bastion zones add <name> <source> <all|ports...>", file=sys.stderr)
+            return 1
+        config.setdefault("zones", {})[args.name] = f"{args.source} -> {' '.join(args.action)}"
+
+    return _apply_section_edit(args, old_config, config, conf_path)
+
+
+def cmd_forwards(args: argparse.Namespace) -> int:
+    """`bastion forwards list|add <name> <proto/port> <dest_ip:port> [--via IFACE] [--snat IP]|remove
+    <name> [--dry-run] [--yes]` — manage the dynamic [forwards] ingress DNAT/port-forward primitive
+    (H27, edge only). A forward is `name = <proto>/<wan_dport> -> <dest_ip>:<dest_dport> [via <iface>]
+    [snat <ip>]`: a WAN dport DNAT'd to an internal/mesh host, optionally source-rewritten (fixed SNAT
+    for a mesh/overlay egress). Shares the zones safe-apply envelope (`_apply_section_edit`): rule
+    delta preview, live-clobber gate, --dry-run, post-apply verify. The `via`/`snat` modifiers are
+    flags (not positional) so argv order is unambiguous; the stored machine.conf value is the canonical
+    ` -> ` / ` via ` / ` snat ` string."""
+    from . import configspec as cfg
+    conf_path = cfg.resolve_conf_path(getattr(args, "conf", None), getattr(args, "root", None))
+    try:
+        config = state.load_conf(conf_path)
+    except FileNotFoundError:
+        print(f"no machine.conf at {conf_path} — run `bastion setup` first", file=sys.stderr)
+        return 1
+    import copy as _copy
+    old_config = _copy.deepcopy(config)
+    forwards = config.get("forwards") or {}
+
+    if args.op == "list":
+        if not forwards:
+            print("(no forwards defined)")
+        for name, spec in forwards.items():
+            print(f"{name} = {spec}")
+        return 0
+
+    if not args.name:
+        print(f"usage: bastion forwards {args.op} <name> ...", file=sys.stderr)
+        return 1
+
+    if args.op == "remove":
+        if args.name not in forwards:
+            print(f"{args.name} is not a defined forward — no change")
+            return 0
+        del config["forwards"][args.name]
+        if not config["forwards"]:
+            del config["forwards"]
+    else:  # add
+        if not args.portspec or not args.dest:
+            print("usage: bastion forwards add <name> <proto/port> <dest_ip:port> "
+                  "[--via IFACE] [--snat IP]", file=sys.stderr)
+            return 1
+        value = f"{args.portspec} -> {args.dest}"
+        if getattr(args, "via", None):
+            value += f" via {args.via}"
+        if getattr(args, "snat", None):
+            value += f" snat {args.snat}"
+        config.setdefault("forwards", {})[args.name] = value
+
+    return _apply_section_edit(args, old_config, config, conf_path)
 
 
 def cmd_dnsblock(args: argparse.Namespace) -> int:
@@ -1842,6 +1910,20 @@ def build_parser() -> argparse.ArgumentParser:
                      help="proceed even if the live kernel has unmanaged rules the reload would flush")
     zon.add_argument("--conf"); zon.add_argument("--root")
     zon.set_defaults(func=cmd_zones)
+
+    fwd = sub.add_parser("forwards", help="manage [forwards] ingress DNAT/port-forward rules (edge)")
+    fwd.add_argument("op", choices=["list", "add", "remove"])
+    fwd.add_argument("name", nargs="?", help="forward name (add/remove)")
+    fwd.add_argument("portspec", nargs="?", help="WAN <proto>/<port> e.g. udp/51822 (add)")
+    fwd.add_argument("dest", nargs="?", help="destination <ip>:<port> e.g. 10.8.0.1:51821 (add)")
+    fwd.add_argument("--via", help="egress interface for the forwarded flow (required with --snat)")
+    fwd.add_argument("--snat", help="fixed SNAT source IP (the box's own address on --via)")
+    fwd.add_argument("--dry-run", action="store_true",
+                     help="preview the rule delta + clobber check; write and reload nothing")
+    fwd.add_argument("--yes", action="store_true",
+                     help="proceed even if the live kernel has unmanaged rules the reload would flush")
+    fwd.add_argument("--conf"); fwd.add_argument("--root")
+    fwd.set_defaults(func=cmd_forwards)
 
     lay = sub.add_parser("layer", help="manage an individual layer")
     lay.add_argument("action", choices=["status", "install", "uninstall", "enable", "disable"],

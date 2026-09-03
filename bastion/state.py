@@ -369,6 +369,78 @@ def validate_conf(config: dict[str, dict[str, str]]) -> tuple[list[str], list[st
                 warnings.append(f"[zones] {name} exposes {what} to {who} — confirm this is intended; "
                                 f"pin the source to a trusted host/subnet if not")
 
+    # [forwards]: name = <proto>/<wan_dport> -> <dest_ip>:<dest_dport> [via <iface>] [snat <ip>].
+    # H27 EDGE ingress DNAT/port-forward primitive (templates._render_forwards). Structural guards
+    # first (mirror the [zones] parse at the top of that loop), then per-field. A missing delimiter or
+    # blank field would render an nft-fatal rule (`dnat to x:`, `iifname ""`) that fails the whole
+    # ruleset load, so every one is a hard error that blocks generate.
+    fwd_mode = _get("machine", "mode")
+    forwards_sec = config.get("forwards") or {}
+    if forwards_sec and fwd_mode and fwd_mode != "edge":
+        warnings.append(f"[forwards] is edge-only — ignored in {fwd_mode} mode")
+    for name, raw in forwards_sec.items():
+        lhs, sep, rhs = str(raw).partition("->")
+        if not sep or not lhs.strip() or not rhs.strip():
+            errors.append(f"[forwards] {name}={raw!r} — must be "
+                          "'<proto>/<port> -> <dest_ip>:<port> [via <iface>] [snat <ip>]'")
+            continue
+        proto, pslash, wan_dport = lhs.strip().partition("/")
+        proto, wan_dport = proto.strip().lower(), wan_dport.strip()
+        if not pslash or proto not in ("tcp", "udp"):
+            errors.append(f"[forwards] {name} — must start with 'tcp/<port>' or 'udp/<port>'")
+            continue
+        if not (wan_dport.isdigit() and 1 <= int(wan_dport) <= 65535):
+            errors.append(f"[forwards] {name} WAN port {wan_dport!r} — must be an integer 1–65535")
+        toks = rhs.strip().split()
+        dest = toks[0] if toks else ""
+        via, snat, bad_tok = "", "", False
+        i = 1
+        while i < len(toks):
+            if toks[i] == "via" and i + 1 < len(toks):
+                via = toks[i + 1]; i += 2
+            elif toks[i] == "snat" and i + 1 < len(toks):
+                snat = toks[i + 1]; i += 2
+            else:
+                bad_tok = True; break
+        if bad_tok:
+            errors.append(f"[forwards] {name} — trailing tokens after the destination must be "
+                          "'via <iface>' and/or 'snat <ip>'")
+            continue
+        dest_ip, dcolon, dest_dport = dest.rpartition(":")
+        dest_ip, dest_dport = dest_ip.strip(), dest_dport.strip()
+        if not dcolon or not dest_ip or not dest_dport:
+            errors.append(f"[forwards] {name} destination {dest!r} — must be '<dest_ip>:<port>'")
+            continue
+        if not (dest_dport.isdigit() and 1 <= int(dest_dport) <= 65535):
+            errors.append(f"[forwards] {name} destination port {dest_dport!r} — must be an integer 1–65535")
+        try:
+            dip = ipaddress.ip_address(dest_ip)
+            if dip.version != 4:
+                errors.append(f"[forwards] {name} destination {dest_ip!r} — must be an IPv4 address "
+                              "(v6 forwards not supported yet)")
+            elif dip.is_loopback or dip.is_unspecified or dip.is_multicast or dip.is_reserved:
+                errors.append(f"[forwards] {name} destination {dest_ip!r} — must be a routable unicast "
+                              "host (not loopback/any/multicast); a self/local dest routes to input and "
+                              "the forward silently fails")
+        except ValueError:
+            errors.append(f"[forwards] {name} destination {dest_ip!r} — must be a valid IPv4 address")
+        if via and (len(via) > 15 or not _IFACE_RE.fullmatch(via)):
+            errors.append(f"[forwards] {name} via {via!r} — not a valid interface name (<=15 chars)")
+        if snat:
+            try:
+                if ipaddress.ip_address(snat).version != 4:
+                    errors.append(f"[forwards] {name} snat {snat!r} — must be an IPv4 address")
+            except ValueError:
+                errors.append(f"[forwards] {name} snat {snat!r} — must be a valid IPv4 address")
+            if not via:
+                errors.append(f"[forwards] {name} — 'snat' requires 'via <iface>' (the SNAT egress "
+                              "interface); a snat with no via would render 'oifname \"\"' (nft-fatal)")
+        # Admin-path hijack warning: a DNAT on the box's own SSH port runs in prerouting BEFORE input,
+        # so it steals inbound WAN-side SSH from the box's sshd (the H25 deadman keys on that path).
+        if wan_dport and ssh and wan_dport == ssh:
+            warnings.append(f"[forwards] {name} captures the box's inbound SSH port (tcp/{ssh}) to "
+                            f"{dest_ip or 'the target'} — confirm intended; it hijacks WAN-side SSH to the box")
+
     for key in ("lan", "wan", "zt_iface", "wg_vps_iface", "wg_server_iface"):
         val = _get("interfaces", key)
         if val and (len(val) > 15 or not _IFACE_RE.fullmatch(val)):
